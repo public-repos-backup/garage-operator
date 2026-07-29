@@ -266,6 +266,7 @@ func main() {
 		Scheme:        mgr.GetScheme(),
 		ClusterDomain: clusterDomain,
 		DefaultImage:  defaultGarageImage,
+		ClusterScoped: watchNamespaces == "",
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GarageCluster")
 		os.Exit(1)

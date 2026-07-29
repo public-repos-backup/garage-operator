@@ -157,6 +157,18 @@ type NodeVolumeConfig struct {
 	ReadOnly bool `json:"readOnly,omitempty"`
 }
 
+// NodeBacking selects the workload that backs a GarageNode's pod.
+type NodeBacking string
+
+const (
+	// NodeBackingStatefulSet is the default: the GarageNode owns a
+	// single-replica StatefulSet.
+	NodeBackingStatefulSet NodeBacking = "StatefulSet"
+	// NodeBackingDaemonSet marks the GarageNode as backed by a cluster-owned
+	// DaemonSet pod on a specific Kubernetes node.
+	NodeBackingDaemonSet NodeBacking = "DaemonSet"
+)
+
 // GarageNodeSpec defines the desired state of GarageNode.
 //
 // GarageNode is only used when the parent GarageCluster has layoutPolicy: Manual.
@@ -211,6 +223,22 @@ type GarageNodeSpec struct {
 	// When set, no StatefulSet is created - the node is assumed to exist externally.
 	// +optional
 	External *ExternalNodeConfig `json:"external,omitempty"`
+
+	// Backing selects the workload that backs this node's pod.
+	// StatefulSet (default when empty): this GarageNode owns a single-replica
+	// StatefulSet. DaemonSet: the pod comes from a cluster-owned DaemonSet
+	// (spec.storage.workload: DaemonSet on the GarageCluster) — no StatefulSet,
+	// ConfigMap, or Service is created; the GarageNode only manages the Garage
+	// layout role for the Kubernetes node named in kubernetesNodeName.
+	// +kubebuilder:validation:Enum=StatefulSet;DaemonSet
+	// +optional
+	Backing NodeBacking `json:"backing,omitempty"`
+
+	// KubernetesNodeName is the name of the Kubernetes node this GarageNode
+	// represents. Required when backing is DaemonSet: node_id discovery selects
+	// the DaemonSet pod scheduled on this Kubernetes node.
+	// +optional
+	KubernetesNodeName string `json:"kubernetesNodeName,omitempty"`
 
 	// Storage configures storage volumes for this node's StatefulSet.
 	// Required for managed nodes (not External).

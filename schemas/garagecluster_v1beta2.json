@@ -1647,6 +1647,10 @@
                   "description": "Annotations to set on the PVC.",
                   "type": "object"
                 },
+                "hostPath": {
+                  "description": "HostPath is the base directory on the Kubernetes node's filesystem for\nthis volume. Required when type is HostPath; not allowed otherwise.",
+                  "type": "string"
+                },
                 "labels": {
                   "additionalProperties": {
                     "type": "string"
@@ -1773,7 +1777,8 @@
                             "description": "Type specifies the volume type.",
                             "enum": [
                               "PersistentVolumeClaim",
-                              "EmptyDir"
+                              "EmptyDir",
+                              "HostPath"
                             ],
                             "type": "string"
                           },
@@ -2024,10 +2029,11 @@
                 },
                 "type": {
                   "default": "PersistentVolumeClaim",
-                  "description": "Type specifies the volume type: PersistentVolumeClaim (default) or EmptyDir.",
+                  "description": "Type specifies the volume type: PersistentVolumeClaim (default), EmptyDir,\nor HostPath (storage-DaemonSet workload only).",
                   "enum": [
                     "PersistentVolumeClaim",
-                    "EmptyDir"
+                    "EmptyDir",
+                    "HostPath"
                   ],
                   "type": "string"
                 },
@@ -4250,6 +4256,19 @@
               "type": "object",
               "additionalProperties": false
             },
+            "capacity": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "description": "Capacity is the uniform storage capacity advertised to the Garage layout\nfor each node. Required when workload is DaemonSet (hostPath volumes have\nno PVC size to derive capacity from); ignored otherwise.",
+              "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))))?$",
+              "x-kubernetes-int-or-string": true
+            },
             "capacityReservePercent": {
               "description": "CapacityReservePercent reserves a percentage of PVC capacity for overhead.\nOnly meaningful when LayoutPolicy is \"Auto\".",
               "maximum": 50,
@@ -4417,6 +4436,10 @@
                   "description": "Annotations to set on the PVC.",
                   "type": "object"
                 },
+                "hostPath": {
+                  "description": "HostPath is the base directory on the Kubernetes node's filesystem for\nthis volume. Required when type is HostPath; not allowed otherwise.",
+                  "type": "string"
+                },
                 "labels": {
                   "additionalProperties": {
                     "type": "string"
@@ -4543,7 +4566,8 @@
                             "description": "Type specifies the volume type.",
                             "enum": [
                               "PersistentVolumeClaim",
-                              "EmptyDir"
+                              "EmptyDir",
+                              "HostPath"
                             ],
                             "type": "string"
                           },
@@ -4794,10 +4818,11 @@
                 },
                 "type": {
                   "default": "PersistentVolumeClaim",
-                  "description": "Type specifies the volume type: PersistentVolumeClaim (default) or EmptyDir.",
+                  "description": "Type specifies the volume type: PersistentVolumeClaim (default), EmptyDir,\nor HostPath (storage-DaemonSet workload only).",
                   "enum": [
                     "PersistentVolumeClaim",
-                    "EmptyDir"
+                    "EmptyDir",
+                    "HostPath"
                   ],
                   "type": "string"
                 },
@@ -5209,6 +5234,10 @@
                   "description": "Annotations to set on the PVC.",
                   "type": "object"
                 },
+                "hostPath": {
+                  "description": "HostPath is the base directory on the Kubernetes node's filesystem for\nthis volume. Required when type is HostPath; not allowed otherwise.",
+                  "type": "string"
+                },
                 "labels": {
                   "additionalProperties": {
                     "type": "string"
@@ -5335,7 +5364,8 @@
                             "description": "Type specifies the volume type.",
                             "enum": [
                               "PersistentVolumeClaim",
-                              "EmptyDir"
+                              "EmptyDir",
+                              "HostPath"
                             ],
                             "type": "string"
                           },
@@ -5586,10 +5616,11 @@
                 },
                 "type": {
                   "default": "PersistentVolumeClaim",
-                  "description": "Type specifies the volume type: PersistentVolumeClaim (default) or EmptyDir.",
+                  "description": "Type specifies the volume type: PersistentVolumeClaim (default), EmptyDir,\nor HostPath (storage-DaemonSet workload only).",
                   "enum": [
                     "PersistentVolumeClaim",
-                    "EmptyDir"
+                    "EmptyDir",
+                    "HostPath"
                   ],
                   "type": "string"
                 },
@@ -5866,7 +5897,7 @@
             },
             "replicas": {
               "default": 3,
-              "description": "Replicas is the number of storage pods to deploy. Set to 0 to keep the\nstorage tier declared (config, PVC templates) but stop all pods.",
+              "description": "Replicas is the number of storage pods to deploy. Set to 0 to keep the\nstorage tier declared (config, PVC templates) but stop all pods.\nIgnored when workload is DaemonSet \u2014 the node count is the number of\nmatching Kubernetes nodes.",
               "format": "int32",
               "minimum": 0,
               "type": "integer"
@@ -6221,6 +6252,14 @@
                 "additionalProperties": false
               },
               "type": "array"
+            },
+            "workload": {
+              "description": "Workload selects how storage pods are deployed: StatefulSet (default)\nor DaemonSet (one Garage storage pod per matching Kubernetes node).\nDaemonSet requires HostPath metadata/data volumes, a uniform capacity,\noperator-managed layout, and Kubernetes peer discovery.",
+              "enum": [
+                "StatefulSet",
+                "DaemonSet"
+              ],
+              "type": "string"
             }
           },
           "required": [

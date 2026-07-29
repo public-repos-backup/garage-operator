@@ -804,6 +804,14 @@
           "type": "object",
           "additionalProperties": false
         },
+        "backing": {
+          "description": "Backing selects the workload that backs this node's pod.\nStatefulSet (default when empty): this GarageNode owns a single-replica\nStatefulSet. DaemonSet: the pod comes from a cluster-owned DaemonSet\n(spec.storage.workload: DaemonSet on the GarageCluster) \u2014 no StatefulSet,\nConfigMap, or Service is created; the GarageNode only manages the Garage\nlayout role for the Kubernetes node named in kubernetesNodeName.",
+          "enum": [
+            "StatefulSet",
+            "DaemonSet"
+          ],
+          "type": "string"
+        },
         "capacity": {
           "anyOf": [
             {
@@ -1311,6 +1319,10 @@
         },
         "imageRepository": {
           "description": "ImageRepository overrides just the repository portion of the Garage image.\nIf not specified, inherits from GarageCluster.\nIgnored if image is set.",
+          "type": "string"
+        },
+        "kubernetesNodeName": {
+          "description": "KubernetesNodeName is the name of the Kubernetes node this GarageNode\nrepresents. Required when backing is DaemonSet: node_id discovery selects\nthe DaemonSet pod scheduled on this Kubernetes node.",
           "type": "string"
         },
         "logging": {

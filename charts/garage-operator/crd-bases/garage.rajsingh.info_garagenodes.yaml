@@ -1001,6 +1001,18 @@ spec:
                         x-kubernetes-list-type: atomic
                     type: object
                 type: object
+              backing:
+                description: |-
+                  Backing selects the workload that backs this node's pod.
+                  StatefulSet (default when empty): this GarageNode owns a single-replica
+                  StatefulSet. DaemonSet: the pod comes from a cluster-owned DaemonSet
+                  (spec.storage.workload: DaemonSet on the GarageCluster) — no StatefulSet,
+                  ConfigMap, or Service is created; the GarageNode only manages the Garage
+                  layout role for the Kubernetes node named in kubernetesNodeName.
+                enum:
+                - StatefulSet
+                - DaemonSet
+                type: string
               capacity:
                 anyOf:
                 - type: integer
@@ -1561,6 +1573,12 @@ spec:
                   ImageRepository overrides just the repository portion of the Garage image.
                   If not specified, inherits from GarageCluster.
                   Ignored if image is set.
+                type: string
+              kubernetesNodeName:
+                description: |-
+                  KubernetesNodeName is the name of the Kubernetes node this GarageNode
+                  represents. Required when backing is DaemonSet: node_id discovery selects
+                  the DaemonSet pod scheduled on this Kubernetes node.
                 type: string
               logging:
                 description: |-

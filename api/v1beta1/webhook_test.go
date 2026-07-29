@@ -1245,3 +1245,90 @@ func TestGarageClusterV1beta1_RejectsConnectToWithStorageNoGateway(t *testing.T)
 		t.Fatal("v1beta1 accepted connectTo with a storage tier and no gateway, want error")
 	}
 }
+
+// ── GarageNodeValidator: DaemonSet-backed nodes (storage-DaemonSet workload) ──
+
+const testDSK8sNodeName = "worker-1"
+
+func TestGarageNodeValidator_DaemonSetBacked_Valid(t *testing.T) {
+	node := &GarageNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "n", Namespace: testSourceNS},
+		Spec: GarageNodeSpec{
+			ClusterRef:         ClusterReference{Name: testCluster, Namespace: testSourceNS},
+			Zone:               testZone,
+			Capacity:           mustQty("100Gi"),
+			Backing:            NodeBackingDaemonSet,
+			KubernetesNodeName: testDSK8sNodeName,
+		},
+	}
+	if _, err := node.validateGarageNode(); err != nil {
+		t.Errorf("DaemonSet-backed node with kubernetesNodeName set should be valid: %v", err)
+	}
+}
+
+func TestGarageNodeValidator_DaemonSetBacked_RequiresKubernetesNodeName(t *testing.T) {
+	node := &GarageNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "n", Namespace: testSourceNS},
+		Spec: GarageNodeSpec{
+			ClusterRef: ClusterReference{Name: testCluster, Namespace: testSourceNS},
+			Zone:       testZone,
+			Capacity:   mustQty("100Gi"),
+			Backing:    NodeBackingDaemonSet,
+		},
+	}
+	if _, err := node.validateGarageNode(); err == nil {
+		t.Fatal("DaemonSet-backed node without kubernetesNodeName should be rejected")
+	}
+}
+
+func TestGarageNodeValidator_DaemonSetBacked_RejectsStorage(t *testing.T) {
+	node := &GarageNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "n", Namespace: testSourceNS},
+		Spec: GarageNodeSpec{
+			ClusterRef:         ClusterReference{Name: testCluster, Namespace: testSourceNS},
+			Zone:               testZone,
+			Capacity:           mustQty("100Gi"),
+			Backing:            NodeBackingDaemonSet,
+			KubernetesNodeName: testDSK8sNodeName,
+			Storage: &NodeStorageConfig{
+				Data: &NodeVolumeConfig{Size: mustQty("100Gi")},
+			},
+		},
+	}
+	if _, err := node.validateGarageNode(); err == nil {
+		t.Fatal("DaemonSet-backed node with storage set should be rejected (no PVCs/StatefulSet owned in this mode)")
+	}
+}
+
+func TestGarageNodeValidator_DaemonSetBacked_RejectsExternal(t *testing.T) {
+	node := &GarageNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "n", Namespace: testSourceNS},
+		Spec: GarageNodeSpec{
+			ClusterRef:         ClusterReference{Name: testCluster, Namespace: testSourceNS},
+			Zone:               testZone,
+			Capacity:           mustQty("100Gi"),
+			Backing:            NodeBackingDaemonSet,
+			KubernetesNodeName: testDSK8sNodeName,
+			External:           &ExternalNodeConfig{Address: "1.2.3.4", Port: 3901},
+		},
+	}
+	if _, err := node.validateGarageNode(); err == nil {
+		t.Fatal("DaemonSet-backed node with external set should be rejected")
+	}
+}
+
+func TestGarageNodeValidator_DaemonSetBacked_RejectsGateway(t *testing.T) {
+	node := &GarageNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "n", Namespace: testSourceNS},
+		Spec: GarageNodeSpec{
+			ClusterRef:         ClusterReference{Name: testCluster, Namespace: testSourceNS},
+			Zone:               testZone,
+			Gateway:            true,
+			Backing:            NodeBackingDaemonSet,
+			KubernetesNodeName: testDSK8sNodeName,
+		},
+	}
+	if _, err := node.validateGarageNode(); err == nil {
+		t.Fatal("DaemonSet-backed node with gateway:true should be rejected (storage-tier-only workload)")
+	}
+}

@@ -45,6 +45,9 @@ type fakeGarageLayout struct {
 	roles     map[string]garage.LayoutNodeRole
 	staged    []garage.NodeRoleChange
 	skipCalls int32
+	// statusNodes, when set, is served on /v2/GetClusterStatus — used by the
+	// DaemonSet-backed discovery tests that resolve a node_id by pod IP.
+	statusNodes []garage.NodeInfo
 }
 
 func newFakeGarageLayout(initial ...garage.LayoutNodeRole) *fakeGarageLayout {
@@ -95,6 +98,11 @@ func (f *fakeGarageLayout) server() *httptest.Server {
 	mux.HandleFunc("/v2/ClusterLayoutSkipDeadNodes", func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&f.skipCalls, 1)
 		_ = json.NewEncoder(w).Encode(garage.SkipDeadNodesResponse{})
+	})
+	mux.HandleFunc("/v2/GetClusterStatus", func(w http.ResponseWriter, _ *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(garage.ClusterStatus{LayoutVersion: f.version, Nodes: f.statusNodes})
 	})
 	return httptest.NewServer(mux)
 }

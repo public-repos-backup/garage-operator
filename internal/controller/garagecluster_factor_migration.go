@@ -200,6 +200,12 @@ func (r *GarageClusterReconciler) fmValidate(ctx context.Context, cluster *garag
 	if !cluster.HasStorageTier() {
 		return r.failFactorMigration(ctx, cluster, "factor migration requires a storage tier")
 	}
+	if isDaemonSetStorage(cluster) {
+		return r.failFactorMigration(ctx, cluster,
+			"factor migration is not supported for spec.storage.workload: DaemonSet — "+
+				"the coordinated purge relies on scaling per-ordinal StatefulSets to 0 and back, "+
+				"which has no equivalent for a shared DaemonSet; migrate the factor manually")
+	}
 	if !force && cluster.Spec.Replication.ConsistencyMode == "dangerous" {
 		return r.failFactorMigration(ctx, cluster, "consistencyMode 'dangerous' requires ,force on the purge annotation")
 	}

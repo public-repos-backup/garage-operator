@@ -113,7 +113,11 @@ func (r *GarageNode) validateGarageNode() (admission.Warnings, error) {
 		}
 	}
 
-	if r.Spec.External != nil {
+	if r.Spec.Backing == NodeBackingDaemonSet {
+		if err := r.validateDaemonSetBackedNode(); err != nil {
+			return warnings, err
+		}
+	} else if r.Spec.External != nil {
 		if err := r.validateExternalNode(); err != nil {
 			return warnings, err
 		}
@@ -130,6 +134,39 @@ func (r *GarageNode) validateGarageNode() (admission.Warnings, error) {
 	}
 
 	return warnings, nil
+}
+
+// validateDaemonSetBackedNode validates a GarageNode whose pod comes from a
+// cluster-owned storage DaemonSet (spec.backing: DaemonSet) rather than a
+// per-node StatefulSet this GarageNode would otherwise own. It owns no
+// StatefulSet, ConfigMap, Service, or PVCs — only the Garage layout role for
+// the Kubernetes node named in kubernetesNodeName — so storage/external
+// configuration (which describe workloads this mode doesn't create) is
+// rejected, and DaemonSet storage is a storage-tier-only concept (gateways
+// keep their existing StatefulSet-backed path).
+func (r *GarageNode) validateDaemonSetBackedNode() error {
+	if r.Spec.KubernetesNodeName == "" {
+		return fmt.Errorf("kubernetesNodeName is required when backing is DaemonSet")
+	}
+	if r.Spec.External != nil {
+		return fmt.Errorf("external cannot be specified when backing is DaemonSet")
+	}
+	if r.Spec.Storage != nil {
+		return fmt.Errorf("storage cannot be specified when backing is DaemonSet (the cluster-owned DaemonSet provides hostPath volumes)")
+	}
+	if r.Spec.Gateway {
+		return fmt.Errorf("gateway cannot be true when backing is DaemonSet (DaemonSet storage is a storage-tier-only workload)")
+	}
+	if r.Spec.PublicEndpoint != nil {
+		return fmt.Errorf("publicEndpoint cannot be specified when backing is DaemonSet (its per-node Service selects on a pod label the shared DaemonSet template never stamps)")
+	}
+	if r.Spec.Network != nil {
+		return fmt.Errorf("network cannot be specified when backing is DaemonSet (there is no per-node ConfigMap for this mode to render overrides into — the DaemonSet's pods all read the shared cluster ConfigMap)")
+	}
+	if r.Spec.Logging != nil {
+		return fmt.Errorf("logging cannot be specified when backing is DaemonSet (there is no per-node ConfigMap for this mode to render overrides into — the DaemonSet's pods all read the shared cluster ConfigMap)")
+	}
+	return nil
 }
 
 func validateNodeID(nodeID string) error {

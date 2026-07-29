@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 KIND_CLUSTER_NAME="garage-operator-dev"
 KIND_CONFIG="${SCRIPT_DIR}/kind-config.yaml"
-IMG="garage-operator:dev"
+IMG="localhost/garage-operator:dev"
 
 # Colors for output
 RED='\033[0;31m'

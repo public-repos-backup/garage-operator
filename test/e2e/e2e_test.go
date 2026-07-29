@@ -4848,6 +4848,288 @@ spec:
 	})
 })
 
+// Storage DaemonSet (one Garage storage pod per matching Kubernetes node, with
+// hostPath metadata/data volumes). `make test-e2e`'s Kind cluster is a bare
+// `kind create cluster` — a single schedulable node, not the 3-node
+// hack/kind-config.yaml used by `make dev-up` — so this block only exercises
+// single-node DaemonSet mechanics (naming, hostPath mount, capacity
+// propagation, admission). Multi-node scale-out and node-loss behavior are
+// not covered by CI; exercise those against a dev cluster instead.
+//
+// hostPath volumes are rejected by the "restricted" and "baseline" Pod
+// Security Standards, so — unlike the other Ordered blocks in this file —
+// the test namespace here is deliberately left unlabeled (no PSA
+// enforcement).
+var _ = Describe("Storage DaemonSet", Ordered, Label("storage-daemonset"), func() {
+	const testNamespace = "garage-ds-test"
+	const clusterName = "ds-cluster"
+	const hostPathBase = "/tmp/garage-e2e-ds"
+
+	var k8sNodeName string
+	var garageNodeName string
+
+	BeforeAll(func() {
+		By("creating manager namespace")
+		cmd := exec.Command("kubectl", "create", "ns", namespace)
+		_, _ = utils.Run(cmd) // Ignore error if already exists
+
+		By("labeling the manager namespace to enforce the restricted security policy")
+		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
+			"pod-security.kubernetes.io/enforce=restricted")
+		_, _ = utils.Run(cmd)
+
+		By("installing CRDs")
+		cmd = exec.Command("make", "install")
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+
+		By("waiting for Garage CRDs to be Established")
+		Expect(utils.WaitCRDsEstablished()).To(Succeed())
+
+		By("deploying the controller-manager")
+		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+
+		By("waiting for controller-manager pod to be Ready (webhook server started)")
+		verifyControllerUp := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "pods", "-l", "control-plane=controller-manager",
+				"-n", namespace,
+				"-o", "jsonpath={.items[0].status.conditions[?(@.type=='Ready')].status}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("True"), "Controller not Ready: %s", output)
+		}
+		Eventually(verifyControllerUp, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("creating test namespace (left unlabeled: hostPath needs the privileged PSA level)")
+		cmd = exec.Command("kubectl", "create", "ns", testNamespace)
+		_, _ = utils.Run(cmd) // Ignore error if already exists
+
+		By("learning the single Kind node's name")
+		cmd = exec.Command("kubectl", "get", "nodes", "-o", "jsonpath={.items[0].metadata.name}")
+		k8sNodeName, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sNodeName).NotTo(BeEmpty())
+		garageNodeName = clusterName + "-ds-" + k8sNodeName
+	})
+
+	AfterAll(func() {
+		By("best-effort cleanup of hostPath directories left on the Kind node")
+		cleanupPod := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ds-hostpath-cleanup
+  namespace: %s
+spec:
+  restartPolicy: Never
+  containers:
+  - name: cleanup
+    image: busybox
+    command: ["sh", "-c", "rm -rf %s/*"]
+    volumeMounts:
+    - name: hostpath-base
+      mountPath: %s
+  volumes:
+  - name: hostpath-base
+    hostPath:
+      path: %s
+      type: DirectoryOrCreate
+`, testNamespace, hostPathBase, hostPathBase, hostPathBase)
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(cleanupPod)
+		_, _ = utils.Run(cmd)
+		_, _ = utils.Run(exec.Command("kubectl", "wait", "--for=jsonpath={.status.phase}=Succeeded",
+			"--timeout=30s", "pod/ds-hostpath-cleanup", "-n", testNamespace))
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", "ds-hostpath-cleanup",
+			"-n", testNamespace, "--ignore-not-found", "--wait=false"))
+
+		By("discovering any GarageNodes left to clear finalizers on")
+		cmd = exec.Command("kubectl", "get", "garagenodes", "-n", testNamespace,
+			"-o", "jsonpath={.items[*].metadata.name}")
+		output, _ := utils.Run(cmd)
+		nodeNames := strings.Fields(output)
+
+		cleanupAuto190(testNamespace, clusterName, nodeNames)
+	})
+
+	It("should deploy a DaemonSet with one pod per matching node and a GarageNode named after it", func() {
+		By("creating an admin token secret")
+		adminTokenSecret := fmt.Sprintf(`
+apiVersion: v1
+kind: Secret
+metadata:
+  name: garage-admin-token
+  namespace: %s
+type: Opaque
+stringData:
+  admin-token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+`, testNamespace)
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(adminTokenSecret)
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create admin token secret")
+
+		By("creating a GarageCluster with storage.workload: DaemonSet")
+		clusterYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta2
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  layoutPolicy: Auto
+  zone: us-test
+  replication:
+    factor: 1
+  storage:
+    workload: DaemonSet
+    capacity: 1Gi
+    metadata:
+      type: HostPath
+      hostPath: %s/meta
+    data:
+      type: HostPath
+      hostPath: %s/data
+    resources:
+      limits:
+        memory: 256Mi
+      requests:
+        memory: 128Mi
+  admin:
+    adminTokenSecretRef:
+      name: garage-admin-token
+      key: admin-token
+  security:
+    allowInsecureSecretPermissions: true
+`, clusterName, testNamespace, hostPathBase, hostPathBase)
+
+		By("applying GarageCluster (retry until admission webhook is up)")
+		Eventually(func(g Gomega) {
+			c := exec.Command("kubectl", "apply", "-f", "-")
+			c.Stdin = strings.NewReader(clusterYAML)
+			out, err := utils.Run(c)
+			g.Expect(err).NotTo(HaveOccurred(), "Failed to create GarageCluster: %s", out)
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying the storage DaemonSet has one pod scheduled and ready")
+		verifyDaemonSet := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "daemonset", clusterName+"-storage", "-n", testNamespace,
+				"-o", "jsonpath={.status.desiredNumberScheduled}/{.status.numberReady}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("1/1"), "DaemonSet not fully ready: %s", output)
+		}
+		Eventually(verifyDaemonSet, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By(fmt.Sprintf("verifying GarageNode %s is created", garageNodeName))
+		verifyGarageNode := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenode", garageNodeName, "-n", testNamespace,
+				"-o", "jsonpath={.metadata.name}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal(garageNodeName))
+		}
+		Eventually(verifyGarageNode, 2*time.Minute, 5*time.Second).Should(Succeed())
+	})
+
+	It("should propagate spec.storage.capacity and reach Connected + InLayout", func() {
+		By("verifying the GarageNode's capacity matches spec.storage.capacity")
+		cmd := exec.Command("kubectl", "get", "garagenode", garageNodeName, "-n", testNamespace,
+			"-o", "jsonpath={.spec.capacity}")
+		output, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(output).To(Equal("1Gi"), "GarageNode capacity should match spec.storage.capacity")
+
+		By("waiting for the node to be Connected and InLayout")
+		verifyNodeReady := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenode", garageNodeName, "-n", testNamespace,
+				"-o", "jsonpath={.status.connected}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("true"), "GarageNode not connected: %q", output)
+
+			cmd = exec.Command("kubectl", "get", "garagenode", garageNodeName, "-n", testNamespace,
+				"-o", "jsonpath={.status.inLayout}")
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("true"), "GarageNode not in layout: %q", output)
+		}
+		Eventually(verifyNodeReady, 5*time.Minute, 10*time.Second).Should(Succeed())
+	})
+
+	It("should serve a GarageBucket through the DaemonSet-backed node", func() {
+		bucketYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta1
+kind: GarageBucket
+metadata:
+  name: ds-test-bucket
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+`, testNamespace, clusterName)
+
+		By("creating a GarageBucket against the DaemonSet-backed cluster")
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(bucketYAML)
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create test bucket")
+
+		By("waiting for the bucket to reach Ready")
+		verifyBucketReady := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagebucket", "ds-test-bucket", "-n", testNamespace,
+				"-o", "jsonpath={.status.phase}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("Ready"), "Bucket not ready: phase=%s", output)
+		}
+		Eventually(verifyBucketReady, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("cleaning up the test bucket")
+		cmd = exec.Command("kubectl", "delete", "garagebucket", "ds-test-bucket", "-n", testNamespace,
+			"--ignore-not-found")
+		_, _ = utils.Run(cmd)
+	})
+
+	It("should reject a storage-DaemonSet cluster with a non-HostPath volume", func() {
+		invalidYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta2
+kind: GarageCluster
+metadata:
+  name: ds-invalid
+  namespace: %s
+spec:
+  layoutPolicy: Auto
+  replication:
+    factor: 1
+  storage:
+    workload: DaemonSet
+    capacity: 1Gi
+    metadata:
+      type: HostPath
+      hostPath: %s/invalid-meta
+    data:
+      size: 1Gi
+  admin:
+    adminTokenSecretRef:
+      name: garage-admin-token
+      key: admin-token
+  security:
+    allowInsecureSecretPermissions: true
+`, testNamespace, hostPathBase)
+
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(invalidYAML)
+		output, err := utils.Run(cmd)
+		Expect(err).To(HaveOccurred(),
+			"Webhook should reject a DaemonSet storage tier with a non-HostPath data volume. Output: %s", output)
+		Expect(output).To(ContainSubstring("HostPath"),
+			"Error should mention HostPath. Output: %s", output)
+	})
+})
+
 // cleanupManagementHandle tears down the management-handle e2e block with a
 // LIGHT teardown: it deletes only this block's namespace and CRs and leaves the
 // operator, CRDs, and admission webhooks running. This shard (api) runs several

@@ -1,0 +1,97 @@
+# Storage-DaemonSet GarageCluster — one Garage storage pod per matching
+# Kubernetes Node, using hostPath volumes instead of PVCs.
+#
+# Use this when storage should be tied to the node's local disk (NVMe/HDD)
+# rather than a floating PVC. Node count follows however many Kubernetes
+# Nodes match `spec.storage.nodeSelector` (plus tolerations) — scale by
+# labeling/draining Nodes, not by editing `replicas` (ignored under
+# DaemonSet). `spec.storage.capacity` is required and applied uniformly to
+# every node, since hostPath has no PVC size to derive it from.
+#
+# The hostPath metadata directory holds the node's Ed25519 node_key, so a pod
+# rescheduled onto the SAME Kubernetes Node keeps its node_id — no
+# drain/resync needed. Losing that node's disk is data loss for the
+# partitions it owned, same as losing a StatefulSet's PVC. The operator never
+# cleans up hostPath directories on GarageNode/Node deletion — that's left on
+# the node's disk for an operator to remove by hand.
+#
+# Requires a cluster-scoped install (watching Node is cluster-scoped; the
+# namespace-scoped Helm install only grants a per-namespace Role) and
+# operator-managed layout — DaemonSet + layoutPolicy: Manual is rejected by
+# the webhook.
+#
+# List the operator-owned child GarageNodes for this cluster with:
+#
+#   kubectl get garagenodes -l garage.rajsingh.info/cluster=garage-daemonset
+#
+# Peer discovery for DaemonSet pods (non-deterministic IPs, one per matching
+# K8s Node) is handled by the operator's own Admin-API-driven bootstrap nudge
+# — the same mechanism used for every other workload shape — NOT by Garage's
+# native kubernetes_discovery (which needs RBAC the operator doesn't grant
+# workload pods by default). That means spec.admin.adminTokenSecretRef is
+# required here; create the secret before applying:
+#
+#   kubectl create secret generic garage-daemonset-admin-token \
+#     -n garage-operator-system \
+#     --from-literal=admin-token="$(openssl rand -hex 32)"
+#
+apiVersion: garage.rajsingh.info/v1beta2
+kind: GarageCluster
+metadata:
+  name: garage-daemonset
+  namespace: garage-operator-system
+spec:
+  image: dxflrs/garage:v2.3.0
+
+  # DaemonSet storage requires operator-managed layout (webhook-enforced).
+  layoutPolicy: Auto
+
+  replication:
+    factor: 3
+    consistencyMode: consistent
+
+  storage:
+    workload: DaemonSet
+
+    # Applied uniformly to every node's layout entry — hostPath has no PVC
+    # size to derive this from.
+    capacity: 10Gi
+
+    metadata:
+      type: HostPath
+      hostPath: /var/lib/garage/meta
+    data:
+      type: HostPath
+      size: 10Gi
+      hostPath: /var/lib/garage/data
+
+    # Restrict to nodes with local storage, e.g. label your Nodes with
+    # storage=local and uncomment:
+    # nodeSelector:
+    #   storage: local
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+  network:
+    rpcBindPort: 3901
+    service:
+      type: ClusterIP
+
+  s3Api:
+    bindPort: 3900
+    region: garage
+
+  admin:
+    bindPort: 3903
+    adminTokenSecretRef:
+      name: garage-admin-token
+      key: admin-token
+
+  database:
+    engine: lmdb

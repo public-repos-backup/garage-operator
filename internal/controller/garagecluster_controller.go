@@ -38,14 +38,17 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
@@ -86,6 +89,11 @@ type GarageClusterReconciler struct {
 	Scheme        *runtime.Scheme
 	ClusterDomain string
 	DefaultImage  string
+	// ClusterScoped is true when the manager caches/watches all namespaces
+	// (no --watch-namespaces). A namespace-scoped Role cannot authorize
+	// access to the cluster-scoped Node resource, so the Node watch/List used
+	// by storage-DaemonSet clusters is only safe to use when this is true.
+	ClusterScoped bool
 }
 
 // +kubebuilder:rbac:groups=garage.rajsingh.info,resources=garageclusters,verbs=get;list;watch;create;update;patch;delete
@@ -93,10 +101,12 @@ type GarageClusterReconciler struct {
 // +kubebuilder:rbac:groups=garage.rajsingh.info,resources=garageclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -164,7 +174,7 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// owned in Auto mode, user-owned in Manual mode). The cluster-level Reconcile
 	// no longer drives a storage STS directly, but the ConfigMap must still be
 	// reconciled here so the per-node STSes pick it up.
-	_, gatewayConfigHash, err := r.reconcileConfigMap(ctx, cluster)
+	storageConfigHash, gatewayConfigHash, err := r.reconcileConfigMap(ctx, cluster)
 	if err != nil {
 		return r.updateStatus(ctx, cluster, PhaseFailed, err)
 	}
@@ -237,19 +247,50 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// gateway tier so a cluster can hand-manage storage (Manual, per-node
 	// GarageNodes in gitops) while the gateway tier stays operator-managed.
 	if effectiveStorageLayoutPolicy(cluster) != LayoutPolicyManual {
-		// Auto mode: migrate any pre-#190 legacy storage STS, then reconcile
-		// the per-node GarageNodes that replace it.
-		if cluster.HasStorageTier() {
+		switch {
+		case isDaemonSetStorage(cluster):
+			// DaemonSet workload: the cluster owns the pods (one per matching
+			// K8s node, hostPath-backed identity); GarageNodes keyed by node
+			// name own only the layout roles. The desired-set diff inside
+			// reconcileDaemonSetStorageNodes also cleans up leftover ordinal
+			// GarageNodes from a StatefulSet→DaemonSet switch.
+			//
+			// This requires listing the cluster-scoped Node resource, which a
+			// namespace-scoped Role can never authorize (see ClusterScoped on
+			// the reconciler) — refuse explicitly rather than hang/error on
+			// every reconcile of this cluster.
+			if !r.ClusterScoped {
+				return r.updateStatus(ctx, cluster, PhaseFailed, fmt.Errorf(
+					"spec.storage.workload: DaemonSet requires a cluster-scoped operator install (watching Node is cluster-scoped and cannot be authorized by a namespace-scoped Role); redeploy the operator with cluster-wide RBAC (unset --watch-namespaces/WATCH_NAMESPACE)"))
+			}
+			if err := r.reconcileStorageDaemonSet(ctx, cluster, storageConfigHash); err != nil {
+				return r.updateStatus(ctx, cluster, PhaseFailed, err)
+			}
+			if err := r.reconcileDaemonSetStorageNodes(ctx, cluster); err != nil {
+				return r.updateStatus(ctx, cluster, PhaseFailed, err)
+			}
+		case cluster.HasStorageTier():
+			// Auto mode: migrate any pre-#190 legacy storage STS, then reconcile
+			// the per-node GarageNodes that replace it. A DaemonSet→StatefulSet
+			// switch tears down the DaemonSet here; the DS-backed GarageNodes
+			// fall out of the ordinal desired set inside
+			// reconcileAutoModeStorageNodes and are deleted by its diff.
+			if err := r.deleteStorageDaemonSet(ctx, cluster); err != nil {
+				return r.updateStatus(ctx, cluster, PhaseFailed, err)
+			}
 			if err := r.migrateLegacyStorageSTSIfNeeded(ctx, cluster); err != nil {
 				return r.updateStatus(ctx, cluster, PhaseFailed, fmt.Errorf("legacy STS migration: %w", err))
 			}
 			if err := r.reconcileAutoModeStorageNodes(ctx, cluster); err != nil {
 				return r.updateStatus(ctx, cluster, PhaseFailed, err)
 			}
-		} else {
-			// No storage tier declared — clean up any leftover legacy STS plus
-			// operator-owned child GarageNodes.
+		default:
+			// No storage tier declared — clean up any leftover legacy STS,
+			// storage DaemonSet, plus operator-owned child GarageNodes.
 			if err := r.deleteStorageStatefulSet(ctx, cluster); err != nil {
+				return r.updateStatus(ctx, cluster, PhaseFailed, err)
+			}
+			if err := r.deleteStorageDaemonSet(ctx, cluster); err != nil {
 				return r.updateStatus(ctx, cluster, PhaseFailed, err)
 			}
 			if err := r.deleteAutoModeStorageNodes(ctx, cluster); err != nil {
@@ -395,6 +436,12 @@ func (r *GarageClusterReconciler) finalize(ctx context.Context, cluster *garagev
 		}
 	} else if !errors.IsNotFound(err) {
 		return err
+	}
+
+	// Delete the storage DaemonSet (DaemonSet storage workload). hostPath data
+	// on the nodes is intentionally left in place.
+	if err := r.deleteStorageDaemonSet(ctx, cluster); err != nil {
+		return fmt.Errorf("failed to delete storage DaemonSet: %w", err)
 	}
 
 	// Delete operator-owned child GarageNodes (Auto-mode per-node CRs).
@@ -2352,6 +2399,26 @@ func (r *GarageClusterReconciler) updateStatusFromCluster(ctx context.Context, c
 		if cluster.HasStorageTier() || cluster.HasGatewayTier() {
 			storageDesired = cluster.StorageReplicas()
 			gatewayDesired = cluster.GatewayReplicas()
+
+			// DaemonSet storage workload: spec.storage.replicas is ignored — the
+			// desired count is however many matching K8s nodes the DaemonSet
+			// controller scheduled onto. storageReady is NOT seeded from the
+			// DaemonSet's own pod-readiness here — GarageNode.Status.Connected
+			// (counted below) is the only authoritative ready signal. A pod can be
+			// kubelet-Ready while its Garage process has never joined the cluster
+			// (e.g. broken peer discovery), and falling back to pod-readiness in
+			// that case masks a fully disconnected cluster as Phase: Running.
+			if isDaemonSetStorage(cluster) {
+				storageDesired = 0
+				ds := &appsv1.DaemonSet{}
+				if err := r.Get(ctx, types.NamespacedName{Name: storageDaemonSetName(cluster), Namespace: cluster.Namespace}, ds); err != nil {
+					if !errors.IsNotFound(err) {
+						return ctrl.Result{}, err
+					}
+				} else {
+					storageDesired = ds.Status.DesiredNumberScheduled
+				}
+			}
 
 			// Match nodes by spec.clusterRef (like the Manual branch above), NOT by
 			// the operator's cluster label. A per-tier Manual storage policy means
@@ -5361,6 +5428,35 @@ func (r *GarageClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}}
 	})
 
+	// Nodes carry no cluster label, so a Node add/delete is mapped by scanning
+	// for storage-DaemonSet clusters whose nodeSelector matches it. This is
+	// what makes DaemonSet-backed GarageNode create-on-join and
+	// delete-on-leave (which drains the layout role) prompt instead of
+	// waiting for the next periodic requeue.
+	nodeMapper := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+		node, ok := obj.(*corev1.Node)
+		if !ok {
+			return nil
+		}
+		clusters := &garagev1beta2.GarageClusterList{}
+		if err := r.List(ctx, clusters); err != nil {
+			return nil
+		}
+		var reqs []reconcile.Request
+		for i := range clusters.Items {
+			c := &clusters.Items[i]
+			if !isDaemonSetStorage(c) {
+				continue
+			}
+			if len(c.Spec.Storage.NodeSelector) > 0 &&
+				!labels.SelectorFromSet(c.Spec.Storage.NodeSelector).Matches(labels.Set(node.Labels)) {
+				continue
+			}
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Name: c.Name, Namespace: c.Namespace}})
+		}
+		return reqs
+	})
+
 	// Note: we intentionally do NOT Watch GarageNode here. Status ticks on
 	// child GarageNodes (LastSeen, Conditions) fire frequently, and re-running
 	// the cluster reconcile on every tick caused two regressions in CI: (a)
@@ -5372,15 +5468,34 @@ func (r *GarageClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// bootstrap_peers to land within one reconcile of a sibling's NodeID
 	// being discovered.
 
-	return ctrl.NewControllerManagedBy(mgr).
+	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&garagev1beta2.GarageCluster{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.DaemonSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Secret{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
-		Watches(&corev1.PersistentVolumeClaim{}, pvcMapper).
+		Watches(&corev1.PersistentVolumeClaim{}, pvcMapper)
+
+	// Node is cluster-scoped: a namespace-scoped Role can never authorize
+	// List/Watch on it (RBAC only evaluates namespaced-resource requests
+	// against a Role), so registering this watch there would hang cache sync
+	// and crash-loop the manager. Only safe when the manager watches all
+	// namespaces (see ClusterScoped). Storage-DaemonSet clusters are refused
+	// with an actionable error in Reconcile when running namespace-scoped.
+	if r.ClusterScoped {
+		// LabelChangedPredicate lets Create/Delete through unconditionally
+		// (node join/leave) but drops Update events unless labels changed —
+		// without it, routine Node status churn (kubelet heartbeats,
+		// condition/capacity updates) would trigger a full GarageClusterList +
+		// reconcile of every DaemonSet-storage cluster on nearly every Node
+		// update, since nodeSelector matching only depends on labels.
+		bldr = bldr.Watches(&corev1.Node{}, nodeMapper, builder.WithPredicates(predicate.LabelChangedPredicate{}))
+	}
+
+	return bldr.
 		Named("garagecluster").
 		Complete(r)
 }

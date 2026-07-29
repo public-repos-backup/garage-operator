@@ -179,12 +179,32 @@ type GarageClusterSpec struct {
 
 // StorageSpec configures the long-lived storage tier of a GarageCluster.
 //
-// Workload: StatefulSet with metadata + data PVCs.
-// Pod identity: ordinal (`<cluster>-0`, `<cluster>-1`, …) — node IDs persist
-// across pod restarts as long as the metadata PVC is preserved.
+// Workload: StatefulSet (default) with metadata + data PVCs, or DaemonSet
+// with hostPath volumes (one storage pod per matching Kubernetes node).
+// Pod identity: ordinal (`<cluster>-0`, `<cluster>-1`, …) under StatefulSet —
+// node IDs persist across pod restarts as long as the metadata PVC is
+// preserved. Under DaemonSet, identity is per physical node: the hostPath
+// metadata directory holds the node_key, so pods rejoin with the same node_id
+// after any restart or reschedule onto the same node.
 type StorageSpec struct {
+	// Workload selects how storage pods are deployed: StatefulSet (default)
+	// or DaemonSet (one Garage storage pod per matching Kubernetes node).
+	// DaemonSet requires HostPath metadata/data volumes, a uniform capacity,
+	// operator-managed layout, and Kubernetes peer discovery.
+	// +kubebuilder:validation:Enum=StatefulSet;DaemonSet
+	// +optional
+	Workload WorkloadType `json:"workload,omitempty"`
+
+	// Capacity is the uniform storage capacity advertised to the Garage layout
+	// for each node. Required when workload is DaemonSet (hostPath volumes have
+	// no PVC size to derive capacity from); ignored otherwise.
+	// +optional
+	Capacity *resource.Quantity `json:"capacity,omitempty"`
+
 	// Replicas is the number of storage pods to deploy. Set to 0 to keep the
 	// storage tier declared (config, PVC templates) but stop all pods.
+	// Ignored when workload is DaemonSet — the node count is the number of
+	// matching Kubernetes nodes.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:default=3
 	Replicas int32 `json:"replicas"`
@@ -261,6 +281,16 @@ type StorageSpec struct {
 	// PodTemplate carries pod scheduling and metadata for the storage tier.
 	PodTemplate `json:",inline"`
 }
+
+// WorkloadType selects the Kubernetes workload backing the storage tier.
+type WorkloadType string
+
+const (
+	// WorkloadTypeStatefulSet deploys storage pods as a per-ordinal StatefulSet (default).
+	WorkloadTypeStatefulSet WorkloadType = "StatefulSet"
+	// WorkloadTypeDaemonSet deploys one storage pod per matching Kubernetes node.
+	WorkloadTypeDaemonSet WorkloadType = "DaemonSet"
+)
 
 // GatewaySpec configures the gateway tier of a GarageCluster.
 //
@@ -492,7 +522,7 @@ type PVCRetentionPolicy struct {
 }
 
 // VolumeType specifies the type of volume to use.
-// +kubebuilder:validation:Enum=PersistentVolumeClaim;EmptyDir
+// +kubebuilder:validation:Enum=PersistentVolumeClaim;EmptyDir;HostPath
 type VolumeType string
 
 const (
@@ -500,14 +530,24 @@ const (
 	VolumeTypePVC VolumeType = "PersistentVolumeClaim"
 	// VolumeTypeEmptyDir uses an EmptyDir volume (ephemeral).
 	VolumeTypeEmptyDir VolumeType = "EmptyDir"
+	// VolumeTypeHostPath mounts a directory from the Kubernetes node's
+	// filesystem. Used by the storage-DaemonSet workload, where Garage identity
+	// and data are durable per physical node rather than per PVC.
+	VolumeTypeHostPath VolumeType = "HostPath"
 )
 
 // VolumeConfig configures a persistent volume.
 type VolumeConfig struct {
-	// Type specifies the volume type: PersistentVolumeClaim (default) or EmptyDir.
+	// Type specifies the volume type: PersistentVolumeClaim (default), EmptyDir,
+	// or HostPath (storage-DaemonSet workload only).
 	// +kubebuilder:default="PersistentVolumeClaim"
 	// +optional
 	Type VolumeType `json:"type,omitempty"`
+
+	// HostPath is the base directory on the Kubernetes node's filesystem for
+	// this volume. Required when type is HostPath; not allowed otherwise.
+	// +optional
+	HostPath string `json:"hostPath,omitempty"`
 
 	// Size of the volume.
 	// +optional

@@ -27,6 +27,12 @@ import (
 // gateway tier has been removed; they must read v1beta2 to manage it.
 const v1beta2AnnotationGatewayTierPresent = "garage.rajsingh.info/v1beta2-only"
 
+// v1beta2AnnotationStorageDaemonSetPresent is the v1beta2AnnotationGatewayTierPresent
+// value (or comma-separated component) marking a v1beta1 view whose storage
+// tier was elided because the source v1beta2 CR uses workload=DaemonSet with
+// HostPath volumes — a shape v1beta1 cannot represent.
+const v1beta2AnnotationStorageDaemonSetPresent = "storage-daemonset-present"
+
 // ConvertTo converts this v1beta1 GarageCluster to the v1beta2 hub.
 //
 // Mapping:
@@ -366,7 +372,37 @@ func (dst *GarageCluster) ConvertFrom(srcRaw conversion.Hub) error {
 		dst.Annotations[v1beta2AnnotationGatewayTierPresent] = "gateway-tier-present"
 	}
 
+	// Storage-DaemonSet clusters (workload, hostPath volumes, uniform capacity)
+	// are v1beta2-only: sanitize the volume configs so the v1beta1 view stays
+	// schema-valid, and stamp the annotation so tooling knows to read v1beta2.
+	dst.elideDaemonSetStorage(src)
+
 	return nil
+}
+
+// elideDaemonSetStorage strips the v1beta2-only storage-DaemonSet shape from
+// the v1beta1 view. v1beta1 has no HostPath volume type, so hostPath-backed
+// volumes render as default (empty) volume configs, and the CR is stamped
+// with `garage.rajsingh.info/v1beta2-only` (appending to any existing value,
+// e.g. a unified cluster's gateway-tier-present).
+func (dst *GarageCluster) elideDaemonSetStorage(src *v1beta2.GarageCluster) {
+	if src.Spec.Storage == nil || src.Spec.Storage.Workload != v1beta2.WorkloadTypeDaemonSet {
+		return
+	}
+	if dst.Spec.Storage.Metadata != nil && string(dst.Spec.Storage.Metadata.Type) == string(v1beta2.VolumeTypeHostPath) {
+		dst.Spec.Storage.Metadata = &VolumeConfig{}
+	}
+	if dst.Spec.Storage.Data != nil && string(dst.Spec.Storage.Data.Type) == string(v1beta2.VolumeTypeHostPath) {
+		dst.Spec.Storage.Data = &VolumeConfig{}
+	}
+	if dst.Annotations == nil {
+		dst.Annotations = map[string]string{}
+	}
+	if v := dst.Annotations[v1beta2AnnotationGatewayTierPresent]; v != "" && v != v1beta2AnnotationStorageDaemonSetPresent {
+		dst.Annotations[v1beta2AnnotationGatewayTierPresent] = v + "," + v1beta2AnnotationStorageDaemonSetPresent
+	} else {
+		dst.Annotations[v1beta2AnnotationGatewayTierPresent] = v1beta2AnnotationStorageDaemonSetPresent
+	}
 }
 
 // copyJSON copies src into dst (a pointer) by JSON round-trip. Returns nil and

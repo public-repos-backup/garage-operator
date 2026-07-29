@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -158,8 +159,16 @@ func (r *GarageCluster) validateGarageCluster() (admission.Warnings, error) {
 	}
 
 	// Storage validation applies to a real storage tier only. A management handle
-	// (#269) has gateway=false but no storage tier, so skip it there.
-	if !r.Spec.Gateway && !r.isManagementHandle() && r.Spec.LayoutPolicy != layoutPolicyManual {
+	// (#269) has gateway=false but no storage tier, so skip it there. A
+	// storage-DaemonSet cluster (#daemonset) is v1beta2-only: the conversion
+	// webhook elides its HostPath volumes into empty VolumeConfigs before this
+	// v1beta1 view is validated (matchPolicy: Equivalent routes v1beta2
+	// requests through this webhook too), so validateStorage's size/type
+	// checks would reject a well-formed v1beta2 object based on the lossy
+	// projection. The elision is marked with the dsMarker annotation value —
+	// skip storage validation there and trust the v1beta2 webhook, which saw
+	// the real object.
+	if !r.Spec.Gateway && !r.isManagementHandle() && !r.isDaemonSetStorageElided() && r.Spec.LayoutPolicy != layoutPolicyManual {
 		if err := r.validateStorage(); err != nil {
 			return warnings, err
 		}
@@ -210,6 +219,21 @@ func (r *GarageCluster) isManagementHandle() bool {
 		r.Spec.Replicas == 0 &&
 		r.Spec.Storage.Metadata == nil &&
 		r.Spec.Storage.Data == nil
+}
+
+// isDaemonSetStorageElided reports whether this v1beta1 view had its storage
+// tier elided by the conversion webhook because the source v1beta2 CR uses
+// workload=DaemonSet with HostPath volumes (see elideDaemonSetStorage in
+// garagecluster_conversion.go). Such a view's storage.metadata/data render as
+// empty VolumeConfigs, which is not itself invalid — it's a marker, not a
+// real submission.
+func (r *GarageCluster) isDaemonSetStorageElided() bool {
+	for _, part := range strings.Split(r.Annotations[v1beta2AnnotationGatewayTierPresent], ",") {
+		if part == v1beta2AnnotationStorageDaemonSetPresent {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *GarageCluster) validateGateway() error {

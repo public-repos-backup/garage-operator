@@ -138,6 +138,14 @@ annotation `garage.rajsingh.info/v1beta2-only=gateway-tier-present` so
 external tooling can detect that the gateway tier was elided. Tools that
 manage unified clusters must read/write v1beta2 directly.
 
+Same story for the storage-**DaemonSet** workload (`spec.storage.workload`,
+`HostPath` volumes, `spec.storage.capacity`) — v1beta1 has no `workload`
+field or `HostPath` volume type. The v1beta1 view elides the hostPath volume
+configs (rendered as empty `VolumeConfig`s) and stamps
+`garage.rajsingh.info/v1beta2-only=storage-daemonset-present` (appended to
+the annotation value, comma-separated, if `gateway-tier-present` is also set).
+Tools must read/write v1beta2 for a DaemonSet-workload cluster.
+
 Other CRDs (`GarageBucket`, `GarageKey`, `GarageNode`, `GarageAdminToken`,
 `GarageReferenceGrant`) remain on `v1beta1` exclusively.
 
@@ -231,16 +239,16 @@ Implementation:
 
 ### Workload differences
 
-| Aspect | Storage tier | Gateway tier (unified) | Gateway tier (edge) |
-|---|---|---|---|
-| Workload | N × `StatefulSet`s (`replicas: 1`) | N × `StatefulSet`s (`replicas: 1`) | `StatefulSet` (`<cr>-gateway`) |
-| GarageNode CRs | one per ordinal (`<cr>-storage-N`) | one per ordinal (`<cr>-gateway-N`, `gateway: true`) | none |
-| metadata volume | PVC (per node) | PVC (per node, 1Gi default) | PVC (per replica) |
-| data volume | PVC (per node) | EmptyDir | EmptyDir |
-| Node identity | persists (PVC) | persists (PVC) | persists (PVC) |
-| ConfigMap | per-node when overrides present, else shared | **always per-node** (so it never inherits the storage `rpc_public_addr`) | gateway-specific |
-| Layout owner | per-`GarageNode` controller (local) | per-`GarageNode` controller (local) | gateway-connection path (remote) |
-| Layout capacity | from PVC size | nil (gateway) | nil (gateway) |
+| Aspect | Storage tier (StatefulSet) | Storage tier (DaemonSet) | Gateway tier (unified) | Gateway tier (edge) |
+|---|---|---|---|---|
+| Workload | N × `StatefulSet`s (`replicas: 1`) | one `DaemonSet` (`<cr>-storage`) | N × `StatefulSet`s (`replicas: 1`) | `StatefulSet` (`<cr>-gateway`) |
+| GarageNode CRs | one per ordinal (`<cr>-storage-N`) | one per matching K8s Node (`<cr>-ds-<k8s-node-name>`) | one per ordinal (`<cr>-gateway-N`, `gateway: true`) | none |
+| metadata volume | PVC (per node) | hostPath (per K8s node) | PVC (per node, 1Gi default) | PVC (per replica) |
+| data volume | PVC (per node) | hostPath (per K8s node) | EmptyDir | EmptyDir |
+| Node identity | persists (PVC) | persists (hostPath on the K8s node) | persists (PVC) | persists (PVC) |
+| ConfigMap | per-node when overrides present, else shared | shared (`<cr>-config`) | **always per-node** (so it never inherits the storage `rpc_public_addr`) | gateway-specific |
+| Layout owner | per-`GarageNode` controller (local) | per-`GarageNode` controller (local), layout role only — no STS owned | per-`GarageNode` controller (local) | gateway-connection path (remote) |
+| Layout capacity | from PVC size | uniform, from `spec.storage.capacity` | nil (gateway) | nil (gateway) |
 
 In a unified cluster every tier is reconciled as per-pod `GarageNode`s; the
 difference between tiers is `gateway: true` (capacity nil, EmptyDir data) and
@@ -248,6 +256,48 @@ between Auto/Manual is **ownership** of those GarageNodes (operator vs user),
 not the workload shape. Edge gateways (a separate gateway-only CR connecting to
 a remote storage cluster) keep the cluster-level StatefulSet because their layout
 is owned remotely.
+
+### Storage-DaemonSet workload
+
+`spec.storage.workload: DaemonSet` (default `StatefulSet`) runs one Garage
+storage pod per matching Kubernetes node instead of a per-ordinal
+StatefulSet. Use it when storage is tied to the node (local NVMe/HDD) rather
+than a floating PVC.
+
+- `storage.metadata`/`data` must be `HostPath` (webhook rejects PVC/EmptyDir
+  under `DaemonSet`, and `HostPath` under `StatefulSet`). The hostPath
+  metadata dir holds the node key, so a pod rescheduled onto the *same* K8s
+  node keeps its `node_id` — no drain/resync. Losing the node's disk is data
+  loss for its partitions, same as losing a StatefulSet's PVC.
+- `spec.storage.replicas` is ignored — node count follows however many K8s
+  Nodes match `nodeSelector`/tolerations; scale by labeling/draining Nodes.
+- `spec.storage.capacity` is required and applied uniformly to every node
+  (hostPath has no PVC size to derive it from); per-node heterogeneous
+  capacity is out of scope.
+- GarageNodes are keyed by K8s Node name (`<cr>-ds-<k8s-node-name>`), not by
+  pod — only **deleting the K8s Node** deletes the GarageNode and drains its
+  layout role. A DaemonSet-backed GarageNode owns no StatefulSet/ConfigMap/PVCs.
+- Zone comes from the K8s Node's `topology.kubernetes.io/zone` label,
+  falling back to `spec.zone`.
+- Peer discovery (pod IPs aren't deterministic, one pod per matching K8s Node)
+  goes through the operator's own Admin-API-driven bootstrap/reconnect nudge
+  (`bootstrapCluster`, per-node `connectNodeToCluster`) — the same mechanism
+  every other workload shape uses — so `spec.admin.adminTokenSecretRef` must
+  be set, or nodes never learn about each other. The defaulter does **not**
+  auto-enable Garage's native `spec.discovery.kubernetes`: that feature needs
+  the *workload pod's* ServiceAccount to have RBAC to patch a cluster-scoped
+  CRD (`garagenodes.deuxfleurs.fr`) and manage namespaced CRs under it, which
+  the operator does not grant by default — enabling it without that RBAC
+  produces a stream of 403s and no working discovery.
+- Requires operator-managed layout — `DaemonSet` + `layoutPolicy: Manual` is
+  rejected.
+- Switching `StatefulSet` ⟷ `DaemonSet` tears down the previous shape's
+  workload and GarageNodes.
+- hostPath data is never cleaned up by the operator on GarageNode/Node
+  deletion — the directory is left on the K8s node's disk.
+- Namespace-scoped installs can't use this workload: watching `Node` is
+  cluster-scoped, and the namespace-scoped Helm install only grants a
+  per-namespace `Role`. Requires the cluster-scoped `ClusterRole` install.
 
 ### Layout staging/apply concurrency
 

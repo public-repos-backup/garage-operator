@@ -259,22 +259,31 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return r.reconcileCycle(ctx, node, cluster)
 	}
 
-	// Reconcile per-node RPC service when publicEndpoint is configured
-	if node.Spec.External == nil && node.Spec.PublicEndpoint != nil {
+	// Reconcile per-node RPC service when publicEndpoint is configured. Not
+	// applicable to DaemonSet-backed nodes (webhook-rejected already, but
+	// guarded here too): the Service would select on a pod label the shared
+	// DaemonSet template never stamps and would sit with zero endpoints.
+	if node.Spec.External == nil && !isDaemonSetBacked(node) && node.Spec.PublicEndpoint != nil {
 		if err := r.reconcileNodeService(ctx, node, cluster); err != nil {
 			return r.updateStatus(ctx, node, PhaseFailed, fmt.Errorf("reconciling node service: %w", err))
 		}
 	}
 
-	// Reconcile per-node ConfigMap when any node-specific config overrides are present
-	if node.Spec.External == nil && nodeHasConfigOverrides(node) {
+	// Reconcile per-node ConfigMap when any node-specific config overrides are
+	// present. Not applicable to DaemonSet-backed nodes (webhook-rejected
+	// already, but guarded here too): their pods always mount the shared
+	// cluster ConfigMap, never a per-node one.
+	if node.Spec.External == nil && !isDaemonSetBacked(node) && nodeHasConfigOverrides(node) {
 		if err := r.reconcileNodeConfigMap(ctx, node, cluster); err != nil {
 			return r.updateStatus(ctx, node, PhaseFailed, fmt.Errorf("reconciling node config: %w", err))
 		}
 	}
 
-	// For managed nodes (not external), create/update the StatefulSet
-	if node.Spec.External == nil {
+	// For managed nodes (not external, not DaemonSet-backed), create/update the
+	// StatefulSet. DaemonSet-backed nodes (storage workload: DaemonSet) get their
+	// pod from a cluster-owned DaemonSet — this controller only manages the
+	// layout role for them.
+	if node.Spec.External == nil && !isDaemonSetBacked(node) {
 		// Expand bound PVCs first if the spec grew. StatefulSet selectors are
 		// immutable but PVCs can be resized in place when the StorageClass has
 		// allowVolumeExpansion=true. Order matters: the STS template carries the
@@ -310,6 +319,13 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 // reconcileStatefulSet creates/updates the StatefulSet for a managed GarageNode.
 // Each GarageNode creates its own StatefulSet with replica 1.
+// isDaemonSetBacked reports whether this GarageNode's pod comes from a
+// cluster-owned DaemonSet (spec.backing: DaemonSet) rather than a per-node
+// StatefulSet owned by this controller.
+func isDaemonSetBacked(node *garagev1beta1.GarageNode) bool {
+	return node.Spec.Backing == garagev1beta1.NodeBackingDaemonSet
+}
+
 func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) error {
 	log := logf.FromContext(ctx)
 	stsName := node.Name
@@ -1363,11 +1379,48 @@ func (r *GarageNodeReconciler) discoverNodeID(ctx context.Context, node *garagev
 		return "", fmt.Errorf("external nodes must have nodeId specified")
 	}
 
+	// DaemonSet-backed nodes have no <node>-0 pod — identity lives in whichever
+	// DaemonSet pod is scheduled on this GarageNode's Kubernetes node.
+	if isDaemonSetBacked(node) {
+		pod, err := r.daemonSetPodForNode(ctx, node, cluster)
+		if err != nil {
+			return "", err
+		}
+		log.Info("Attempting to discover node ID from DaemonSet pod", "pod", pod.Name, "kubernetesNode", node.Spec.KubernetesNodeName)
+		return r.getNodeIDFromPod(ctx, cluster.Namespace, pod.Name)
+	}
+
 	// For managed nodes, the pod name is the same as the node name with -0 suffix
 	podName := node.Name + "-0"
 
 	log.Info("Attempting to discover node ID from pod", "pod", podName)
 	return r.getNodeIDFromPod(ctx, cluster.Namespace, podName)
+}
+
+// daemonSetPodForNode returns the storage DaemonSet pod scheduled on the
+// Kubernetes node this DaemonSet-backed GarageNode represents. Pods are
+// matched by the storage-tier labels the cluster-owned DaemonSet stamps on
+// its template ({labelCluster, labelTier=storage}) plus spec.nodeName.
+func (r *GarageNodeReconciler) daemonSetPodForNode(ctx context.Context, node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) (*corev1.Pod, error) {
+	if node.Spec.KubernetesNodeName == "" {
+		return nil, fmt.Errorf("DaemonSet-backed node %s has no spec.kubernetesNodeName", node.Name)
+	}
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels(map[string]string{
+			labelCluster: cluster.Name,
+			labelTier:    tierStorage,
+		}),
+	); err != nil {
+		return nil, fmt.Errorf("listing storage DaemonSet pods: %w", err)
+	}
+	for i := range pods.Items {
+		if pods.Items[i].Spec.NodeName == node.Spec.KubernetesNodeName {
+			return &pods.Items[i], nil
+		}
+	}
+	return nil, fmt.Errorf("no storage DaemonSet pod found on Kubernetes node %q", node.Spec.KubernetesNodeName)
 }
 
 // getPodIPs returns all IP addresses assigned to the node's pod.
@@ -1378,15 +1431,23 @@ func (r *GarageNodeReconciler) getPodIPs(ctx context.Context, node *garagev1beta
 		return nil, fmt.Errorf("external nodes must have nodeId specified")
 	}
 
-	podName := node.Name + "-0"
-
-	pod := &corev1.Pod{}
-	if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: cluster.Namespace}, pod); err != nil {
-		return nil, fmt.Errorf("failed to get pod %s: %w", podName, err)
+	var pod *corev1.Pod
+	if isDaemonSetBacked(node) {
+		dsPod, err := r.daemonSetPodForNode(ctx, node, cluster)
+		if err != nil {
+			return nil, err
+		}
+		pod = dsPod
+	} else {
+		podName := node.Name + "-0"
+		pod = &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: cluster.Namespace}, pod); err != nil {
+			return nil, fmt.Errorf("failed to get pod %s: %w", podName, err)
+		}
 	}
 
 	if pod.Status.PodIP == "" {
-		return nil, fmt.Errorf("pod %s has no IP address yet", podName)
+		return nil, fmt.Errorf("pod %s has no IP address yet", pod.Name)
 	}
 
 	seen := map[string]bool{pod.Status.PodIP: true}

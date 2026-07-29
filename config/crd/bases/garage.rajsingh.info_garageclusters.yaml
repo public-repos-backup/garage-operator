@@ -6946,6 +6946,11 @@ spec:
                           type: string
                         description: Annotations to set on the PVC.
                         type: object
+                      hostPath:
+                        description: |-
+                          HostPath is the base directory on the Kubernetes node's filesystem for
+                          this volume. Required when type is HostPath; not allowed otherwise.
+                        type: string
                       labels:
                         additionalProperties:
                           type: string
@@ -7054,6 +7059,7 @@ spec:
                                   enum:
                                   - PersistentVolumeClaim
                                   - EmptyDir
+                                  - HostPath
                                   type: string
                                 volumeClaimTemplateSpec:
                                   description: VolumeClaimTemplateSpec allows full
@@ -7319,11 +7325,13 @@ spec:
                         type: string
                       type:
                         default: PersistentVolumeClaim
-                        description: 'Type specifies the volume type: PersistentVolumeClaim
-                          (default) or EmptyDir.'
+                        description: |-
+                          Type specifies the volume type: PersistentVolumeClaim (default), EmptyDir,
+                          or HostPath (storage-DaemonSet workload only).
                         enum:
                         - PersistentVolumeClaim
                         - EmptyDir
+                        - HostPath
                         type: string
                       volumeClaimTemplateSpec:
                         description: VolumeClaimTemplateSpec allows full customization
@@ -9819,6 +9827,16 @@ spec:
                             x-kubernetes-list-type: atomic
                         type: object
                     type: object
+                  capacity:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      Capacity is the uniform storage capacity advertised to the Garage layout
+                      for each node. Required when workload is DaemonSet (hostPath volumes have
+                      no PVC size to derive capacity from); ignored otherwise.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
                   capacityReservePercent:
                     description: |-
                       CapacityReservePercent reserves a percentage of PVC capacity for overhead.
@@ -10030,6 +10048,11 @@ spec:
                           type: string
                         description: Annotations to set on the PVC.
                         type: object
+                      hostPath:
+                        description: |-
+                          HostPath is the base directory on the Kubernetes node's filesystem for
+                          this volume. Required when type is HostPath; not allowed otherwise.
+                        type: string
                       labels:
                         additionalProperties:
                           type: string
@@ -10138,6 +10161,7 @@ spec:
                                   enum:
                                   - PersistentVolumeClaim
                                   - EmptyDir
+                                  - HostPath
                                   type: string
                                 volumeClaimTemplateSpec:
                                   description: VolumeClaimTemplateSpec allows full
@@ -10403,11 +10427,13 @@ spec:
                         type: string
                       type:
                         default: PersistentVolumeClaim
-                        description: 'Type specifies the volume type: PersistentVolumeClaim
-                          (default) or EmptyDir.'
+                        description: |-
+                          Type specifies the volume type: PersistentVolumeClaim (default), EmptyDir,
+                          or HostPath (storage-DaemonSet workload only).
                         enum:
                         - PersistentVolumeClaim
                         - EmptyDir
+                        - HostPath
                         type: string
                       volumeClaimTemplateSpec:
                         description: VolumeClaimTemplateSpec allows full customization
@@ -10852,6 +10878,11 @@ spec:
                           type: string
                         description: Annotations to set on the PVC.
                         type: object
+                      hostPath:
+                        description: |-
+                          HostPath is the base directory on the Kubernetes node's filesystem for
+                          this volume. Required when type is HostPath; not allowed otherwise.
+                        type: string
                       labels:
                         additionalProperties:
                           type: string
@@ -10960,6 +10991,7 @@ spec:
                                   enum:
                                   - PersistentVolumeClaim
                                   - EmptyDir
+                                  - HostPath
                                   type: string
                                 volumeClaimTemplateSpec:
                                   description: VolumeClaimTemplateSpec allows full
@@ -11225,11 +11257,13 @@ spec:
                         type: string
                       type:
                         default: PersistentVolumeClaim
-                        description: 'Type specifies the volume type: PersistentVolumeClaim
-                          (default) or EmptyDir.'
+                        description: |-
+                          Type specifies the volume type: PersistentVolumeClaim (default), EmptyDir,
+                          or HostPath (storage-DaemonSet workload only).
                         enum:
                         - PersistentVolumeClaim
                         - EmptyDir
+                        - HostPath
                         type: string
                       volumeClaimTemplateSpec:
                         description: VolumeClaimTemplateSpec allows full customization
@@ -11507,6 +11541,8 @@ spec:
                     description: |-
                       Replicas is the number of storage pods to deploy. Set to 0 to keep the
                       storage tier declared (config, PVC templates) but stop all pods.
+                      Ignored when workload is DaemonSet — the node count is the number of
+                      matching Kubernetes nodes.
                     format: int32
                     minimum: 0
                     type: integer
@@ -12032,6 +12068,16 @@ spec:
                       - whenUnsatisfiable
                       type: object
                     type: array
+                  workload:
+                    description: |-
+                      Workload selects how storage pods are deployed: StatefulSet (default)
+                      or DaemonSet (one Garage storage pod per matching Kubernetes node).
+                      DaemonSet requires HostPath metadata/data volumes, a uniform capacity,
+                      operator-managed layout, and Kubernetes peer discovery.
+                    enum:
+                    - StatefulSet
+                    - DaemonSet
+                    type: string
                 required:
                 - data
                 - metadata

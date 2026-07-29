@@ -161,7 +161,36 @@ func (r *GarageCluster) validateGarageCluster() (admission.Warnings, error) {
 		return warnings, err
 	}
 
-	if r.HasStorageTier() && r.Spec.LayoutPolicy != layoutPolicyManual {
+	// DaemonSet storage implies operator-managed layout: the operator derives
+	// one GarageNode per matching Kubernetes node, so user-owned (Manual)
+	// GarageNodes cannot coexist with it. Checked regardless of the Manual
+	// gate below — the conflict is precisely with Manual policy.
+	if r.HasStorageTier() && r.Spec.Storage.Workload == WorkloadTypeDaemonSet &&
+		r.EffectiveStorageLayoutPolicy() == layoutPolicyManual {
+		return warnings, fmt.Errorf("spec.storage.workload: DaemonSet requires operator-managed layout; storage layoutPolicy Manual is not supported")
+	}
+
+	// DaemonSet storage needs a uniform layout capacity (hostPath volumes have
+	// no PVC size to derive it from). Peer discovery for DaemonSet pods (whose
+	// IPs aren't deterministic) is handled by the operator's own
+	// Admin-API-driven bootstrap/reconnect nudge (bootstrapCluster, per-node
+	// connectNodeToCluster) — the same mechanism used for every other workload
+	// shape, so it requires spec.admin.adminTokenSecretRef to be set. Garage's
+	// native kubernetes_discovery is not auto-enabled: it requires RBAC (CRD
+	// patch + namespaced CR management) the operator does not grant workload
+	// pods by default, and enabling it without that RBAC just spams 403s.
+	if r.HasStorageTier() && r.Spec.Storage.Workload == WorkloadTypeDaemonSet {
+		if r.Spec.Storage.Capacity == nil {
+			return warnings, fmt.Errorf("spec.storage.capacity: required with workload DaemonSet (advertised to the Garage layout for every node)")
+		}
+	}
+
+	// Use the tier-aware effective policy, not the raw cluster-level field:
+	// spec.storage.layoutPolicy can override the cluster default (e.g. Manual
+	// storage under an Auto cluster), and validateStorageTier carries the
+	// DaemonSet HostPath/type-pairing/capacity checks that must still run
+	// whenever the storage tier itself is Auto-managed.
+	if r.HasStorageTier() && r.EffectiveStorageLayoutPolicy() != layoutPolicyManual {
 		if err := r.validateStorageTier(); err != nil {
 			return warnings, err
 		}
@@ -175,6 +204,14 @@ func (r *GarageCluster) validateGarageCluster() (admission.Warnings, error) {
 	if r.HasGatewayTier() && r.Spec.Gateway.Metadata != nil {
 		if err := r.validateVolumeConfig(r.Spec.Gateway.Metadata, "gateway.metadata"); err != nil {
 			return warnings, err
+		}
+		// HostPath only makes sense for the storage-DaemonSet workload, which
+		// pins pods to specific K8s nodes via hostPath identity. The gateway
+		// tier is always a StatefulSet with a PVC volumeClaimTemplate for
+		// metadata (buildGatewayVolumeClaimTemplates has no HostPath branch),
+		// so a HostPath type here would be admitted but silently ignored.
+		if r.Spec.Gateway.Metadata.Type == VolumeTypeHostPath {
+			return warnings, fmt.Errorf("gateway.metadata.type: HostPath is only supported for spec.storage.workload: DaemonSet, not the gateway tier")
 		}
 	}
 
@@ -380,6 +417,27 @@ func (r *GarageCluster) validateStorageTier() error {
 		return fmt.Errorf("spec.storage.data: required when spec.storage is set")
 	}
 
+	// Workload/volume-type pairing: DaemonSet storage lives on the node's
+	// filesystem (identity + data survive pod churn on the same node), so it
+	// requires HostPath for both volumes — and HostPath makes no sense under a
+	// StatefulSet, which provides identity via PVCs.
+	isDS := st.Workload == WorkloadTypeDaemonSet
+	if isDS {
+		if st.Metadata.Type != VolumeTypeHostPath {
+			return fmt.Errorf("storage.metadata.type: workload DaemonSet requires HostPath volumes")
+		}
+		if st.Data.Type != VolumeTypeHostPath {
+			return fmt.Errorf("storage.data.type: workload DaemonSet requires HostPath volumes")
+		}
+	} else {
+		if st.Metadata.Type == VolumeTypeHostPath {
+			return fmt.Errorf("storage.metadata.type: HostPath is only supported with spec.storage.workload: DaemonSet")
+		}
+		if st.Data.Type == VolumeTypeHostPath {
+			return fmt.Errorf("storage.data.type: HostPath is only supported with spec.storage.workload: DaemonSet")
+		}
+	}
+
 	if err := r.validateVolumeConfig(st.Metadata, "metadata"); err != nil {
 		return err
 	}
@@ -393,7 +451,7 @@ func (r *GarageCluster) validateStorageTier() error {
 		return fmt.Errorf("storage.metadata.paths: paths is only valid for data volumes")
 	}
 
-	if !r.isDataEphemeral() {
+	if !r.isDataEphemeral() && st.Data.Type != VolumeTypeHostPath {
 		if st.Data.Size == nil && len(st.Data.Paths) == 0 {
 			return fmt.Errorf("storage.data.size: must specify size for persistent data storage (or use storage.data.paths for multi-disk)")
 		}
@@ -403,6 +461,12 @@ func (r *GarageCluster) validateStorageTier() error {
 }
 
 func (r *GarageCluster) validateVolumeConfig(vc *VolumeConfig, name string) error {
+	if vc.Type == VolumeTypeHostPath && vc.HostPath == "" {
+		return fmt.Errorf("storage.%s.hostPath: required with HostPath type", name)
+	}
+	if vc.Type != VolumeTypeHostPath && vc.HostPath != "" {
+		return fmt.Errorf("storage.%s.hostPath: only allowed with HostPath type", name)
+	}
 	if vc.Type == VolumeTypeEmptyDir {
 		if vc.StorageClassName != nil {
 			return fmt.Errorf("storage.%s.storageClassName: not allowed with EmptyDir type", name)
