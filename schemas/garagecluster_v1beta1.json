@@ -1589,6 +1589,7 @@
                   "modulus": {
                     "description": "modulus to take of the hash of the source label values.\n\nOnly applicable when the action is `HashMod`.",
                     "format": "int64",
+                    "minimum": 0,
                     "type": "integer"
                   },
                   "regex": {
