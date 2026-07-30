@@ -36,6 +36,19 @@ func (g *GarageCluster) EffectiveStorageLayoutPolicy() string {
 	return g.Spec.LayoutPolicy
 }
 
+// EffectiveWorkload returns the storage tier's workload type, defaulting the
+// zero value to StatefulSet. Callers must use this instead of reading
+// st.Workload directly whenever the result is compared against another
+// defaulted value (e.g. old vs. new in a webhook update check) — comparing
+// raw fields lets an unset "" on one side and an explicit "StatefulSet" on
+// the other look like a change when they're actually equal.
+func (st *StorageSpec) EffectiveWorkload() WorkloadType {
+	if st == nil || st.Workload == "" {
+		return WorkloadTypeStatefulSet
+	}
+	return st.Workload
+}
+
 // IsManagementHandle returns true when this cluster is a pure connection handle
 // to an external Garage cluster: only spec.connectTo is set, with neither a
 // storage nor a gateway tier. The operator reconciles no workload for such a CR;

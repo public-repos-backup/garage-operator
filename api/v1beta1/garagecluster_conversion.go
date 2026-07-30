@@ -386,7 +386,7 @@ func (dst *GarageCluster) ConvertFrom(srcRaw conversion.Hub) error {
 // with `garage.rajsingh.info/v1beta2-only` (appending to any existing value,
 // e.g. a unified cluster's gateway-tier-present).
 func (dst *GarageCluster) elideDaemonSetStorage(src *v1beta2.GarageCluster) {
-	if src.Spec.Storage == nil || src.Spec.Storage.Workload != v1beta2.WorkloadTypeDaemonSet {
+	if src.Spec.Storage == nil || src.Spec.Storage.EffectiveWorkload() != v1beta2.WorkloadTypeDaemonSet {
 		return
 	}
 	if dst.Spec.Storage.Metadata != nil && string(dst.Spec.Storage.Metadata.Type) == string(v1beta2.VolumeTypeHostPath) {

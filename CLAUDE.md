@@ -291,8 +291,12 @@ than a floating PVC.
   produces a stream of 403s and no working discovery.
 - Requires operator-managed layout — `DaemonSet` + `layoutPolicy: Manual` is
   rejected.
-- Switching `StatefulSet` ⟷ `DaemonSet` tears down the previous shape's
-  workload and GarageNodes.
+- `spec.storage.workload` is **immutable**, and — specifically for
+  `DaemonSet` — `spec.storage` can't be removed once set either (that would
+  let a remove-then-re-add edit bypass the workload check); delete and
+  recreate the `GarageCluster` to change shape. Removing a `StatefulSet`
+  storage tier is unaffected and stays allowed (its existing teardown path,
+  e.g. converting to a management handle).
 - hostPath data is never cleaned up by the operator on GarageNode/Node
   deletion — the directory is left on the K8s node's disk.
 - Namespace-scoped installs can't use this workload: watching `Node` is

@@ -251,9 +251,7 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		case isDaemonSetStorage(cluster):
 			// DaemonSet workload: the cluster owns the pods (one per matching
 			// K8s node, hostPath-backed identity); GarageNodes keyed by node
-			// name own only the layout roles. The desired-set diff inside
-			// reconcileDaemonSetStorageNodes also cleans up leftover ordinal
-			// GarageNodes from a StatefulSet→DaemonSet switch.
+			// name own only the layout roles.
 			//
 			// This requires listing the cluster-scoped Node resource, which a
 			// namespace-scoped Role can never authorize (see ClusterScoped on
@@ -271,10 +269,10 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 		case cluster.HasStorageTier():
 			// Auto mode: migrate any pre-#190 legacy storage STS, then reconcile
-			// the per-node GarageNodes that replace it. A DaemonSet→StatefulSet
-			// switch tears down the DaemonSet here; the DS-backed GarageNodes
-			// fall out of the ordinal desired set inside
-			// reconcileAutoModeStorageNodes and are deleted by its diff.
+			// the per-node GarageNodes that replace it. deleteStorageDaemonSet
+			// is a no-op here in normal operation (spec.storage.workload is
+			// immutable, so a StatefulSet-workload cluster never had a
+			// DaemonSet) — defensive cleanup only.
 			if err := r.deleteStorageDaemonSet(ctx, cluster); err != nil {
 				return r.updateStatus(ctx, cluster, PhaseFailed, err)
 			}

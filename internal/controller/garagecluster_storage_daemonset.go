@@ -50,7 +50,7 @@ import (
 // isDaemonSetStorage reports whether the cluster's storage tier runs as a
 // DaemonSet workload.
 func isDaemonSetStorage(cluster *garagev1beta2.GarageCluster) bool {
-	return cluster.HasStorageTier() && cluster.Spec.Storage.Workload == garagev1beta2.WorkloadTypeDaemonSet
+	return cluster.HasStorageTier() && cluster.Spec.Storage.EffectiveWorkload() == garagev1beta2.WorkloadTypeDaemonSet
 }
 
 // storageDaemonSetName returns the canonical name of the cluster-owned
@@ -221,9 +221,12 @@ func (r *GarageClusterReconciler) reconcileDaemonSetStorageNodes(ctx context.Con
 		}
 	}
 
-	// GarageNodes whose K8s node is gone (or that belong to the previous
-	// StatefulSet workload shape) fall out of the desired set; deleting them
-	// triggers the per-node finalizer, which drains the layout role.
+	// GarageNodes whose K8s node is gone fall out of the desired set;
+	// deleting them triggers the per-node finalizer, which drains the layout
+	// role. spec.storage.workload is immutable (webhook-enforced), so a
+	// leftover ordinal (StatefulSet-shaped) GarageNode should never appear
+	// here in normal operation — this also defensively cleans one up if it
+	// does (e.g. a stray object predating the immutability rule).
 	var toDelete []*garagev1beta1.GarageNode
 	for name, n := range existing {
 		if desiredByName[name] {
@@ -246,10 +249,10 @@ func (r *GarageClusterReconciler) reconcileDaemonSetStorageNodes(ctx context.Con
 		// is required and applied uniformly to every node (webhook-enforced), so
 		// every desired node counts as surviving unless it's already mid-deletion
 		// in the pre-loop snapshot. This also correctly counts a node created
-		// earlier in THIS reconcile (e.g. during a StatefulSet→DaemonSet switch,
-		// where the replacement node doesn't exist yet in `existing`) — using
-		// countLiveStorageNodes here would undercount it and spuriously block a
-		// same-pass workload-shape switch, not just a real scale-down.
+		// earlier in THIS reconcile (e.g. a K8s Node that just joined and was
+		// created above in the same pass, so it doesn't exist yet in
+		// `existing`) — using countLiveStorageNodes here would undercount it
+		// and spuriously block what is really a scale-up, not a scale-down.
 		surviving := 0
 		for name := range desiredByName {
 			if n, ok := existing[name]; ok && !n.DeletionTimestamp.IsZero() {
@@ -267,7 +270,7 @@ func (r *GarageClusterReconciler) reconcileDaemonSetStorageNodes(ctx context.Con
 	}
 
 	for _, n := range toDelete {
-		log.Info("Deleting DaemonSet-backed GarageNode (K8s node gone or workload switch)", "name", n.Name)
+		log.Info("Deleting DaemonSet-backed GarageNode (K8s node gone)", "name", n.Name)
 		if err := r.Delete(ctx, n); err != nil && !errors.IsNotFound(err) {
 			return fmt.Errorf("deleting GarageNode %s: %w", n.Name, err)
 		}
@@ -345,9 +348,11 @@ func (r *GarageClusterReconciler) buildDaemonSetStorageNode(cluster *garagev1bet
 	return node, nil
 }
 
-// deleteStorageDaemonSet removes the cluster-owned storage DaemonSet (used
-// when the workload switches back to StatefulSet or the storage tier is
-// removed).
+// deleteStorageDaemonSet removes the cluster-owned storage DaemonSet. Called
+// whenever the storage tier isn't DaemonSet-workload (no storage tier, or
+// StatefulSet workload) — a no-op in the common case, since
+// spec.storage.workload is immutable and a StatefulSet-workload cluster never
+// had one; defensive cleanup if a DaemonSet exists anyway.
 func (r *GarageClusterReconciler) deleteStorageDaemonSet(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
 	log := logf.FromContext(ctx)
 	existing := &appsv1.DaemonSet{}

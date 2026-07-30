@@ -53,6 +53,9 @@ spec:
   storage:
     workload: DaemonSet
 
+    # ignored
+    replicas: 0
+
     # Applied uniformly to every node's layout entry — hostPath has no PVC
     # size to derive this from.
     capacity: 10Gi

@@ -127,6 +127,19 @@ func (v *GarageClusterValidator) ValidateUpdate(ctx context.Context, oldObj, new
 	if oldStorage == layoutPolicyManual && newStorage != "" && newStorage != layoutPolicyManual {
 		return warnings, fmt.Errorf("spec.storage.layoutPolicy transition from Manual to Auto is not supported (one-way only) — see issue #190")
 	}
+	if oldObj.HasStorageTier() {
+		oldWorkload := oldObj.Spec.Storage.EffectiveWorkload()
+		if !newObj.HasStorageTier() {
+			if oldWorkload == WorkloadTypeDaemonSet {
+				return warnings, fmt.Errorf("spec.storage cannot be removed once set for a DaemonSet workload (this would bypass spec.storage.workload immutability); delete and recreate the GarageCluster to change the storage tier's shape")
+			}
+		} else {
+			newWorkload := newObj.Spec.Storage.EffectiveWorkload()
+			if oldWorkload != newWorkload {
+				return warnings, fmt.Errorf("spec.storage.workload is immutable: cannot change from %s to %s on an existing cluster", oldWorkload, newWorkload)
+			}
+		}
+	}
 
 	oldFactor := 0
 	if oldObj.Spec.Replication != nil {
@@ -165,7 +178,7 @@ func (r *GarageCluster) validateGarageCluster() (admission.Warnings, error) {
 	// one GarageNode per matching Kubernetes node, so user-owned (Manual)
 	// GarageNodes cannot coexist with it. Checked regardless of the Manual
 	// gate below — the conflict is precisely with Manual policy.
-	if r.HasStorageTier() && r.Spec.Storage.Workload == WorkloadTypeDaemonSet &&
+	if r.HasStorageTier() && r.Spec.Storage.EffectiveWorkload() == WorkloadTypeDaemonSet &&
 		r.EffectiveStorageLayoutPolicy() == layoutPolicyManual {
 		return warnings, fmt.Errorf("spec.storage.workload: DaemonSet requires operator-managed layout; storage layoutPolicy Manual is not supported")
 	}
@@ -179,7 +192,7 @@ func (r *GarageCluster) validateGarageCluster() (admission.Warnings, error) {
 	// native kubernetes_discovery is not auto-enabled: it requires RBAC (CRD
 	// patch + namespaced CR management) the operator does not grant workload
 	// pods by default, and enabling it without that RBAC just spams 403s.
-	if r.HasStorageTier() && r.Spec.Storage.Workload == WorkloadTypeDaemonSet {
+	if r.HasStorageTier() && r.Spec.Storage.EffectiveWorkload() == WorkloadTypeDaemonSet {
 		if r.Spec.Storage.Capacity == nil {
 			return warnings, fmt.Errorf("spec.storage.capacity: required with workload DaemonSet (advertised to the Garage layout for every node)")
 		}
@@ -421,7 +434,7 @@ func (r *GarageCluster) validateStorageTier() error {
 	// filesystem (identity + data survive pod churn on the same node), so it
 	// requires HostPath for both volumes — and HostPath makes no sense under a
 	// StatefulSet, which provides identity via PVCs.
-	isDS := st.Workload == WorkloadTypeDaemonSet
+	isDS := st.EffectiveWorkload() == WorkloadTypeDaemonSet
 	if isDS {
 		if st.Metadata.Type != VolumeTypeHostPath {
 			return fmt.Errorf("storage.metadata.type: workload DaemonSet requires HostPath volumes")

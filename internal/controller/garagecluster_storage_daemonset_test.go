@@ -249,11 +249,18 @@ var _ = Describe("GarageCluster storage DaemonSet workload", func() {
 			Expect(nodes[0].Spec.KubernetesNodeName).To(Equal(matching))
 		})
 
-		It("cleans up leftover ordinal GarageNodes from a StatefulSet-to-DaemonSet workload switch", func() {
+		It("cleans up a stray ordinal-named GarageNode not in the DaemonSet's desired set", func() {
+			// spec.storage.workload is immutable (webhook-enforced), so an
+			// ordinal (StatefulSet-shaped) GarageNode can't arise from a live
+			// workload switch. This plants one directly to exercise
+			// reconcileDaemonSetStorageNodes' desired-set diff defensively:
+			// any GarageNode it doesn't recognize as DaemonSet-backed gets
+			// deleted, regardless of how it got there (e.g. a stray object
+			// predating this immutability rule).
 			worker := clusterNN.Name + "-worker"
 			mkNode(worker, nil)
 
-			By("planting an ordinal GarageNode as the STS workload would have left it")
+			By("planting a stray ordinal-named GarageNode")
 			staleCap := resource.MustParse("100Gi")
 			stale := &garagev1beta1.GarageNode{
 				ObjectMeta: metav1.ObjectMeta{
@@ -276,7 +283,7 @@ var _ = Describe("GarageCluster storage DaemonSet workload", func() {
 			Expect(reconciler.reconcileDaemonSetStorageNodes(ctx, cluster)).To(Succeed())
 
 			nodes := listStorageNodes()
-			Expect(nodes).To(HaveLen(1), "the stale ordinal GarageNode must be deleted, leaving only the DaemonSet-backed one")
+			Expect(nodes).To(HaveLen(1), "the stray ordinal GarageNode must be deleted, leaving only the DaemonSet-backed one")
 			Expect(nodes[0].Spec.Backing).To(Equal(garagev1beta1.NodeBackingDaemonSet))
 			Expect(nodes[0].Spec.KubernetesNodeName).To(Equal(worker))
 		})
@@ -323,11 +330,19 @@ var _ = Describe("GarageCluster storage DaemonSet workload", func() {
 			Expect(gnList.Items[0].Spec.KubernetesNodeName).To(Equal(k8sNodeName))
 		})
 
-		It("deletes the DaemonSet when the workload switches back to StatefulSet", func() {
+		It("tears down a stray storage DaemonSet if the workload field is ever changed to StatefulSet", func() {
+			// spec.storage.workload is immutable — the v1beta2 validating
+			// webhook (api/v1beta2/garagecluster_webhook.go) rejects this
+			// transition and is the real safeguard in production. This
+			// envtest suite doesn't install webhooks, so the Update below
+			// bypasses it; the point of this test is the reconciler's
+			// defense-in-depth cleanup (e.g. the webhook being briefly
+			// unavailable during an operator upgrade, or an object edited
+			// directly against etcd), not a supported user-facing switch.
 			reconcileTwice()
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterNN.Name + "-storage", Namespace: testNamespace}, &appsv1.DaemonSet{})).To(Succeed())
 
-			By("switching spec.storage.workload to StatefulSet")
+			By("bypassing the (unregistered-in-this-suite) webhook to force spec.storage.workload to StatefulSet")
 			fresh := &garagev1beta2.GarageCluster{}
 			Expect(k8sClient.Get(ctx, clusterNN, fresh)).To(Succeed())
 			fresh.Spec.Storage.Workload = garagev1beta2.WorkloadTypeStatefulSet
@@ -342,7 +357,7 @@ var _ = Describe("GarageCluster storage DaemonSet workload", func() {
 
 			Expect(errors.IsNotFound(
 				k8sClient.Get(ctx, types.NamespacedName{Name: clusterNN.Name + "-storage", Namespace: testNamespace}, &appsv1.DaemonSet{}),
-			)).To(BeTrue(), "the storage DaemonSet must be removed on switch-over")
+			)).To(BeTrue(), "the stray storage DaemonSet must be removed")
 		})
 	})
 
