@@ -1,6 +1,10 @@
 # Garage Kubernetes Operator
 
 > **Agent Notes**: Reference /Users/rajsingh/Documents/GitHub/garage for Garage source code. Update this file with important learnings.
+>
+> Follow [CONTRIBUTING.md](CONTRIBUTING.md) for the public contribution,
+> design, testing, pull request, and release workflow. Tool-specific guidance
+> does not override it.
 
 A Kubernetes operator for [Garage](https://garagehq.deuxfleurs.fr/) - distributed S3-compatible object storage.
 UPSTREAM CODEBASE ../garage

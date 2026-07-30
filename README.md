@@ -1285,10 +1285,15 @@ The operator includes an optional COSI (Container Object Storage Interface) driv
 
 ## Documentation
 
+- [Contributing](CONTRIBUTING.md) - Design, testing, and release workflow
+- [Design Records](docs/design/) - Designs for substantial or high-risk changes
 - [Helm Chart](charts/garage-operator/) - Installation and configuration
 - [Garage Docs](https://garagehq.deuxfleurs.fr/) - Garage project documentation
 
 ## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development and pull
+request workflow.
 
 ```bash
 make dev-up       # Start kind cluster with operator

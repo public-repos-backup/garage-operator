@@ -1,5 +1,8 @@
 # connectTo-only management handle (Stage 1 of issue #269)
 
+**Status:** Implemented in
+[#270](https://github.com/rajsinghtech/garage-operator/pull/270).
+
 ## Problem
 
 A user runs Garage deployed by the upstream Helm chart and wants the operator
@@ -48,7 +51,10 @@ other. Helm keeps owning the pods; the operator touches only Admin-API state.
 
 ```go
 func (g *GarageCluster) IsManagementHandle() bool {
-    return g != nil && g.Spec.Storage == nil && g.Spec.Gateway == nil && g.Spec.ConnectTo != nil
+    return g != nil &&
+        g.Spec.Storage == nil &&
+        g.Spec.Gateway == nil &&
+        g.Spec.ConnectTo != nil
 }
 ```
 
@@ -89,6 +95,7 @@ if cluster.IsManagementHandle() {
 ```
 
 `reconcileManagementHandle`:
+
 - Resolves the admin client and probes reachability (`GetClusterStatus`).
 - Reachable → `Status.Phase = Running`, condition `ManagementHandleReady=True`,
   requeue `RequeueAfterLong` (5m, matching healthy edge gateways).
