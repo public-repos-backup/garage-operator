@@ -5,7 +5,7 @@ image:
   pullPolicy: Never
 
 leaderElection:
-  enabled: false
+  enabled: true
 
 # Disable security contexts for Kind cluster compatibility
 podSecurityContext: {}

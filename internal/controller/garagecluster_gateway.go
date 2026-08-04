@@ -14,6 +14,8 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -24,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -32,12 +35,31 @@ import (
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	"github.com/rajsinghtech/garage-operator/internal/garage"
+	"github.com/rajsinghtech/garage-operator/internal/workloadidentity"
 )
 
 // gatewayDefaultMetadataSize is the default capacity of the gateway metadata PVC
 // when the user does not override `spec.gateway.metadata.size`. Gateway metadata
 // holds the Ed25519 node_key plus a small index — 1Gi is generous.
 var gatewayDefaultMetadataSize = resource.MustParse("1Gi")
+
+func gatewayPVCRetentionPolicy(policy *garagev1beta2.PVCRetentionPolicy) *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy {
+	if policy != nil {
+		return translatePVCRetentionPolicy(policy)
+	}
+	return &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+		WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+		WhenScaled:  appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+	}
+}
+
+const (
+	gatewayDataMarkerVolumeName    = "gateway-data-marker"
+	gatewayDataMarkerFile          = "garage-marker"
+	annotationGatewayDataMarker    = "garage.rajsingh.info/gateway-data-marker"
+	gatewayDataMarkerFieldPath     = "metadata.annotations['" + annotationGatewayDataMarker + "']"
+	gatewayDataMarkerLegacyContent = ""
+)
 
 // gatewayWorkloadName is the canonical name for the gateway-tier workload
 // (StatefulSet from v0.5.6 onwards; Deployment in older versions).
@@ -49,9 +71,9 @@ func gatewayWorkloadName(cluster *garagev1beta2.GarageCluster) string {
 //
 // Gateway pods get a small metadata PVC so the Ed25519 node identity Garage
 // stores under metadata_dir survives pod restarts. Data dir stays EmptyDir —
-// gateways do not store object blocks. PVC retention is Delete/Delete to keep
-// the existing "ephemeral semantics" of the gateway tier (PVCs vanish on
-// scale-down and CR deletion).
+// gateways do not store object blocks. PVC retention defaults to Delete/Delete
+// to keep the established edge-gateway lifecycle, but an explicit gateway
+// retention policy (including the released v1beta1 field) is honored.
 //
 // As a one-shot upgrade aid, any pre-existing Deployment with the same name
 // (from v0.5.5 and earlier) is removed before the StatefulSet is created.
@@ -68,6 +90,17 @@ func (r *GarageClusterReconciler) reconcileGatewayStatefulSet(ctx context.Contex
 	if gw == nil {
 		return nil
 	}
+	name := gatewayWorkloadName(cluster)
+	preexisting := &appsv1.StatefulSet{}
+	preexistingErr := r.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, preexisting)
+	if preexistingErr != nil && !errors.IsNotFound(preexistingErr) {
+		return preexistingErr
+	}
+	if errors.IsNotFound(preexistingErr) {
+		if err := validateEdgeGatewayPodNames(cluster); err != nil {
+			return fmt.Errorf("refusing to create edge gateway StatefulSet: %w", err)
+		}
+	}
 
 	// One-shot migration: pre-v0.5.6 deployed the gateway as a Deployment with
 	// the same name. Delete it before we provision the StatefulSet so the two
@@ -76,12 +109,11 @@ func (r *GarageClusterReconciler) reconcileGatewayStatefulSet(ctx context.Contex
 		return err
 	}
 
-	name := gatewayWorkloadName(cluster)
 	image := resolveGarageImage(cluster.Spec.Image, cluster.Spec.ImageRepository, r.DefaultImage)
 	replicas := gw.Replicas
 
 	containerPorts := buildContainerPorts(cluster)
-	volumes, volumeMounts := buildGatewayVolumesAndMounts(cluster)
+	volumes, volumeMounts := buildGatewayVolumesAndMounts(cluster, configHash)
 	volumeClaimTemplates := buildGatewayVolumeClaimTemplates(cluster)
 
 	podSpec := buildGaragePodSpec(PodSpecConfig{
@@ -103,26 +135,38 @@ func (r *GarageClusterReconciler) reconcileGatewayStatefulSet(ctx context.Contex
 		Env:                       gw.Env,
 		EnvFrom:                   gw.EnvFrom,
 	}, volumes, volumeMounts, containerPorts)
+	if err := validateGarageCredentialFileAccess(cluster, podSpec, "spec.gateway"); err != nil {
+		return err
+	}
 
-	podLabels := r.selectorLabelsForTier(cluster, tierGateway)
+	userPodLabels := workloadidentity.UserPodLabels(gw.PodLabels)
+	podLabels := make(map[string]string, len(userPodLabels)+4)
+	for key, value := range userPodLabels {
+		podLabels[key] = value
+	}
+	for key, value := range r.labelsForTier(cluster, tierGateway) {
+		podLabels[key] = value
+	}
 	// Add labelCluster to the pod template (NOT the STS selector — that's immutable
 	// for existing rollouts) so the cluster-scoped headless RPC service and primary
 	// API service (post-#190, selecting via labelCluster) include gateway pods.
 	podLabels[labelCluster] = cluster.Name
-	for k, v := range gw.PodLabels {
-		podLabels[k] = v
-	}
 
 	// Hash user-provided podAnnotations/podLabels alongside the pod spec so changes to those
 	// trigger an update (the update gate compares only the hash annotations).
-	podSpecHashStr := computePodSpecHash(podSpec, gw.PodAnnotations, gw.PodLabels)
+	podSpecHashStr := computePodSpecHash(podSpec, gw.PodAnnotations, userPodLabels)
 
 	podAnnotations := make(map[string]string)
 	for k, v := range gw.PodAnnotations {
 		podAnnotations[k] = v
 	}
-	podAnnotations["garage.rajsingh.info/config-hash"] = configHash
-	podAnnotations["garage.rajsingh.info/pod-spec-hash"] = podSpecHashStr
+	// Released gateway workloads created an empty garage-marker before Garage
+	// persisted its content in metadata/data_layout. Keep that byte-for-byte
+	// value across upgrades; a Pod-name marker would make every retained gateway
+	// metadata volume fail Garage's marker check on its next restart.
+	podAnnotations[annotationGatewayDataMarker] = gatewayDataMarkerLegacyContent
+	podAnnotations[annotationConfigHash] = configHash
+	podAnnotations[annotationPodSpecHash] = podSpecHashStr
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -133,16 +177,13 @@ func (r *GarageClusterReconciler) reconcileGatewayStatefulSet(ctx context.Contex
 		Spec: appsv1.StatefulSetSpec{
 			// Re-use the shared headless RPC service. It selects pods by the
 			// cluster-scoped label which is already present on gateway pods.
-			ServiceName:          cluster.Name + "-headless",
-			Replicas:             &replicas,
-			Selector:             &metav1.LabelSelector{MatchLabels: r.selectorLabelsForTier(cluster, tierGateway)},
-			PodManagementPolicy:  appsv1.ParallelPodManagement,
-			UpdateStrategy:       appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
-			VolumeClaimTemplates: volumeClaimTemplates,
-			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
-				WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
-				WhenScaled:  appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
-			},
+			ServiceName:                          cluster.Name + "-headless",
+			Replicas:                             &replicas,
+			Selector:                             &metav1.LabelSelector{MatchLabels: r.selectorLabelsForTier(cluster, tierGateway)},
+			PodManagementPolicy:                  appsv1.ParallelPodManagement,
+			UpdateStrategy:                       appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
+			VolumeClaimTemplates:                 volumeClaimTemplates,
+			PersistentVolumeClaimRetentionPolicy: gatewayPVCRetentionPolicy(gw.PVCRetentionPolicy),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels, Annotations: podAnnotations},
 				Spec:       podSpec,
@@ -164,10 +205,35 @@ func (r *GarageClusterReconciler) reconcileGatewayStatefulSet(ctx context.Contex
 		return err
 	}
 
-	// VolumeClaimTemplates are immutable; if the metadata storageClass changes,
-	// orphan-delete the StatefulSet and let the next reconcile re-create it.
-	if vctStorageClassChanged(existing.Spec.VolumeClaimTemplates, volumeClaimTemplates) {
-		log.Info("Gateway VolumeClaimTemplate storageClass changed, recreating StatefulSet (orphan cascade — delete old PVCs manually)", "name", name)
+	// VolumeClaimTemplates are immutable. Admission allows an edge gateway's
+	// PVC shape/size to change only after replicas reached zero. Do not trust the
+	// desired count alone: the user can submit the second update before the
+	// StatefulSet controller removes old Pods and claims. First drive the old
+	// StatefulSet to zero, then require exact old-UID Pods and every derived claim
+	// to disappear before orphan-deleting the controller. The next reconcile can
+	// then publish the new immutable template without overlapping identities or
+	// silently reusing an old claim.
+	if gatewayVolumeClaimTemplatesChanged(existing.Spec.VolumeClaimTemplates, volumeClaimTemplates) {
+		if err := validateEdgeGatewayPodNames(cluster); err != nil {
+			return fmt.Errorf("refusing to recreate edge gateway StatefulSet: %w", err)
+		}
+		if replicas != 0 {
+			return fmt.Errorf("refusing to recreate gateway StatefulSet %s for a metadata template change while desired replicas is %d", name, replicas)
+		}
+		if existing.Spec.Replicas == nil || *existing.Spec.Replicas != 0 {
+			existing.Spec.Replicas = ptr.To[int32](0)
+			log.Info("Scaling old gateway StatefulSet to zero before metadata template recreation", "name", name)
+			return r.Update(ctx, existing)
+		}
+		clear, reason, err := r.edgeGatewayStatefulSetStorageRetired(ctx, existing)
+		if err != nil {
+			return err
+		}
+		if !clear {
+			log.Info("Waiting for old gateway storage incarnation to retire before metadata template recreation", "name", name, "reason", reason)
+			return nil
+		}
+		log.Info("Gateway VolumeClaimTemplate changed, recreating StatefulSet with orphan propagation", "name", name)
 		propagation := metav1.DeletePropagationOrphan
 		if err := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !errors.IsNotFound(err) {
 			return fmt.Errorf("failed to delete gateway StatefulSet for VCT recreation: %w", err)
@@ -179,15 +245,27 @@ func (r *GarageClusterReconciler) reconcileGatewayStatefulSet(ctx context.Contex
 	if !equality.Semantic.DeepEqual(existing.Labels, sts.Labels) || !metav1.IsControlledBy(existing, cluster) {
 		needsUpdate = true
 	}
-	if existing.Spec.Template.Annotations["garage.rajsingh.info/config-hash"] != configHash ||
-		existing.Spec.Template.Annotations["garage.rajsingh.info/pod-spec-hash"] != podSpecHashStr {
+	if existing.Spec.Template.Annotations[annotationConfigHash] != configHash ||
+		existing.Spec.Template.Annotations[annotationPodSpecHash] != podSpecHashStr {
+		needsUpdate = true
+	}
+	if gw.PVCRetentionPolicy != nil && !equality.Semantic.DeepEqual(
+		existing.Spec.PersistentVolumeClaimRetentionPolicy,
+		sts.Spec.PersistentVolumeClaimRetentionPolicy,
+	) {
 		needsUpdate = true
 	}
 	if !needsUpdate {
 		return nil
 	}
+	if err := validateEdgeGatewayPodNames(cluster); err != nil {
+		return fmt.Errorf("refusing to roll edge gateway StatefulSet: %w", err)
+	}
 	existing.Spec.Replicas = sts.Spec.Replicas
 	existing.Spec.Template = sts.Spec.Template
+	if gw.PVCRetentionPolicy != nil {
+		existing.Spec.PersistentVolumeClaimRetentionPolicy = sts.Spec.PersistentVolumeClaimRetentionPolicy
+	}
 	// Re-assert operator labels + controllerRef so ownerRef/label drift
 	// self-heals (the STS selector is immutable and is intentionally left
 	// untouched). sts already had SetControllerReference applied above.
@@ -195,6 +273,58 @@ func (r *GarageClusterReconciler) reconcileGatewayStatefulSet(ctx context.Contex
 	existing.OwnerReferences = sts.OwnerReferences
 	log.Info("Updating gateway StatefulSet", "name", name)
 	return r.Update(ctx, existing)
+}
+
+func validateEdgeGatewayPodNames(cluster *garagev1beta2.GarageCluster) error {
+	if cluster == nil || cluster.Spec.Gateway == nil {
+		return nil
+	}
+	for ordinal := int32(0); ordinal < cluster.Spec.Gateway.Replicas; ordinal++ {
+		podName := fmt.Sprintf("%s-%d", gatewayWorkloadName(cluster), ordinal)
+		if errs := utilvalidation.IsValidLabelValue(podName); len(errs) > 0 {
+			return fmt.Errorf("StatefulSet Pod label %q is invalid: %s", podName, strings.Join(errs, "; "))
+		}
+	}
+	return nil
+}
+
+// edgeGatewayStatefulSetStorageRetired proves that a zero-replica edge
+// StatefulSet has no exact old-controller Pod and no PVC derived from one of
+// its immutable claim templates. It never deletes a claim: an unexpectedly
+// retained PVC blocks recreation for explicit operator inspection.
+func (r *GarageClusterReconciler) edgeGatewayStatefulSetStorageRetired(
+	ctx context.Context,
+	statefulSet *appsv1.StatefulSet,
+) (bool, string, error) {
+	if statefulSet == nil || statefulSet.UID == "" {
+		return false, "StatefulSet UID is not observable", nil
+	}
+
+	pods := &corev1.PodList{}
+	if err := r.safetyReader().List(ctx, pods, client.InNamespace(statefulSet.Namespace)); err != nil {
+		return false, "", fmt.Errorf("listing Pods before gateway StatefulSet metadata recreation: %w", err)
+	}
+	for i := range pods.Items {
+		owner := metav1.GetControllerOf(&pods.Items[i])
+		if owner != nil && owner.Kind == kindStatefulSet && owner.UID == statefulSet.UID {
+			return false, fmt.Sprintf("Pod %s owned by old StatefulSet UID %s still exists", pods.Items[i].Name, statefulSet.UID), nil
+		}
+	}
+
+	claims := &corev1.PersistentVolumeClaimList{}
+	if err := r.safetyReader().List(ctx, claims, client.InNamespace(statefulSet.Namespace)); err != nil {
+		return false, "", fmt.Errorf("listing PVCs before gateway StatefulSet metadata recreation: %w", err)
+	}
+	for i := range claims.Items {
+		for j := range statefulSet.Spec.VolumeClaimTemplates {
+			prefix := statefulSet.Spec.VolumeClaimTemplates[j].Name + "-" + statefulSet.Name + "-"
+			if strings.HasPrefix(claims.Items[i].Name, prefix) {
+				return false, fmt.Sprintf("PVC %s from the old immutable claim template still exists", claims.Items[i].Name), nil
+			}
+		}
+	}
+
+	return true, "", nil
 }
 
 // deletePreviousGatewayDeployment removes any pre-v0.5.6 Deployment with the
@@ -253,99 +383,99 @@ func (r *GarageClusterReconciler) deleteStorageStatefulSet(ctx context.Context, 
 	return r.Delete(ctx, existing)
 }
 
-// buildGatewayVolumesAndMounts builds the volumes and mounts for a gateway pod.
+// buildGatewayVolumesAndMounts builds the volumes and mounts for the
+// cluster-owned edge-gateway StatefulSet. Unified gateway identities are
+// GarageNode-owned and receive their exact per-node config revision through the
+// GarageNode renderer; this builder always consumes the shared cluster config.
 //
-// Metadata is provisioned via a StatefulSet volumeClaimTemplate (see
-// buildGatewayVolumeClaimTemplates) so it does NOT appear in the volumes list
-// here. The data dir stays EmptyDir because gateways do not store object
-// blocks. RPC secret comes from the connected storage cluster when set; else
-// from the gateway cluster's own RPC secret (auto-generated or referenced).
-func buildGatewayVolumesAndMounts(cluster *garagev1beta2.GarageCluster) ([]corev1.Volume, []corev1.VolumeMount) {
-	mounts := []corev1.VolumeMount{
-		{Name: configVolumeName, MountPath: configMountPath, ReadOnly: true},
-		{Name: RPCSecretKey, MountPath: rpcSecretMountPath, ReadOnly: true},
-		{Name: metadataVolName, MountPath: metadataPath},
-		{Name: dataVolName, MountPath: dataPath},
+// Persistent metadata is provisioned via a StatefulSet volumeClaimTemplate
+// (see buildGatewayVolumeClaimTemplates), so it does not appear in the volumes
+// list here. An explicit metadata.type=EmptyDir instead renders a real
+// metadata volume and no claim template. The data dir always stays EmptyDir
+// because gateways do not store object blocks. RPC secret comes from the
+// connected storage cluster when set; otherwise from the gateway cluster's own
+// RPC secret (auto-generated or referenced).
+func buildGatewayVolumesAndMounts(cluster *garagev1beta2.GarageCluster, configHash ...string) ([]corev1.Volume, []corev1.VolumeMount) {
+	credentialVolumes, credentialMounts := buildGarageCredentialVolumesAndMounts(cluster, true)
+	mounts := make([]corev1.VolumeMount, 0, 3+len(credentialMounts))
+	mounts = append(mounts,
+		corev1.VolumeMount{Name: configVolumeName, MountPath: configMountPath, ReadOnly: true},
+		corev1.VolumeMount{Name: metadataVolName, MountPath: metadataPath},
+		corev1.VolumeMount{Name: dataVolName, MountPath: dataPath},
+		gatewayDataMarkerMount(),
+	)
+
+	// Edge gateways consume the shared cluster revision. The historical
+	// <name>-gateway-config resource is no longer published; selecting that base
+	// for a unified cluster would construct a name that can never exist.
+	configName := cluster.Name + "-config"
+	if len(configHash) > 0 && configHash[0] != "" {
+		configName = garageConfigRevisionName(configName, configHash[0])
 	}
 
-	rpcSecretName := cluster.Name + "-rpc-secret"
-	rpcSecretKey := RPCSecretKey
-	if cluster.Spec.Network.RPCSecretRef != nil {
-		rpcSecretName = cluster.Spec.Network.RPCSecretRef.Name
-		if cluster.Spec.Network.RPCSecretRef.Key != "" {
-			rpcSecretKey = cluster.Spec.Network.RPCSecretRef.Key
-		}
-	}
-	if cluster.Spec.ConnectTo != nil {
-		if cluster.Spec.ConnectTo.RPCSecretRef != nil {
-			rpcSecretName = cluster.Spec.ConnectTo.RPCSecretRef.Name
-			if cluster.Spec.ConnectTo.RPCSecretRef.Key != "" {
-				rpcSecretKey = cluster.Spec.ConnectTo.RPCSecretRef.Key
-			}
-		} else if cluster.Spec.ConnectTo.ClusterRef != nil {
-			rpcSecretName = cluster.Spec.ConnectTo.ClusterRef.Name + "-rpc-secret"
-		}
-	}
-
-	// Use the gateway-specific ConfigMap when the operator created one
-	// (spec.gateway.rpcPublicAddr is set alongside spec.storage). Otherwise
-	// fall back to the shared <name>-config map.
-	configMapName := cluster.Name + "-config"
-	if cluster.HasStorageTier() && cluster.HasGatewayTier() && cluster.Spec.Gateway.RPCPublicAddr != "" {
-		configMapName = cluster.Name + "-gateway-config"
-	}
-
-	volumes := []corev1.Volume{
-		{
-			Name: configVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: configMapName},
-				},
-			},
-		},
-		{
-			Name: RPCSecretKey,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  rpcSecretName,
-					DefaultMode: ptr.To[int32](0600),
-					Items:       []corev1.KeyToPath{{Key: rpcSecretKey, Path: RPCSecretKey}},
-				},
-			},
+	volumes := make([]corev1.Volume, 0, 2+len(credentialVolumes))
+	volumes = append(volumes,
+		corev1.Volume{
+			Name:         configVolumeName,
+			VolumeSource: garageConfigVolumeSource(cluster, configName),
 		},
 		// metadata is provisioned via volumeClaimTemplates, not here.
-		{
+		corev1.Volume{
 			Name: dataVolName,
 			VolumeSource: corev1.VolumeSource{
 				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		},
+		gatewayDataMarkerVolume(),
+	)
+	if cluster.Spec.Gateway != nil {
+		if metadata := cluster.Spec.Gateway.Metadata; metadata != nil && metadata.Type == garagev1beta2.VolumeTypeEmptyDir {
+			emptyDir := &corev1.EmptyDirVolumeSource{}
+			if metadata.Size != nil && !metadata.Size.IsZero() {
+				sizeLimit := metadata.Size.DeepCopy()
+				emptyDir.SizeLimit = &sizeLimit
+			}
+			volumes = append(volumes, corev1.Volume{
+				Name: metadataVolName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: emptyDir,
+				},
+			})
+		}
 	}
 
-	if cluster.Spec.Admin != nil && cluster.Spec.Admin.AdminTokenSecretRef != nil {
-		adminTokenKey := DefaultAdminTokenKey
-		if cluster.Spec.Admin.AdminTokenSecretRef.Key != "" {
-			adminTokenKey = cluster.Spec.Admin.AdminTokenSecretRef.Key
-		}
-		volumes = append(volumes, corev1.Volume{
-			Name: DefaultAdminTokenKey,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  cluster.Spec.Admin.AdminTokenSecretRef.Name,
-					DefaultMode: ptr.To[int32](0600),
-					Items:       []corev1.KeyToPath{{Key: adminTokenKey, Path: DefaultAdminTokenKey}},
-				},
-			},
-		})
-		mounts = append(mounts, corev1.VolumeMount{
-			Name:      DefaultAdminTokenKey,
-			MountPath: adminSecretMountPath,
-			ReadOnly:  true,
-		})
-	}
+	volumes = append(volumes, credentialVolumes...)
+	mounts = append(mounts, credentialMounts...)
 
 	return volumes, mounts
+}
+
+// Garage accepts an existing read-only marker and persists its exact content in
+// the metadata layout. Released gateway workloads used `touch`, so that content
+// is the empty string. Projecting an operator-owned empty Pod annotation removes
+// the separate BusyBox init image without invalidating retained metadata PVCs.
+func gatewayDataMarkerVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: gatewayDataMarkerVolumeName,
+		VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{
+			Items: []corev1.DownwardAPIVolumeFile{{
+				Path: gatewayDataMarkerFile,
+				FieldRef: &corev1.ObjectFieldSelector{
+					APIVersion: "v1",
+					FieldPath:  gatewayDataMarkerFieldPath,
+				},
+			}},
+		}},
+	}
+}
+
+func gatewayDataMarkerMount() corev1.VolumeMount {
+	return corev1.VolumeMount{
+		Name:      gatewayDataMarkerVolumeName,
+		MountPath: dataPath + "/" + gatewayDataMarkerFile,
+		SubPath:   gatewayDataMarkerFile,
+		ReadOnly:  true,
+	}
 }
 
 // buildGatewayVolumeClaimTemplates returns the PVC templates for the gateway
@@ -353,6 +483,9 @@ func buildGatewayVolumesAndMounts(cluster *garagev1beta2.GarageCluster) ([]corev
 // EmptyDir on a gateway pod.
 func buildGatewayVolumeClaimTemplates(cluster *garagev1beta2.GarageCluster) []corev1.PersistentVolumeClaim {
 	if cluster.Spec.Gateway == nil {
+		return nil
+	}
+	if metadata := cluster.Spec.Gateway.Metadata; metadata != nil && metadata.Type == garagev1beta2.VolumeTypeEmptyDir {
 		return nil
 	}
 
@@ -396,34 +529,39 @@ func buildGatewayVolumeClaimTemplates(cluster *garagev1beta2.GarageCluster) []co
 //
 // When `layoutManagement.autoApply` is true the removal is staged AND applied.
 // Otherwise stale entries are surfaced via the GatewayTombstones condition and
-// PendingGatewayTombstones status field for manual approval (via the
-// force-layout-apply annotation).
+// PendingGatewayTombstones status field, but are neither staged nor applied;
+// users must remove those exact roles with the Garage CLI or enable autoApply.
 func (r *GarageClusterReconciler) reconcileGatewayTombstones(ctx context.Context, cluster *garagev1beta2.GarageCluster) {
 	log := logf.FromContext(ctx)
 	if !cluster.HasGatewayTier() {
 		return
 	}
 
-	// Forward-only edge gateway (#243): the external cluster cannot dial back to the
-	// gateway pods (no rpcPublicAddr/publicEndpoint), so it permanently reports the
-	// gateway's role as not isUp. The reaper keys staleness off isUp and edge gateways
-	// have no claimed-set protection, so it would reap the gateway's own live role
-	// every cycle — and under autoApply the gateway immediately re-registers, yielding
-	// the infinite add/remove layout churn. The role is not actually stale; skip the
-	// reaper for this topology. (A real removal still happens via the GarageNode/STS
-	// finalizer path on delete.)
-	if edgeGatewayReverseUnroutable(cluster) {
-		log.V(1).Info("Skipping gateway tombstone cleanup (forward-only edge gateway; reverse reachability not configured)")
-		if len(cluster.Status.PendingGatewayTombstones) > 0 {
-			cluster.Status.PendingGatewayTombstones = nil
-		}
-		meta.RemoveStatusCondition(&cluster.Status.Conditions, garagev1beta1.ConditionGatewayTombstones)
-		return
-	}
+	// Forward-only edge gateways cannot be reported isUp by the external cluster.
+	// Keep inspecting the layout so an intentional scale-down can retire exact-UID
+	// ordinals outside the desired range, but suppress dwell-based reaping of
+	// desired ordinals below. Edge gateway replicas have no per-ordinal GarageNode
+	// finalizer, so scale-down cleanup belongs here.
+	forwardOnlyEdge := edgeGatewayReverseUnroutable(cluster)
 
 	layoutClient, err := r.gatewayLayoutClient(ctx, cluster)
 	if err != nil {
 		log.V(1).Info("Skipping gateway tombstone cleanup (admin client not ready)", "error", err)
+		return
+	}
+	layoutOwner, err := resolveGarageLayoutOwner(ctx, r.safetyReader(), cluster)
+	if err != nil {
+		log.V(1).Info("Waiting to resolve canonical layout owner before gateway tombstone cleanup", "reason", err.Error())
+		return
+	}
+	release, err := acquireLayoutMutation(r.layoutMutationCoordinator(), layoutOwner)
+	if err != nil {
+		log.V(1).Info("Waiting to inspect gateway tombstones behind another layout writer", "reason", err.Error())
+		return
+	}
+	defer release()
+	if err := requireSettledLayoutHistory(ctx, layoutClient); err != nil {
+		log.V(1).Info("Waiting for settled layout history before gateway tombstone cleanup", "reason", err.Error())
 		return
 	}
 
@@ -439,18 +577,16 @@ func (r *GarageClusterReconciler) reconcileGatewayTombstones(ctx context.Context
 	}
 
 	live := make(map[string]bool, len(status.Nodes))
-	// sustainedDown gates the untagged #224 backstop: a tag-stripped, gateway-shaped
-	// role is only reaped after it has been continuously down past the same dwell
-	// PeerUnreachable uses, so a transient blip — or a briefly-down federated peer
-	// whose role landed in the local zone — is never reaped on a single isUp=false
-	// snapshot (the tagged path keeps its claimed-set protection and needs no dwell).
+	// sustainedDown prevents native edge-gateway rolling updates and transient
+	// federation disconnects from looking like abandoned identities. Every
+	// automatic tombstone removal requires the same dwell used by PeerUnreachable.
 	sustainedDown := make(map[string]bool)
 	for _, n := range status.Nodes {
 		if n.IsUp {
 			live[n.ID] = true
 			continue
 		}
-		if n.LastSeenSecsAgo != nil && time.Duration(*n.LastSeenSecsAgo)*time.Second >= peerUnreachableThreshold {
+		if !forwardOnlyEdge && n.LastSeenSecsAgo != nil && time.Duration(*n.LastSeenSecsAgo)*time.Second >= peerUnreachableThreshold {
 			sustainedDown[n.ID] = true
 		}
 	}
@@ -478,21 +614,23 @@ func (r *GarageClusterReconciler) reconcileGatewayTombstones(ctx context.Context
 		}
 	}
 
-	// Scope the reaper to the LOCAL region. In a federation every region shares
-	// the same cluster:<name>/<ns> ownership tag, so without zone scoping each
-	// region would reap the others' gateway roles -> endless cross-region layout
-	// churn (#220). The gateway role carries the region's zone (set by
-	// buildAutoModeGatewayNode -> GarageNode layout staging), so only roles whose
-	// zone matches this cluster's zone are ours to remove.
-	// In a unified Auto cluster the reaper runs against the LOCAL layout, where the
-	// only capacity:null roles in the local zone are gateways (storage always carries
-	// non-nil capacity). That lets us reap a local-zone, capacity:null, unclaimed,
-	// down role even if it lost its tier:gateway tag — e.g. a federation re-import
-	// stripped it (#224). Gate this backstop off for edge gateways (claimed map is
-	// empty and the layout is the remote storage cluster's) and for Manual clusters
-	// (user-owned roles aren't claimed), where it could over-reap.
-	hardenUntagged := cluster.HasStorageTier() && cluster.Spec.LayoutPolicy != LayoutPolicyManual
-	stale := staleGatewayRoles(layout.Roles, localGatewayZone(cluster), cluster.Name, cluster.Namespace, live, claimed, sustainedDown, hardenUntagged)
+	// Name, namespace, and zone are not unique in a federation. Only the
+	// cluster-uid tag written from this exact Kubernetes object authorizes
+	// automatic removal. Legacy/tag-stripped roles remain visible for explicit
+	// cleanup instead of risking another site's gateway.
+	var edgeDesiredReplicas *int32
+	if !cluster.HasStorageTier() && cluster.Spec.Gateway != nil {
+		edgeDesiredReplicas = &cluster.Spec.Gateway.Replicas
+	}
+	stale := staleGatewayRoles(
+		layout.Roles,
+		localGatewayZone(cluster),
+		string(cluster.UID),
+		live,
+		claimed,
+		sustainedDown,
+		edgeDesiredReplicas,
+	)
 
 	if len(stale) == 0 {
 		if len(cluster.Status.PendingGatewayTombstones) > 0 {
@@ -510,7 +648,7 @@ func (r *GarageClusterReconciler) reconcileGatewayTombstones(ctx context.Context
 			Type:    garagev1beta1.ConditionGatewayTombstones,
 			Status:  metav1.ConditionTrue,
 			Reason:  garagev1beta1.ReasonGatewayTombstonesPending,
-			Message: fmt.Sprintf("%d stale gateway entries pending; set spec.layoutManagement.autoApply: true or use the force-layout-apply annotation", len(stale)),
+			Message: fmt.Sprintf("%d stale gateway entries pending; set spec.layoutManagement.autoApply: true or remove the exact roles with the Garage CLI", len(stale)),
 		})
 		log.Info("Stale gateway entries pending (autoApply disabled)", "count", len(stale))
 		return
@@ -520,33 +658,49 @@ func (r *GarageClusterReconciler) reconcileGatewayTombstones(ctx context.Context
 	for _, id := range stale {
 		changes = append(changes, garage.NodeRoleChange{ID: id, Remove: true})
 	}
-	if err := layoutClient.UpdateClusterLayout(ctx, changes); err != nil {
-		log.Error(err, "Failed to stage stale gateway entry removal")
+	// Persist the exact identities before Apply. A crash after Garage commits the
+	// removal must leave an operator-visible recovery boundary. Surviving current
+	// members normally converge the version; if another peer/history version
+	// blocks it, Garage exposes only a cluster-wide recovery API, never a
+	// target-scoped one.
+	persistPending := func() {
+		cluster.Status.PendingGatewayTombstones = append([]string(nil), stale...)
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:   garagev1beta1.ConditionGatewayTombstones,
+			Status: metav1.ConditionTrue,
+			Reason: garagev1beta1.ReasonGatewayTombstonesPending,
+			Message: fmt.Sprintf(
+				"%d stale gateway role removal(s) are pending normal layout convergence; if a dead identity blocks ACK, assess the entire layout before using the explicit skip-dead-nodes annotation",
+				len(stale),
+			),
+		})
+	}
+	persistPending()
+	if err := UpdateStatusWithRetry(ctx, r.Client, cluster, persistPending); err != nil {
+		log.Error(err, "Could not persist exact gateway tombstone targets before Garage Apply")
 		return
 	}
-	if err := layoutClient.ApplyStagedLayoutChanges(ctx); err != nil {
+	if _, err := stageAndApplyExclusiveLayout(ctx, layoutClient, layout, changes, nil, func() error {
+		if err := layoutClient.UpdateClusterLayout(ctx, changes); err != nil {
+			return fmt.Errorf("staging stale gateway entry removal: %w", err)
+		}
+		return nil
+	}); err != nil {
 		if !garage.IsReplicationConstraint(err) {
-			log.Error(err, "Failed to apply gateway tombstone removal")
+			log.Error(err, "Refusing or failing gateway tombstone removal")
 		}
 		return
 	}
-	// Re-read for the authoritative current version. A concurrent writer may have
-	// advanced past layout.Version+1, so the guess is unsafe for skip-dead-nodes;
-	// only call it when we actually obtained a fresh version (the next reconcile
-	// re-drives this cleanup otherwise).
+	// Re-read only for diagnostics. Never invoke skip-dead-nodes automatically:
+	// upstream force-ACKs every peer the serving node currently sees as down, not
+	// just the exact tombstone identities persisted above.
 	newVersion, ok := reReadLayoutVersion(ctx, layoutClient)
 	if ok {
-		log.Info("Removed stale gateway entries from layout", "count", len(stale), "version", newVersion)
-		skipReq := garage.SkipDeadNodesRequest{Version: newVersion, AllowMissingData: true}
-		if _, err := layoutClient.ClusterLayoutSkipDeadNodes(ctx, skipReq); err != nil && !garage.IsBadRequest(err) {
-			log.V(1).Info("skip-dead-nodes after tombstone removal failed", "error", err)
-		}
+		log.Info("Removed stale gateway entries from layout; waiting for normal ACK or explicit cluster-wide recovery",
+			"count", len(stale), "version", newVersion)
 	} else {
-		log.Info("Removed stale gateway entries from layout (could not re-read version; skip-dead-nodes deferred to next reconcile)", "count", len(stale))
+		log.Info("Removed stale gateway entries from layout; committed version is not observable yet", "count", len(stale))
 	}
-
-	cluster.Status.PendingGatewayTombstones = nil
-	meta.RemoveStatusCondition(&cluster.Status.Conditions, garagev1beta1.ConditionGatewayTombstones)
 }
 
 // gatewayLayoutClient returns the admin API client whose layout the gateway entries
@@ -592,42 +746,42 @@ func localGatewayZone(cluster *garagev1beta2.GarageCluster) string {
 
 // staleGatewayRoles returns the IDs of gateway layout roles owned by this
 // cluster that are no longer backed by a live or operator-claimed gateway node
-// and are therefore safe to remove. It is scoped to localZone: a role in any
-// other zone belongs to a different federated region and is skipped entirely
-// (#220). A role qualifies only when it carries BOTH the cluster ownership tag
-// and the tier:gateway tag, sits in localZone, and is neither live (isUp) nor
-// claimed by a live operator-owned gateway GarageNode CR.
-// hardenUntagged enables the #224 backstop: reap a local-zone, capacity:null,
-// unclaimed, down role even when it lacks the tier:gateway / ownership tags (e.g. a
-// federation re-import stripped them). The caller sets it only for unified Auto
-// clusters, where local-zone capacity:null roles are exclusively operator-owned
-// gateways and a mid-restart gateway is protected by the claimed set.
-func staleGatewayRoles(roles []garage.LayoutNodeRole, localZone, clusterName, clusterNamespace string, live, claimed, sustainedDown map[string]bool, hardenUntagged bool) []string {
-	ownershipTag := fmt.Sprintf("cluster:%s/%s", clusterName, clusterNamespace)
+// and are therefore safe to remove. A role qualifies only when it carries the
+// exact cluster UID and tier:gateway tags, sits in localZone, has remained down
+// past the safety dwell, and is not claimed by a live GarageNode CR. During an
+// edge-gateway scale-down, an exact-UID role whose pod ordinal is outside the
+// desired replica range is immediately retired; desired ordinals still require
+// the dwell so a native StatefulSet rollout cannot churn their persistent role.
+func staleGatewayRoles(
+	roles []garage.LayoutNodeRole,
+	localZone,
+	clusterUID string,
+	live,
+	claimed,
+	sustainedDown map[string]bool,
+	edgeDesiredReplicas *int32,
+) []string {
 	tierTag := "tier:" + tierGateway
 	var stale []string
 	for _, role := range roles {
 		if role.Zone != localZone {
 			continue
 		}
-		ownsThis := false
 		isGatewayTier := false
 		for _, tag := range role.Tags {
-			if tag == ownershipTag {
-				ownsThis = true
-			}
 			if tag == tierTag {
 				isGatewayTier = true
 			}
 		}
-		tagged := ownsThis && isGatewayTier
-		// Gateway-shaped backstop for tag-stripped orphans (#224): in a unified
-		// cluster the local zone's only capacity:null roles are gateways. Requires
-		// sustainedDown so a transiently-down peer (e.g. an imported federated role
-		// that lands in the local zone) is never reaped on a single snapshot — the
-		// tagged path above stays claimed-protected and needs no dwell.
-		untaggedGatewayShaped := hardenUntagged && role.Capacity == nil && sustainedDown[role.ID]
-		if !tagged && !untaggedGatewayShaped {
+		retiredEdgeOrdinal := false
+		if edgeDesiredReplicas != nil {
+			if ordinalText, ok := parseRemotePodOrdinal(role.Tags, tierGateway); ok {
+				ordinal, err := strconv.Atoi(ordinalText)
+				retiredEdgeOrdinal = err == nil && int32(ordinal) >= *edgeDesiredReplicas
+			}
+		}
+		if !isGatewayTier || !nodeBelongsToClusterUID(role.Tags, clusterUID) ||
+			(!retiredEdgeOrdinal && !sustainedDown[role.ID]) {
 			continue
 		}
 		if live[role.ID] || claimed[role.ID] {

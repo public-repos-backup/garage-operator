@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -41,6 +43,18 @@ import (
 // symmetric across tiers.
 func autoModeGatewayNodeName(clusterName string, ordinal int32) string {
 	return fmt.Sprintf("%s-gateway-%d", clusterName, ordinal)
+}
+
+func parseAutoModeGatewayOrdinal(nodeName, clusterName string) (int32, bool) {
+	prefix := clusterName + "-gateway-"
+	if !strings.HasPrefix(nodeName, prefix) {
+		return 0, false
+	}
+	ordinal, err := strconv.ParseInt(nodeName[len(prefix):], 10, 32)
+	if err != nil || ordinal < 0 {
+		return 0, false
+	}
+	return int32(ordinal), true
 }
 
 // reconcileAutoModeGatewayNodes generates and reconciles one gateway GarageNode
@@ -68,8 +82,19 @@ func (r *GarageClusterReconciler) reconcileAutoModeGatewayNodes(ctx context.Cont
 	if err != nil {
 		return fmt.Errorf("listing operator-owned gateway GarageNodes: %w", err)
 	}
+	if adopted, err := r.ensureAutoModeCycleOwnership(ctx, cluster, existing, tierGateway); err != nil {
+		return err
+	} else if adopted {
+		return nil
+	}
 
+	type pendingGatewayUpdate struct {
+		current *garagev1beta1.GarageNode
+		desired *garagev1beta1.GarageNode
+	}
 	desiredByName := make(map[string]bool, desiredReplicas)
+	var toCreate []*garagev1beta1.GarageNode
+	var toUpdate []pendingGatewayUpdate
 	for i := int32(0); i < desiredReplicas; i++ {
 		desiredByName[autoModeGatewayNodeName(cluster.Name, i)] = true
 
@@ -78,43 +103,96 @@ func (r *GarageClusterReconciler) reconcileAutoModeGatewayNodes(ctx context.Cont
 			return fmt.Errorf("building desired gateway GarageNode for ordinal %d: %w", i, err)
 		}
 
-		current, found := existing[desired.Name]
-		if !found {
-			log.Info("Creating Auto-mode gateway GarageNode", "name", desired.Name)
-			if err := r.Create(ctx, desired); err != nil && !errors.IsAlreadyExists(err) {
-				return fmt.Errorf("creating gateway GarageNode %s: %w", desired.Name, err)
+		// Repeated cycles accumulate exact -cycle suffixes. Keep deleting
+		// ancestors out of the parent scale loop and let the sole live promoted
+		// descendant satisfy this ordinal.
+		descendantNames, current, err := resolveAutoModeCycleSlot(existing, desired.Name)
+		if err != nil {
+			return fmt.Errorf("resolving promoted gateway cycle for ordinal %d: %w", i, err)
+		}
+		for _, name := range descendantNames {
+			desiredByName[name] = true
+		}
+		if current == nil {
+			if nameErr := validateManagedGarageNodeName(desired); nameErr != nil {
+				return fmt.Errorf("refusing to create Auto gateway GarageNode ordinal %d: %w", i, nameErr)
 			}
+			toCreate = append(toCreate, desired)
 			continue
 		}
 
 		if autoModeGatewayNodeNeedsUpdate(current, desired) {
-			log.Info("Updating Auto-mode gateway GarageNode (drift detected)", "name", desired.Name)
-			current.Spec.Zone = desired.Spec.Zone
-			current.Spec.Tags = desired.Spec.Tags
-			current.Spec.Network = desired.Spec.Network
-			if current.Spec.Storage == nil {
-				current.Spec.Storage = desired.Spec.Storage
-			} else if desired.Spec.Storage != nil && desired.Spec.Storage.Metadata != nil {
-				if current.Spec.Storage.Metadata == nil {
-					current.Spec.Storage.Metadata = desired.Spec.Storage.Metadata
-				} else if current.Spec.Storage.Metadata.ExistingClaim == "" {
-					current.Spec.Storage.Metadata.Size = desired.Spec.Storage.Metadata.Size
-					current.Spec.Storage.Metadata.StorageClassName = desired.Spec.Storage.Metadata.StorageClassName
-				}
+			if nameErr := validateManagedGarageNodeName(desired); nameErr != nil {
+				return fmt.Errorf("refusing to roll Auto gateway GarageNode ordinal %d: %w", i, nameErr)
 			}
-			if err := r.Update(ctx, current); err != nil {
-				return fmt.Errorf("updating gateway GarageNode %s: %w", current.Name, err)
-			}
+			toUpdate = append(toUpdate, pendingGatewayUpdate{current: current, desired: desired})
 		}
 	}
 
+	if len(toCreate) > 0 || len(toUpdate) > 0 {
+		// Gateway identities are never the empty-cluster bootstrap. The storage
+		// tier must establish the Admin API and settle first, after which gateway
+		// additions and role-affecting updates are admitted one at a time.
+		ready, _, waitingMessage, barrierErr := r.clusterLayoutReadyForMutation(ctx, cluster, false)
+		if barrierErr != nil {
+			waitingMessage = "refusing to start an Auto-mode gateway addition/update until Garage layout convergence can be verified: " + barrierErr.Error()
+		}
+		if barrierErr != nil || !ready {
+			log.Info("Waiting to reconcile Auto-mode gateway topology", "reason", waitingMessage)
+			return nil
+		}
+		if len(toCreate) > 0 {
+			toCreate = toCreate[:1]
+			toUpdate = nil
+		} else {
+			toUpdate = toUpdate[:1]
+		}
+		for _, desired := range toCreate {
+			log.Info("Creating Auto-mode gateway GarageNode (serialized topology change)", "name", desired.Name)
+			if err := r.Create(ctx, desired); err != nil && !errors.IsAlreadyExists(err) {
+				return fmt.Errorf("creating gateway GarageNode %s: %w", desired.Name, err)
+			}
+		}
+		for _, update := range toUpdate {
+			log.Info("Updating Auto-mode gateway GarageNode (serialized topology change)", "name", update.current.Name)
+			applyAutoModeGatewayNodeUpdate(update.current, update.desired)
+			if err := r.Update(ctx, update.current); err != nil {
+				return fmt.Errorf("updating gateway GarageNode %s: %w", update.current.Name, err)
+			}
+		}
+		// Let this batch join and settle before a scale-down or another tier
+		// changes the shared Garage layout.
+		return nil
+	}
+
+	var toDelete []*garagev1beta1.GarageNode
 	for name, n := range existing {
 		if desiredByName[name] {
 			continue
 		}
-		log.Info("Deleting Auto-mode gateway GarageNode (scale-down)", "name", name)
-		if err := r.Delete(ctx, n); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("deleting gateway GarageNode %s: %w", name, err)
+		toDelete = append(toDelete, n)
+	}
+	sort.Slice(toDelete, func(i, j int) bool {
+		left, leftOK := parseAutoModeGatewayOrdinal(autoNodeSlotForCycle(toDelete[i]), cluster.Name)
+		right, rightOK := parseAutoModeGatewayOrdinal(autoNodeSlotForCycle(toDelete[j]), cluster.Name)
+		if leftOK && rightOK && left != right {
+			return left > right
+		}
+		return toDelete[i].Name > toDelete[j].Name
+	})
+	if len(toDelete) > 0 {
+		candidate := toDelete[0]
+		ready, _, waitingMessage, barrierErr := r.clusterLayoutReadyForMutation(ctx, cluster, false, candidate.Name)
+		if barrierErr != nil {
+			waitingMessage = "refusing to start an Auto-mode gateway drain until Garage layout convergence can be verified: " + barrierErr.Error()
+		}
+		if barrierErr != nil || !ready {
+			log.Info("Waiting to drain Auto-mode gateway GarageNode", "node", candidate.Name, "reason", waitingMessage)
+			return nil
+		}
+		log.Info("Deleting one Auto-mode gateway GarageNode (serialized scale-down)", "name", candidate.Name)
+		if err := r.Delete(ctx, candidate); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("deleting gateway GarageNode %s: %w", candidate.Name, err)
 		}
 	}
 
@@ -211,6 +289,14 @@ func (r *GarageClusterReconciler) buildAutoModeGatewayNode(cluster *garagev1beta
 				StorageClassName: metaSC,
 			},
 		}
+		if gw := cluster.Spec.Gateway; gw != nil && gw.Metadata != nil {
+			storage.Metadata.AccessModes = append([]corev1.PersistentVolumeAccessMode(nil), gw.Metadata.AccessModes...)
+			if gw.Metadata.Selector != nil {
+				storage.Metadata.Selector = gw.Metadata.Selector.DeepCopy()
+			}
+			storage.Metadata.Labels = maps.Clone(gw.Metadata.Labels)
+			storage.Metadata.Annotations = maps.Clone(gw.Metadata.Annotations)
+		}
 	}
 
 	node := &garagev1beta1.GarageNode{
@@ -221,6 +307,7 @@ func (r *GarageClusterReconciler) buildAutoModeGatewayNode(cluster *garagev1beta
 				labelCluster:      cluster.Name,
 				labelTier:         tierGateway,
 				labelAppManagedBy: managedByOperatorValue,
+				labelAutoNodeSlot: name,
 			},
 		},
 		Spec: garagev1beta1.GarageNodeSpec{
@@ -286,6 +373,25 @@ func autoModeGatewayNodeNeedsUpdate(current, desired *garagev1beta1.GarageNode) 
 	return false
 }
 
+func applyAutoModeGatewayNodeUpdate(current, desired *garagev1beta1.GarageNode) {
+	current.Spec.Zone = desired.Spec.Zone
+	current.Spec.Tags = desired.Spec.Tags
+	current.Spec.Network = desired.Spec.Network
+	if current.Spec.Storage == nil {
+		current.Spec.Storage = desired.Spec.Storage
+		return
+	}
+	if desired.Spec.Storage == nil || desired.Spec.Storage.Metadata == nil {
+		return
+	}
+	if current.Spec.Storage.Metadata == nil {
+		current.Spec.Storage.Metadata = desired.Spec.Storage.Metadata
+	} else if current.Spec.Storage.Metadata.ExistingClaim == "" {
+		current.Spec.Storage.Metadata.Size = desired.Spec.Storage.Metadata.Size
+		current.Spec.Storage.Metadata.StorageClassName = desired.Spec.Storage.Metadata.StorageClassName
+	}
+}
+
 // deleteAutoModeGatewayNodes deletes all operator-owned gateway GarageNodes for
 // this cluster. Used when the gateway tier is removed entirely or the cluster
 // stops being unified (e.g. storage tier dropped).
@@ -295,11 +401,33 @@ func (r *GarageClusterReconciler) deleteAutoModeGatewayNodes(ctx context.Context
 	if err != nil {
 		return err
 	}
-	for name, n := range existing {
-		log.Info("Deleting Auto-mode gateway GarageNode (gateway tier removed)", "name", name)
-		if err := r.Delete(ctx, n); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("deleting gateway GarageNode %s: %w", name, err)
+	if len(existing) == 0 {
+		return nil
+	}
+	candidates := make([]*garagev1beta1.GarageNode, 0, len(existing))
+	for _, node := range existing {
+		candidates = append(candidates, node)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left, leftOK := parseAutoModeGatewayOrdinal(autoNodeSlotForCycle(candidates[i]), cluster.Name)
+		right, rightOK := parseAutoModeGatewayOrdinal(autoNodeSlotForCycle(candidates[j]), cluster.Name)
+		if leftOK && rightOK && left != right {
+			return left > right
 		}
+		return candidates[i].Name > candidates[j].Name
+	})
+	candidate := candidates[0]
+	ready, _, waitingMessage, barrierErr := r.clusterLayoutReadyForMutation(ctx, cluster, false, candidate.Name)
+	if barrierErr != nil {
+		waitingMessage = "refusing to drain the removed Auto-mode gateway tier until Garage layout convergence can be verified: " + barrierErr.Error()
+	}
+	if barrierErr != nil || !ready {
+		log.Info("Waiting to drain removed Auto-mode gateway GarageNode", "node", candidate.Name, "reason", waitingMessage)
+		return nil
+	}
+	log.Info("Deleting one Auto-mode gateway GarageNode (gateway tier removed)", "name", candidate.Name)
+	if err := r.Delete(ctx, candidate); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("deleting gateway GarageNode %s: %w", candidate.Name, err)
 	}
 	return nil
 }

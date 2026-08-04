@@ -1,0 +1,30 @@
+# GarageNode eligible for the narrow add-before-remove cycle workflow.
+#
+# Apply this resource without the cycle annotation. Wait until status reports
+# the current generation, an exact Pod UID, a 64-hex nodeId, connected: true,
+# and inLayout: true. The parent GarageCluster must also be literally
+# `consistent`, fully healthy, rollout-converged, and have a settled layout.
+# Then request the replacement as a separate update:
+#
+#   kubectl -n garage-operator-system annotate garagenode garage-storage-cycle \
+#     garage.rajsingh.info/cycle=true
+#
+# The sibling receives a fresh Garage identity and fresh PVC names from these
+# same repeatable templates. Do not use this workflow with existingClaim,
+# gateways, external processes, or node-local-pool-backed GarageNodes. For those
+# shapes, explicitly create a distinct GarageNode and drain the old identity.
+apiVersion: garage.rajsingh.info/v1beta1
+kind: GarageNode
+metadata:
+  name: garage-storage-cycle
+  namespace: garage-operator-system
+spec:
+  clusterRef:
+    name: garage
+  zone: zone-a
+  capacity: 100Gi
+  storage:
+    metadata:
+      size: 1Gi
+    data:
+      size: 100Gi

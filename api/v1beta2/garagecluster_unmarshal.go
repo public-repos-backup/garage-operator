@@ -63,7 +63,7 @@ func (s *GarageClusterSpec) UnmarshalJSON(data []byte) error {
 		s.Gateway = nil
 		return nil
 	}
-	if bytes.Equal(raw, []byte("true")) {
+	if bytes.Equal(raw, []byte(stringTrue)) {
 		s.Gateway = &GatewaySpec{}
 		return nil
 	}

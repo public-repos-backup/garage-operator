@@ -1,0 +1,169 @@
+# Mixed Garage storage: keep a hand-managed SMB GarageNode and add a uniform
+# node-local pool to the same physical-site GarageCluster. The controller's
+# workload implementation is deliberately not part of the public API.
+# Requires Garage v2.0.0+ (v2.3.0 is the tested default), a cluster-scoped
+# operator install, and enabled validating/conversion webhooks.
+#
+# Prerequisites:
+#
+#   kubectl create namespace garage
+#   kubectl label namespace garage pod-security.kubernetes.io/enforce=privileged
+#   kubectl create secret generic garage-admin-token -n garage \
+#     --from-literal=admin-token="$(openssl rand -hex 32)"
+#   kubectl label node worker-a worker-b \
+#     storage.garage.example/pool=local-700
+#
+# On every selected Node, provision these directories and their backing mounts:
+#
+#   /var/lib/garage/local-700/metadata
+#   /var/lib/garage/local-700/data
+#
+# After the real filesystems are mounted, create the required marker inside
+# each one (the operator deliberately never creates these files):
+#
+#   sudo touch /var/lib/garage/local-700/metadata/.garage-volume-id
+#   sudo touch /var/lib/garage/local-700/data/.garage-volume-id
+#
+# With hostPathType: Directory, kubelet also mounts each marker as HostPath
+# type File. An absent disk therefore leaves no marker and the pod fails before
+# Garage can write into an empty mountpoint on the Node root filesystem.
+#
+# Pod Security Admission Baseline/Restricted policies reject HostPath volumes.
+# Use the privileged namespace label above or an equivalent narrowly scoped
+# admission exception; the operator's own namespace can remain Restricted.
+apiVersion: garage.rajsingh.info/v1beta2
+kind: GarageCluster
+metadata:
+  name: garage-mixed
+  namespace: garage
+spec:
+  image: dxflrs/garage:v2.3.0
+  zone: site-a
+
+  # Whole-store teardown. Use Drain instead when intentionally retiring this
+  # site from a surviving federated Garage cluster.
+  deletionPolicy: Destroy
+
+  # The cluster-level policy may remain Auto for an operator-managed gateway.
+  # storage.layoutPolicy below applies only to the default PVC group.
+  layoutPolicy: Auto
+  replication:
+    factor: 3
+    consistencyMode: consistent
+
+  # Positive-capacity removal is a layout-wide operation, regardless of
+  # whether the source is SMB/PVC-backed or belongs to a node-local pool.
+  layoutManagement:
+    autoApply: true
+    drain:
+      # Keep the safe default when every Garage process is represented by a
+      # locally managed GarageNode. Federated sites must explicitly use
+      # AssumeConsistent after every site runs literal consistent mode.
+      unverifiedPeersPolicy: Block
+
+  storage:
+    # Existing SMB/PVC GarageNodes remain user-owned. Named node-local pools are
+    # still reconciled by the operator under this Manual default-group policy.
+    layoutPolicy: Manual
+    replicas: 0
+
+    nodeLocalPools:
+      - name: local-700
+        # Garage layout weight for each selected Node; HostPath has no PVC
+        # request from which the operator could derive capacity.
+        capacity: 700Gi
+        metadata:
+          hostPath: /var/lib/garage/local-700/metadata
+          hostPathType: Directory
+        data:
+          hostPath: /var/lib/garage/local-700/data
+          hostPathType: Directory
+
+        # Use one dedicated key across every pool, with a different value for
+        # each pool. This makes selectors provably non-overlapping.
+        selector:
+          matchLabels:
+            storage.garage.example/pool: local-700
+
+        # Optional but recommended for federation. It must route to the Garage
+        # pod on exactly the named Kubernetes Node.
+        network:
+          rpcPublicAddrTemplate: "{nodeName}.storage.example.net:3901"
+
+        podTemplate:
+          priorityClassName: infra-critical
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1
+
+  network:
+    rpcBindPort: 3901
+
+  s3Api:
+    bindPort: 3900
+    region: garage
+
+  admin:
+    bindPort: 3903
+    adminTokenSecretRef:
+      name: garage-admin-token
+      key: admin-token
+
+  database:
+    engine: lmdb
+---
+# An ordinary Manual GarageNode can coexist with the local pool. In a real
+# migration, retain existingClaim and nodeId where needed to preserve an
+# existing SMB identity.
+apiVersion: garage.rajsingh.info/v1beta1
+kind: GarageNode
+metadata:
+  name: garage-mixed-smb
+  namespace: garage
+  labels:
+    garage.rajsingh.info/cluster: garage-mixed
+spec:
+  clusterRef:
+    name: garage-mixed
+  zone: site-a
+  capacity: 2Ti
+  tags:
+    - cluster:garage-mixed/garage
+    - tier:storage
+  network:
+    rpcPublicAddr: smb.storage.example.net:3901
+  storage:
+    metadata:
+      size: 10Gi
+      storageClassName: replicated-block
+    data:
+      size: 2Ti
+      storageClassName: smb
+---
+# Example identity-specific RPC Service for one pool Node. The operator patches
+# the stable kubernetes-node label after the pod schedules. Use one Service and
+# one distinct external hostname per Garage identity.
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage-mixed-worker-a-rpc
+  namespace: garage
+spec:
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/instance: garage-mixed
+    garage.rajsingh.info/node-local-pool: local-700
+    garage.rajsingh.info/kubernetes-node: worker-a
+  ports:
+    - name: rpc
+      port: 3901
+      targetPort: rpc
+  type: LoadBalancer

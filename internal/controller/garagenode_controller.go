@@ -18,10 +18,10 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	stderrors "errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -48,6 +49,7 @@ import (
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	"github.com/rajsinghtech/garage-operator/internal/garage"
+	"github.com/rajsinghtech/garage-operator/internal/workloadidentity"
 )
 
 // finalizeOrphanedTimeout caps the best-effort layout-removal call made when
@@ -59,12 +61,62 @@ const (
 	garageNodeFinalizer = "garagenode.garage.rajsingh.info/finalizer"
 )
 
+// errUnsafeLayoutRoleRemoval marks a finalization failure that must not consume
+// the generic retry budget. Dropping the finalizer after five deterministic
+// replication-constraint failures would delete the GarageNode CR while leaving
+// its capacity-bearing role permanently orphaned in Garage's layout.
+var errUnsafeLayoutRoleRemoval = stderrors.New("unsafe Garage layout role removal")
+
+// errLayoutRoleDraining means Garage accepted a storage role removal but an
+// older active layout version still depends on that node. The pod and
+// GarageNode finalizer must remain until Garage's layout-history trackers no
+// longer include the identity; stopping it earlier can interrupt the block
+// synchronization that makes the new layout safe.
+var errLayoutRoleDraining = stderrors.New("garage layout role is still draining")
+
+// errManagedPodAbsent distinguishes a proven workload gap from an ambiguous
+// read or ownership failure. Only a proven absence may use a previously
+// observed Garage identity without a current Pod UID to bind it to.
+var errManagedPodAbsent = stderrors.New("managed Pod is absent")
+
 // GarageNodeReconciler reconciles a GarageNode object
 type GarageNodeReconciler struct {
 	client.Client
+	APIReader     client.Reader
 	Scheme        *runtime.Scheme
 	ClusterDomain string
 	DefaultImage  string
+	// ClusterScoped controls whether canonical rollout-source discovery may list
+	// GarageClusters across namespaces. Namespace-scoped installs retain full
+	// PVC/SMB support without requiring a cluster-wide List permission.
+	ClusterScoped bool
+	// LayoutMutations is shared with GarageClusterReconciler so Manual,
+	// automatic, gateway, federation, and node-local-pool writers cannot race.
+	LayoutMutations *LayoutMutationCoordinator
+	// Test seams for the object-block resync quiet-period barrier.
+	blockResyncObservationGetter func(context.Context, *garage.Client) (*blockResyncObservation, error)
+	blockRepairLauncher          func(context.Context, *garage.Client, string) error
+	clusterHealthGetter          func(context.Context, *garage.Client) (*garage.ClusterHealth, error)
+	blockResyncQuietPeriod       time.Duration
+	// Test seam for the exact rollout-actor lost-source transfer. Production
+	// resolves the Admin client from the GarageCluster connection contract.
+	lostSourceGarageClientGetter func(context.Context, *garagev1beta2.GarageCluster) (*garage.Client, error)
+	// Test seam for direct, process-local identity discovery during node-local-pool
+	// cold recovery. Production reads the selected DaemonSet Pod's own Admin API;
+	// cluster status or a stale GarageNode status is not sufficient evidence.
+	nodeLocalPoolRecoveryNodeIDGetter func(context.Context, *garagev1beta1.GarageNode, *garagev1beta2.GarageCluster, []string) (string, error)
+	// Test seam for a managed spec.nodeId expected-pin proof. Production always
+	// asks the exact owned Pod's Admin API for its self identity.
+	managedNodeIDGetter func(context.Context, *garagev1beta1.GarageNode, *garagev1beta2.GarageCluster) (string, error)
+	// Test seam for the cycle replacement's per-node layout sync proof.
+	cycleLayoutHistoryGetter func(context.Context, *garagev1beta2.GarageCluster) (*garage.LayoutHistoryResponse, error)
+}
+
+func (r *GarageNodeReconciler) nodeLocalPoolReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // +kubebuilder:rbac:groups=garage.rajsingh.info,resources=garagenodes,verbs=get;list;watch;create;update;patch;delete
@@ -85,6 +137,14 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		return ctrl.Result{}, err
 	}
+	if canonicalNodeID := canonicalGarageNodeID(node.Status.NodeID); canonicalNodeID != node.Status.NodeID {
+		apply := func() { node.Status.NodeID = canonicalNodeID }
+		apply()
+		if err := UpdateStatusWithRetry(ctx, r.Client, node, apply); err != nil {
+			return ctrl.Result{}, fmt.Errorf("canonicalizing GarageNode status.nodeId: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
 
 	// Get the cluster reference
 	cluster := &garagev1beta2.GarageCluster{}
@@ -103,12 +163,19 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// gateways (spec.connectTo.adminApiEndpoint), the layout entry still lives
 		// on the *remote* cluster — make a best-effort attempt against the admin
 		// endpoint we captured on the last successful reconcile so we don't leave
-		// a dead layout entry on the federated peer. Either way, never block
-		// finalizer release indefinitely — the worst case is a manual
-		// `garage layout remove` on the remote.
+		// a dead capacity-less layout entry on the federated peer. A storage node
+		// is different: without the durable parent transaction there is nowhere to
+		// record or recover block-migration evidence, so retain its finalizer for
+		// explicit manual recovery instead of silently orphaning positive capacity.
 		if errors.IsNotFound(err) {
 			if !node.DeletionTimestamp.IsZero() {
 				if controllerutil.ContainsFinalizer(node, garageNodeFinalizer) {
+					if !node.Spec.Gateway {
+						return r.updateStatus(ctx, node, PhaseDeleting, fmt.Errorf(
+							"referenced GarageCluster %q is absent; refusing to release a storage identity without its durable cluster-wide drain transaction; restore the parent or complete documented manual recovery",
+							node.Spec.ClusterRef.Name,
+						))
+					}
 					if err := r.attemptOrphanedFinalize(ctx, node); err != nil {
 						log.Info("Best-effort layout cleanup against captured admin endpoint failed; releasing finalizer anyway",
 							"node", node.Name, "endpoint", node.Status.ClusterAdminEndpoint, "error", err.Error())
@@ -140,6 +207,56 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		return r.updateStatus(ctx, node, PhaseFailed, fmt.Errorf("failed to get cluster: %w", err))
 	}
+	if node.Spec.ZoneFrom != nil && node.Spec.ZoneFrom.NodeLabel != "" &&
+		node.Spec.External == nil && !r.ClusterScoped && node.DeletionTimestamp.IsZero() {
+		return r.updateStatus(ctx, node, PhaseFailed, fmt.Errorf(
+			"spec.zoneFrom requires a cluster-scoped operator install because Kubernetes Node labels are the topology source; redeploy without --watch-namespaces/WATCH_NAMESPACE",
+		))
+	}
+	// Rehydrate the process-wide exclusion before doing any spec-driven work.
+	// This is required in the GarageNode controller too: after a manager restart
+	// it may reconcile before the parent and must not render h2 over a persisted
+	// h1 OnDelete handoff. A gateway-only parent with clusterRef mutates the
+	// referenced storage GarageCluster's layout, so load that durable owner status
+	// rather than trusting the gateway object's unrelated status.
+	layoutOwner, err := resolveGarageLayoutOwner(ctx, r.nodeLocalPoolReader(), cluster)
+	if err != nil {
+		return r.updateStatus(ctx, node, PhasePending,
+			fmt.Errorf("reading canonical layout-owner GarageCluster before GarageNode reconciliation: %w", err))
+	}
+	coordinator := r.layoutMutationCoordinator()
+	key := layoutOwnerKey(layoutOwner)
+	if err := rehydrateNodeLocalPoolRolloutsForOwner(ctx, r.nodeLocalPoolReader(), coordinator, layoutOwner, r.ClusterScoped); err != nil {
+		return r.updateStatus(ctx, node, PhasePending,
+			fmt.Errorf("rehydrating canonical managed-Pod rollout transactions: %w", err))
+	}
+	if err := rehydrateStorageDrainsForOwner(ctx, r.nodeLocalPoolReader(), coordinator, layoutOwner, r.ClusterScoped, r.APIReader != nil); err != nil {
+		return r.updateStatus(ctx, node, PhasePending,
+			fmt.Errorf("rehydrating canonical storage-drain transactions: %w", err))
+	}
+	transferred, err := r.recoverOrTransferStorageRolloutLostSource(ctx, node, cluster, layoutOwner)
+	if err != nil {
+		return r.updateStatus(ctx, node, PhasePending,
+			fmt.Errorf("waiting for safe lost-source recovery of the exact storage rollout actor: %w", err))
+	}
+	if transferred {
+		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+	}
+	// A generation-wide rollout transition starts as soon as the last converged
+	// condition becomes stale. During that prepare phase GarageNodes must still
+	// be able to publish their desired ConfigMaps/StatefulSets and finish additive
+	// layout joins; no process has been selected for deletion yet. The narrower
+	// handoff boundary starts only after status.storageRollout (or its durable
+	// RollingOut condition) records one exact Pod incarnation. At that point the
+	// parent owns workload publication and every non-actor layout writer freezes.
+	storageRolloutTransitionActive := storageRolloutMutationBoundaryActive(cluster) ||
+		storageRolloutMutationBoundaryActive(layoutOwner) || coordinator.NodeLocalPoolRolloutActive(key)
+	storageRolloutHandoffActive := nodeLocalPoolRolloutConditionActive(cluster) ||
+		nodeLocalPoolRolloutConditionActive(layoutOwner) || coordinator.NodeLocalPoolRolloutActive(key)
+	storageDrainActor := storageDrainActorForNode(node)
+	storageDrainActorActive := storageDrainActorMatches(layoutOwner.Status.StorageDrain, storageDrainActor)
+	storageDrainActive := storageDrainConditionActive(layoutOwner) ||
+		coordinator.StorageDrainActive(key)
 	// User-created GarageNodes still require Manual layout for their tier —
 	// operator-managed CRs (controllerOwnerRef on the GarageCluster, generated by
 	// Auto mode in #190) are allowed regardless of policy. Storage nodes honor the
@@ -150,63 +267,149 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// replacing, not by the cluster — so it is exempt from the Manual-only gate the
 	// same way an Auto ordinal is; otherwise an Auto cluster's sibling would be
 	// rejected before it could ever join and sync.
-	isOperatorOwned := metav1.IsControlledBy(node, cluster) || isCycleSibling(node)
+	isOperatorOwned := hasExactGarageClusterControllerReference(node, cluster) || isCycleSibling(node)
 	tierPolicy := effectiveStorageLayoutPolicy(cluster)
-	tierName := "storage"
+	tierName := tierStorage
 	if node.Spec.Gateway {
 		tierPolicy = cluster.Spec.LayoutPolicy
-		tierName = "gateway"
+		tierName = tierGateway
 	}
 	if !isOperatorOwned && tierPolicy != LayoutPolicyManual {
 		return r.updateStatus(ctx, node, PhaseFailed,
 			fmt.Errorf("user-created %s GarageNode requires its tier layoutPolicy: Manual (set spec.storage.layoutPolicy for storage, spec.layoutPolicy for gateway)", tierName))
 	}
+	// Replication-factor migration temporarily owns the entire cluster layout.
+	// This gate covers Manual and gateway GarageNodes as well as the storage
+	// nodes explicitly marked operator-suspended by the migration state machine.
+	if factorMigrationActive(cluster) {
+		if !node.DeletionTimestamp.IsZero() {
+			return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+		}
+		return r.updateStatus(ctx, node, PhasePending,
+			fmt.Errorf("waiting for GarageCluster replication-factor migration to finish before reconciling the layout role"))
+	}
+	if storageDrainActive && !storageDrainActorActive {
+		actorDescription := "whose durable status is still publishing"
+		if layoutOwner.Status.StorageDrain != nil {
+			actorDescription = fmt.Sprintf("%+v", layoutOwner.Status.StorageDrain.Actor)
+		}
+		return r.updateStatus(ctx, node, PhasePending,
+			fmt.Errorf("waiting for GarageCluster storage drain actor %s before changing this GarageNode or its workload", actorDescription))
+	}
 
 	// Handle deletion
 	if !node.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(node, garageNodeFinalizer) {
-			// If the parent cluster is also being deleted, the cluster's finalizer
-			// already called removeNodesFromLayout for every node. Skip the per-node
-			// admin-API call — it would just retry against a Service that's about to
-			// disappear, blocking namespace teardown for FinalizationMaxRetries × backoff.
+			// A Drain-deleting parent owns one cluster-wide transaction. Foreground
+			// garbage collection may mark child GarageNodes deleting before the
+			// parent finalizer has proved block migration, so keep this finalizer (and
+			// therefore the identity-bearing workload) until that proof completes.
 			if !cluster.DeletionTimestamp.IsZero() {
-				log.Info("Parent cluster is being deleted, skipping per-node layout cleanup")
-				controllerutil.RemoveFinalizer(node, garageNodeFinalizer)
-				if err := r.Update(ctx, node); err != nil {
-					return ctrl.Result{}, err
+				parentDrain := cluster.EffectiveDeletionPolicy() == garagev1beta2.DeletionPolicyDrain && cluster.HasStorageTier()
+				safeParentHandoff := false
+				var parentHandoffErr error
+				if parentDrain {
+					safeParentHandoff, parentHandoffErr = completedGarageClusterDrainAuthorizesFinalization(cluster)
 				}
-				return ctrl.Result{}, nil
-			}
-			// Get garage client for finalization
-			garageClient, err := GetGarageClient(ctx, r.Client, cluster, r.ClusterDomain)
-			if err != nil {
-				log.Error(err, "Failed to get garage client for finalization")
-			} else {
-				if err := r.finalize(ctx, node, garageClient); err != nil {
-					if ShouldSkipFinalization(node) {
-						log.Info("Finalization failed too many times, removing finalizer anyway",
-							"retries", GetFinalizationRetryCount(node), "error", err)
-					} else {
-						IncrementFinalizationRetryCount(node)
-						retryCount := GetFinalizationRetryCount(node)
-						log.Error(err, "Failed to finalize node, will retry",
-							"retries", retryCount)
-						if updateErr := r.Update(ctx, node); updateErr != nil {
-							log.Error(updateErr, "Failed to update retry count annotation")
-						}
-						_, _ = r.updateStatus(ctx, node, PhaseDeleting, fmt.Errorf("finalization failed (retry %d/%d): %w", retryCount, FinalizationMaxRetries, err))
-						return ctrl.Result{RequeueAfter: RequeueAfterError}, nil
+				switch {
+				case storageDrainActorActive:
+					// Admission normally prevents this race. If deletion was forced or
+					// admission was bypassed, let the exact node actor finish first.
+				case parentDrain && parentHandoffErr != nil:
+					_, _ = r.updateStatus(ctx, node, PhaseDeleting,
+						fmt.Errorf("parent GarageCluster terminal drain proof is invalid: %w", parentHandoffErr))
+					return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+				case parentDrain && !safeParentHandoff:
+					_, _ = r.updateStatus(ctx, node, PhaseDeleting,
+						fmt.Errorf("waiting for parent GarageCluster storage drain to complete before releasing this workload"))
+					return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+				default:
+					log.Info("Parent cluster layout cleanup is complete or Destroy was selected; releasing per-node finalizer")
+					controllerutil.RemoveFinalizer(node, garageNodeFinalizer)
+					if err := r.Update(ctx, node); err != nil {
+						return ctrl.Result{}, err
 					}
+					return ctrl.Result{}, nil
+				}
+			}
+			// A reversible drain removes the role and completes its durable block
+			// proof before DELETE is admitted. Once that exact handoff is terminal,
+			// the source Pod is expected to disappear and must never be used as a
+			// fresh peer-proof prerequisite. In particular, the deletion boundary
+			// can race a newer GarageNode generation past status.observedGeneration;
+			// re-running peer discovery here would then deadlock a safe teardown.
+			preparedWithoutLayout := garageNodePreparedWithoutLayout(node)
+			preparedHandoff := preparedWithoutLayout
+			if storageDrainActorActive {
+				preparedHandoff, err = completedGarageNodeDrainAuthorizesFinalization(node, layoutOwner)
+			}
+			if err == nil && preparedHandoff {
+				if preparedWithoutLayout {
+					log.Info("Generation-bound no-layout drain preparation authorizes finalizer release",
+						"nodeID", node.Status.NodeID)
+				} else {
+					log.Info("Exact terminal storage-drain handoff authorizes finalizer release",
+						"nodeID", node.Status.NodeID,
+						"transactionID", layoutOwner.Status.StorageDrain.TransactionID)
+				}
+			} else if err == nil {
+				// No terminal handoff exists. This covers gateway deletion, forced or
+				// admission-bypassed deletion, and an ordinary in-progress drain; keep
+				// driving the existing live layout finalization state machine.
+				garageClient, clientErr := r.garageNodeFinalizationClient(ctx, node, cluster)
+				if clientErr != nil {
+					log.Error(clientErr, "Failed to get garage client for finalization")
+					err = fmt.Errorf("get Garage client for finalization: %w", clientErr)
+				} else {
+					mutate := func() error { return r.finalize(ctx, node, layoutOwner, garageClient) }
+					if node.Spec.Gateway {
+						err = runCapacitylessGarageNodeRoleRetirementMutation(
+							r.layoutMutationCoordinator(), layoutOwner, node, mutate,
+						)
+					} else if storageDrainActorActive {
+						err = runLayoutMutationIgnoringStorageDrain(
+							ctx, r.layoutMutationCoordinator(), layoutOwner, storageDrainActor, garageClient, mutate,
+						)
+					} else {
+						err = runLayoutMutation(ctx, r.layoutMutationCoordinator(), layoutOwner, garageClient, mutate)
+					}
+				}
+			}
+			if err != nil {
+				if stderrors.Is(err, errLayoutMutationPending) || requiresDurableLayoutFinalization(node, err) {
+					log.Info("GarageNode layout role cannot be removed safely yet; retaining finalizer",
+						"error", err)
+					_, _ = r.updateStatus(ctx, node, PhaseDeleting,
+						fmt.Errorf("waiting for a safe Garage layout role removal: %w", err))
+					return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+				}
+				if ShouldSkipFinalization(node) {
+					log.Info("Finalization failed too many times, removing finalizer anyway",
+						"retries", GetFinalizationRetryCount(node), "error", err)
+				} else {
+					IncrementFinalizationRetryCount(node)
+					retryCount := GetFinalizationRetryCount(node)
+					log.Error(err, "Failed to finalize node, will retry",
+						"retries", retryCount)
+					if updateErr := r.Update(ctx, node); updateErr != nil {
+						log.Error(updateErr, "Failed to update retry count annotation")
+					}
+					_, _ = r.updateStatus(ctx, node, PhaseDeleting, fmt.Errorf("finalization failed (retry %d/%d): %w", retryCount, FinalizationMaxRetries, err))
+					return ctrl.Result{RequeueAfter: RequeueAfterError}, nil
 				}
 			}
 			controllerutil.RemoveFinalizer(node, garageNodeFinalizer)
 			if err := r.Update(ctx, node); err != nil {
 				return ctrl.Result{}, err
 			}
+			if storageDrainActorActive {
+				if err := r.clearCompletedNodeStorageDrain(ctx, node, layoutOwner); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
 		}
 		return ctrl.Result{}, nil
 	}
-
 	// Add finalizer
 	if !controllerutil.ContainsFinalizer(node, garageNodeFinalizer) {
 		controllerutil.AddFinalizer(node, garageNodeFinalizer)
@@ -215,21 +418,144 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
+	if err := validateGarageClusterRuntimeSafety(cluster); err != nil {
+		return r.updateStatus(ctx, node, PhaseFailed,
+			fmt.Errorf("refusing ordinary GarageNode reconciliation for an unsafe parent GarageCluster: %w", err))
+	}
+	if err := validateGarageNodeRuntimeSafety(node); err != nil {
+		return r.updateStatus(ctx, node, PhaseFailed, err)
+	}
+	clusterGuard := &GarageClusterReconciler{
+		Client: r.Client, APIReader: r.APIReader, Scheme: r.Scheme,
+	}
+	needsLegacyEnvironmentProof, err := clusterGuard.legacyEnvironmentMigrationNeeded(ctx, cluster, false)
+	if err == nil && !needsLegacyEnvironmentProof {
+		needsLegacyEnvironmentProof, err = garageNodeNeedsLegacyEnvironmentEvaluation(
+			ctx, r.nodeLocalPoolReader(), node, cluster,
+		)
+	}
+	if err != nil {
+		return r.updateStatus(ctx, node, PhaseFailed, err)
+	}
+	if needsLegacyEnvironmentProof {
+		migration, err := clusterGuard.evaluateLegacyEnvironmentMigration(ctx, cluster, true)
+		if err != nil {
+			return r.updateStatus(ctx, node, PhaseFailed,
+				fmt.Errorf("released Garage environment migration is blocked: %w", err))
+		}
+		if migration.blocked {
+			return r.updateStatus(ctx, node, PhaseFailed,
+				fmt.Errorf("released Garage environment migration is waiting: %s", migration.message))
+		}
+	}
+
+	// Parent-owned Auto/node-local-pool retirement is bound to the exact parent spec
+	// generation that selected this node. If the user changes the parent before
+	// a durable storage-drain transaction starts, cancel the metadata request
+	// before ordinary drain handling can remove a still-desired role. A parent
+	// that still wants the deletion will re-issue the handoff at its new
+	// generation; a user-authored drain never has this status field set.
+	if requestedGeneration := node.Status.ParentDeletionRequestGeneration; requestedGeneration != 0 &&
+		requestedGeneration != cluster.Generation &&
+		node.Annotations[garagev1beta1.AnnotationAcknowledgeLostSource] == "" {
+		if node.Annotations[garagev1beta1.AnnotationDrain] == annotationTrue {
+			delete(node.Annotations, garagev1beta1.AnnotationDrain)
+			if err := r.Update(ctx, node); err != nil {
+				return ctrl.Result{}, fmt.Errorf("canceling stale parent-owned GarageNode drain request: %w", err)
+			}
+		}
+		apply := func() {
+			node.Status.ParentDeletionRequestGeneration = 0
+		}
+		apply()
+		if err := UpdateStatusWithRetry(ctx, r.Client, node, apply); err != nil {
+			return ctrl.Result{}, fmt.Errorf("clearing stale parent-owned GarageNode deletion intent: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// garage.rajsingh.info/drain is a reversible prepare operation, not an
+	// alias for DELETE. Keep the object, finalizer, and identity-bearing process
+	// alive while removing its role and proving that its local blocks reached the
+	// current destinations. The parent controller or user performs DELETE only
+	// after the exact transaction is terminal.
+	drainPreparationRequested := node.Annotations[garagev1beta1.AnnotationDrain] == annotationTrue
+	if drainPreparationRequested {
+		if storageRolloutTransitionActive {
+			message := "waiting for the parent managed pod rollout to finish before preparing this GarageNode for deletion"
+			if err := setGarageNodeDrainPreparedCondition(
+				ctx, r.Client, node, metav1.ConditionFalse,
+				garagev1beta1.ReasonNodeDrainPreparing, message,
+			); err != nil {
+				return ctrl.Result{}, err
+			}
+			// Do not return here. A parent-owned scale-down changes the parent
+			// generation before it requests this reversible drain. The existing
+			// StatefulSet must still publish its exact current-generation rollout
+			// input acknowledgment; otherwise the parent rollout waits for that
+			// acknowledgment while this node waits for the rollout, and neither
+			// state machine can advance. The rollout-prepare boundary below permits
+			// workload publication and serialized no-op/current-role reconciliation,
+			// but it still prevents drain preparation until the rollout converges.
+		} else {
+			prepared, preparedWithoutLayout, err := r.prepareGarageNodeDrain(ctx, node, cluster, layoutOwner)
+			if err != nil {
+				reason := garagev1beta1.ReasonNodeDrainPreparing
+				if !stderrors.Is(err, errLayoutMutationPending) && !stderrors.Is(err, errLayoutRoleDraining) {
+					reason = garagev1beta1.ReasonNodeDrainBlocked
+				}
+				if statusErr := setGarageNodeDrainPreparedCondition(
+					ctx, r.Client, node, metav1.ConditionFalse, reason, err.Error(),
+				); statusErr != nil {
+					return ctrl.Result{}, statusErr
+				}
+				return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+			}
+			if !prepared {
+				return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+			}
+			reason := garagev1beta1.ReasonNodeDrainPrepared
+			message := "Garage role is absent and the exact removed-source/current-destination block proof is complete; background/default deletion is now safe"
+			if preparedWithoutLayout {
+				reason = garagev1beta1.ReasonNodeDrainPreparedNotInLayout
+				message = "GarageNode has no live managed process or its never-committed exact identity is absent from the settled Garage layout; no block drain is required"
+			}
+			if err := setGarageNodeDrainPreparedCondition(
+				ctx, r.Client, node, metav1.ConditionTrue, reason, message,
+			); err != nil {
+				return ctrl.Result{}, err
+			}
+			// A graceful cycle requested this same preparation and owns the final
+			// promotion + Delete step. Ordinary Auto/node-local-pool/manual preparation
+			// holds here until its parent or user issues the now-admissible DELETE.
+			if !isCycleRequested(node) && node.Status.CyclePhase == "" {
+				return ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
+			}
+		}
+	} else {
+		meta.RemoveStatusCondition(&node.Status.Conditions, garagev1beta1.ConditionDrainPrepared)
+	}
 
 	// Maintenance mode: skip ALL reconciliation (STS, ConfigMap, Service, layout) so
 	// operators can perform PVC swaps or hardware work without the operator fighting them.
 	// Runs AFTER the deletion/finalizer block so a suspended node can still be deleted.
 	//
-	// Two sources of suspension, both with identical effect:
+	// Three sources of suspension, all with identical effect:
 	//   - spec.maintenance.suspended  — user-facing, for manual PVC/hardware work.
+	//   - parent spec.maintenance.suspended — freezes every local process and
+	//     layout writer for site-wide/federated maintenance.
 	//   - garage.rajsingh.info/operator-suspended annotation — INTERNAL, set by a
 	//     cluster-level coordinated operation (factor migration) that needs to own
 	//     this node's StatefulSet without the per-node controller fighting it.
 	userSuspended := node.Spec.Maintenance != nil && node.Spec.Maintenance.Suspended
+	parentSuspended := cluster.Spec.Maintenance != nil && cluster.Spec.Maintenance.Suspended
 	op, operatorSuspended := node.Annotations[garagev1beta1.AnnotationOperatorSuspended]
-	if userSuspended || operatorSuspended {
+	if userSuspended || parentSuspended || operatorSuspended {
 		reason, message := "MaintenanceSuspended", "Reconciliation paused by spec.maintenance.suspended"
-		if operatorSuspended && !userSuspended {
+		if parentSuspended && !userSuspended {
+			reason, message = "ClusterMaintenanceSuspended", "Reconciliation paused by parent GarageCluster spec.maintenance.suspended"
+		}
+		if operatorSuspended && !userSuspended && !parentSuspended {
 			reason, message = "OperatorSuspended", fmt.Sprintf("Reconciliation paused by operation %q", op)
 		}
 		applySuspended := func() {
@@ -256,26 +582,47 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// + remove this node. Resumable via status.cyclePhase. When a cycle is active or
 	// requested, reconcileCycle owns the rest of this reconcile (it may delete this
 	// node when the swap completes), so return on its result.
-	if isCycleRequested(node) || node.Status.CyclePhase != "" {
-		return r.reconcileCycle(ctx, node, cluster)
+	cycleActive := isCycleRequested(node) || node.Status.CyclePhase != ""
+	if cycleActive &&
+		(storageRolloutHandoffActive || (storageDrainActive && !storageDrainActorActive)) {
+		return r.updateStatus(ctx, node, PhasePending,
+			fmt.Errorf("waiting for the parent storage rollout/drain transaction to finish before cycling this GarageNode"))
+	}
+	// A broad rollout-prepare boundary (before an exact Pod handoff exists) must
+	// pause the cycle state machine without returning from reconciliation. The
+	// ordinary managed-workload path below is the only writer that can publish
+	// this node's exact current-generation rollout input acknowledgment. Running
+	// the cycle would cross the single-flight layout boundary; returning here
+	// would make the parent rollout and cycle wait on each other forever.
+	if cycleActive && !storageRolloutTransitionActive {
+		return r.reconcileCycle(ctx, node, cluster, layoutOwner)
 	}
 
-	// Reconcile per-node RPC service when publicEndpoint is configured
-	if node.Spec.External == nil && node.Spec.PublicEndpoint != nil {
+	// Reconcile per-node RPC service when publicEndpoint is configured. Not
+	// applicable to node-local-pool-backed nodes (webhook-rejected already, but
+	// guarded here too): the Service would select on a pod label the shared
+	// DaemonSet template never stamps and would sit with zero endpoints.
+	if !storageRolloutHandoffActive && !storageDrainActive && node.Spec.External == nil && !isNodeLocalPoolBacked(node) && node.Spec.PublicEndpoint != nil {
 		if err := r.reconcileNodeService(ctx, node, cluster); err != nil {
 			return r.updateStatus(ctx, node, PhaseFailed, fmt.Errorf("reconciling node service: %w", err))
 		}
 	}
 
-	// Reconcile per-node ConfigMap when any node-specific config overrides are present
-	if node.Spec.External == nil && nodeHasConfigOverrides(node) {
+	// Reconcile per-node ConfigMap when any node-specific config overrides are
+	// present. Not applicable to node-local-pool-backed nodes (webhook-rejected
+	// already, but guarded here too): their pods always mount the shared
+	// cluster ConfigMap, never a per-node one.
+	if !storageRolloutHandoffActive && !storageDrainActive && node.Spec.External == nil && !isNodeLocalPoolBacked(node) && nodeHasConfigOverrides(node) {
 		if err := r.reconcileNodeConfigMap(ctx, node, cluster); err != nil {
 			return r.updateStatus(ctx, node, PhaseFailed, fmt.Errorf("reconciling node config: %w", err))
 		}
 	}
 
-	// For managed nodes (not external), create/update the StatefulSet
-	if node.Spec.External == nil {
+	// For managed nodes (not external, not node-local-pool-backed), create/update the
+	// StatefulSet. Node-local pool-backed nodes get their pod from a named,
+	// cluster-owned node-local pool — this controller only manages the layout role
+	// for them.
+	if !storageRolloutHandoffActive && !storageDrainActive && node.Spec.External == nil && !isNodeLocalPoolBacked(node) {
 		// Expand bound PVCs first if the spec grew. StatefulSet selectors are
 		// immutable but PVCs can be resized in place when the StorageClass has
 		// allowVolumeExpansion=true. Order matters: the STS template carries the
@@ -291,6 +638,22 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// Get garage client for layout management
 	garageClient, err := GetGarageClient(ctx, r.Client, cluster, r.ClusterDomain)
+	if err != nil && garageNodeCanUseExactOperatorTokenBridge(node) {
+		// During additive joins (and identity-replacing recovery) a new process
+		// cannot receive the FullReplication token row until it has a layout role,
+		// while the cluster-wide token proof deliberately waits for that process
+		// to accept the token. Break that cycle through an exact existing Pod that
+		// proves it accepts the authoritative dynamic token; never send a fallback
+		// credential through the load-balanced cluster Service.
+		if direct, directErr := directVerifiedOperatorAdminClient(
+			ctx, r.nodeLocalPoolReader(), cluster, getAdminPort(cluster),
+		); directErr == nil {
+			garageClient = direct
+			err = nil
+		} else {
+			err = fmt.Errorf("%w; exact existing-Pod operator-token bridge is unavailable: %v", err, directErr)
+		}
+	}
 	if err != nil {
 		return r.updateStatus(ctx, node, PhaseFailed, fmt.Errorf("failed to create garage client: %w", err))
 	}
@@ -302,16 +665,287 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	captureAdminEndpoint(node, cluster, r.ClusterDomain)
 
 	// Reconcile the node layout
-	if err := r.reconcileNode(ctx, node, cluster, garageClient); err != nil {
-		return r.updateStatus(ctx, node, PhaseFailed, err)
+	mutate := func() error { return r.reconcileNode(ctx, node, cluster, garageClient, layoutOwner) }
+	var layoutErr error
+	switch {
+	case storageDrainActorActive:
+		layoutErr = runLayoutMutationIgnoringStorageDrain(
+			ctx, r.layoutMutationCoordinator(), layoutOwner, storageDrainActor, garageClient, mutate,
+		)
+	case nodeLocalPoolRolloutCandidateMatches(cluster, node):
+		layoutErr = runLayoutMutationIgnoringNodeLocalPoolRollout(
+			ctx, r.layoutMutationCoordinator(), layoutOwner, garageClient, mutate,
+		)
+	case node.Spec.External == nil && storageRolloutTransitionActive && !storageRolloutHandoffActive:
+		// Before an exact Pod UID is selected, managed GarageNodes still own the
+		// joins and capacity/zone updates required to make their desired generation
+		// rollout-ready. Keep these mutations serialized and history-gated while
+		// the broader transition boundary freezes every unrelated writer.
+		layoutErr = runLayoutMutationDuringStorageRolloutPrepare(
+			ctx, r.layoutMutationCoordinator(), layoutOwner, garageClient, mutate,
+		)
+	case node.Spec.External == nil && storageRolloutHandoffActive:
+		// A second managed pod may have been restarted manually while the
+		// recorded candidate owns the rollout. It may refresh read-only
+		// connectivity and exact pod-UID evidence, but it cannot stage layout
+		// changes. A stale generation would require such a change, so fail closed
+		// until the active candidate completes.
+		if node.Status.ObservedGeneration < node.Generation {
+			return r.updateStatus(ctx, node, PhasePending,
+				fmt.Errorf("waiting for storage rollout actor %+v before reconciling this GarageNode generation", cluster.Status.StorageRollout))
+		}
+		return r.updateStatusFromGarage(ctx, node, cluster, garageClient)
+	default:
+		layoutErr = runLayoutMutation(ctx, r.layoutMutationCoordinator(), layoutOwner, garageClient, mutate)
+	}
+	if layoutErr != nil {
+		if stderrors.Is(layoutErr, errLayoutMutationPending) {
+			_, statusErr := r.updateStatus(ctx, node, PhasePending, layoutErr)
+			if statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+		}
+		return r.updateStatus(ctx, node, PhaseFailed, layoutErr)
 	}
 
-	return r.updateStatusFromGarage(ctx, node, garageClient)
+	result, statusErr := r.updateStatusFromGarage(ctx, node, cluster, garageClient)
+	if statusErr != nil {
+		return result, statusErr
+	}
+	if storageDrainActorActive {
+		proof := clusterStorageDrainProof(layoutOwner.Status.StorageDrain)
+		if proof != nil && proof.CompletedAt != nil {
+			if err := r.clearCompletedNodeStorageDrain(ctx, node, layoutOwner); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	return result, nil
+}
+
+// garageNodeCanUseExactOperatorTokenBridge covers every operator-managed local
+// Garage process represented by a GarageNode, including Manual edge gateways.
+// Cluster-owned Auto gateway StatefulSets are not GarageNodes and therefore
+// cannot enter this path; external GarageNodes have no exact local Pod endpoint.
+func garageNodeCanUseExactOperatorTokenBridge(node *garagev1beta1.GarageNode) bool {
+	return node != nil && node.Spec.External == nil
+}
+
+// exactManagedGarageNodeAdminClient binds a safety-critical Admin transaction
+// to the exact identity-bearing Pod and the immutable startup credential that
+// Pod actually mounted. A table-backed operator token is FullReplication data:
+// once this actor's role is removed, that local process may stop serving the
+// token even though it must remain online while layout history and block drain
+// complete. A shared Service can also select that just-removed process between
+// requests. Keeping one exact Pod IP plus its mounted static bearer avoids both
+// failure modes without weakening Pod ownership or durable identity checks.
+func (r *GarageNodeReconciler) exactManagedGarageNodeAdminClient(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	expectedNodeID string,
+) (*garage.Client, error) {
+	if node == nil || cluster == nil || node.Spec.External != nil {
+		return nil, fmt.Errorf("exact managed GarageNode Admin client requires a local managed node and parent cluster")
+	}
+	expectedNodeID = canonicalGarageNodeID(expectedNodeID)
+	if expectedNodeID == "" {
+		return nil, fmt.Errorf("exact managed GarageNode Admin client requires a durable Garage node ID")
+	}
+
+	identity, err := r.discoverNodeIdentityDirect(ctx, node, cluster)
+	if err != nil {
+		return nil, fmt.Errorf("proving exact managed Garage process identity: %w", err)
+	}
+	if identity == nil || canonicalGarageNodeID(identity.nodeID) != expectedNodeID {
+		actual := ""
+		if identity != nil {
+			actual = canonicalGarageNodeID(identity.nodeID)
+		}
+		return nil, fmt.Errorf(
+			"exact managed Pod reports Garage identity %s, expected durable identity %s",
+			shortID(actual), shortID(expectedNodeID),
+		)
+	}
+
+	pod, err := r.managedPodForNode(ctx, node, cluster)
+	if err != nil {
+		return nil, fmt.Errorf("re-reading exact managed Pod before Admin transaction: %w", err)
+	}
+	if pod.UID != identity.podUID {
+		return nil, fmt.Errorf("managed Pod changed UID from %s to %s before Admin transaction", identity.podUID, pod.UID)
+	}
+	podIPs, err := managedPodIPs(pod)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Contains(podIPs, identity.podIP) {
+		return nil, fmt.Errorf("managed Pod %s/%s no longer owns authenticated IP %s", pod.Namespace, pod.Name, identity.podIP)
+	}
+	adminToken, err := mountedStaticAdminToken(ctx, r.nodeLocalPoolReader(), pod)
+	if err != nil {
+		return nil, fmt.Errorf("reading exact Pod startup Admin token: %w", err)
+	}
+	return garage.NewClient(adminEndpoint(identity.podIP, getAdminPort(cluster)), adminToken), nil
+}
+
+func (r *GarageNodeReconciler) garageNodeFinalizationClient(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+) (*garage.Client, error) {
+	if node != nil && node.Spec.External == nil {
+		nodeID, err := node.ResolvedGarageNodeID()
+		if err != nil {
+			return nil, err
+		}
+		if nodeID != "" && !garageNodeAcknowledgesLostSource(node, nodeID) {
+			return r.exactManagedGarageNodeAdminClient(ctx, node, cluster, nodeID)
+		}
+	}
+	return GetGarageClient(ctx, r.Client, cluster, r.ClusterDomain)
+}
+
+// fenceManagedGarageNodeLostSource creates a durable stop boundary before the
+// operator omits an acknowledged unavailable source from block verification.
+// The immutable drain/lost-source annotations keep ordinary GarageNode
+// reconciliation from restoring a StatefulSet replica. For node-local pools the
+// parent reconciler separately suppresses activation-label restoration.
+func (r *GarageNodeReconciler) fenceManagedGarageNodeLostSource(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+) (bool, error) {
+	if node == nil || cluster == nil || node.Spec.External != nil {
+		return false, fmt.Errorf("managed lost-source fencing requires an operator-managed GarageNode and parent GarageCluster")
+	}
+	if isNodeLocalPoolBacked(node) {
+		k8sNode := &corev1.Node{}
+		err := r.nodeLocalPoolReader().Get(ctx, types.NamespacedName{Name: node.Spec.KubernetesNodeName}, k8sNode)
+		if err != nil && !errors.IsNotFound(err) {
+			return false, fmt.Errorf("reading Kubernetes Node before lost-source fencing: %w", err)
+		}
+		if err == nil {
+			activationLabel := nodeLocalPoolActivationLabel(cluster, node.Spec.NodeLocalPoolName)
+			recoveryAnnotation := nodeLocalPoolRecoveryNodeIDAnnotation(cluster, node.Spec.NodeLocalPoolName)
+			_, activationExists := k8sNode.Labels[activationLabel]
+			if activationExists || k8sNode.Annotations[recoveryAnnotation] != "" {
+				before := k8sNode.DeepCopy()
+				delete(k8sNode.Labels, activationLabel)
+				delete(k8sNode.Annotations, recoveryAnnotation)
+				if err := r.Patch(ctx, k8sNode, client.MergeFrom(before)); err != nil {
+					return false, fmt.Errorf("removing node-local-pool activation and identity records before lost-source recovery: %w", err)
+				}
+				return false, nil
+			}
+		}
+		pods := &corev1.PodList{}
+		if err := r.nodeLocalPoolReader().List(ctx, pods,
+			client.InNamespace(node.Namespace),
+			client.MatchingLabels(map[string]string{
+				labelCluster:       cluster.Name,
+				labelTier:          tierStorage,
+				labelNodeLocalPool: node.Spec.NodeLocalPoolName,
+			}),
+		); err != nil {
+			return false, fmt.Errorf("listing node-local-pool Pods during lost-source fencing: %w", err)
+		}
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if pod.Spec.NodeName != node.Spec.KubernetesNodeName {
+				continue
+			}
+			owner := metav1.GetControllerOf(pod)
+			if owner == nil || owner.Kind != daemonSetKind {
+				return false, fmt.Errorf("%w: refusing to fence unexpected Pod %s on lost-source Kubernetes Node %s", errLayoutMutationPending, pod.Name, node.Spec.KubernetesNodeName)
+			}
+			uid := pod.UID
+			zero := int64(0)
+			if err := r.Delete(ctx, pod, &client.DeleteOptions{
+				GracePeriodSeconds: &zero,
+				Preconditions:      &metav1.Preconditions{UID: &uid},
+			}); err != nil && !errors.IsNotFound(err) && !errors.IsConflict(err) {
+				return false, fmt.Errorf("deleting exact node-local-pool Pod %s during lost-source fencing: %w", pod.Name, err)
+			}
+			return false, nil
+		}
+		return true, nil
+	}
+
+	statefulSet := &appsv1.StatefulSet{}
+	err := r.nodeLocalPoolReader().Get(ctx, types.NamespacedName{Namespace: node.Namespace, Name: node.Name}, statefulSet)
+	if err != nil && !errors.IsNotFound(err) {
+		return false, fmt.Errorf("reading GarageNode StatefulSet before lost-source fencing: %w", err)
+	}
+	if err == nil {
+		if !metav1.IsControlledBy(statefulSet, node) {
+			return false, fmt.Errorf("%w: StatefulSet %s is not controlled by acknowledged lost-source GarageNode %s", errLayoutMutationPending, statefulSet.Name, node.Name)
+		}
+		if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != 0 {
+			before := statefulSet.DeepCopy()
+			statefulSet.Spec.Replicas = ptr.To[int32](0)
+			if err := r.Patch(ctx, statefulSet, client.MergeFrom(before)); err != nil {
+				return false, fmt.Errorf("scaling GarageNode StatefulSet to zero for lost-source recovery: %w", err)
+			}
+			return false, nil
+		}
+	}
+	pod := &corev1.Pod{}
+	err = r.nodeLocalPoolReader().Get(ctx, types.NamespacedName{Namespace: node.Namespace, Name: node.Name + "-0"}, pod)
+	if errors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reading GarageNode Pod during lost-source fencing: %w", err)
+	}
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil || owner.Kind != kindStatefulSet || owner.Name != node.Name {
+		return false, fmt.Errorf("%w: refusing to fence unexpected Pod %s for lost-source GarageNode %s", errLayoutMutationPending, pod.Name, node.Name)
+	}
+	uid := pod.UID
+	zero := int64(0)
+	if err := r.Delete(ctx, pod, &client.DeleteOptions{
+		GracePeriodSeconds: &zero,
+		Preconditions:      &metav1.Preconditions{UID: &uid},
+	}); err != nil && !errors.IsNotFound(err) && !errors.IsConflict(err) {
+		return false, fmt.Errorf("deleting exact GarageNode Pod during lost-source fencing: %w", err)
+	}
+	return false, nil
+}
+
+// requiresDurableLayoutFinalization keeps every known Garage identity behind
+// its finalizer until the Admin API proves role retirement. Gateways carry no
+// object blocks, but they do carry full-copy metadata and must stay online long
+// enough to ACK the version that removes them. The explicit orphaned-parent
+// recovery path remains the only bounded best-effort exception.
+func requiresDurableLayoutFinalization(node *garagev1beta1.GarageNode, err error) bool {
+	return err != nil && node != nil
+}
+
+// isNodeLocalPoolBacked reports whether this GarageNode's pod comes from a
+// cluster-owned node-local-pool workload (spec.backing: NodeLocalPool) rather than a per-node
+// StatefulSet owned by this controller.
+func isNodeLocalPoolBacked(node *garagev1beta1.GarageNode) bool {
+	return node.Spec.Backing == garagev1beta1.NodeBackingNodeLocalPool
 }
 
 // reconcileStatefulSet creates/updates the StatefulSet for a managed GarageNode.
 // Each GarageNode creates its own StatefulSet with replica 1.
 func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) error {
+	return r.reconcileStatefulSetWithRecoveryFence(ctx, node, cluster, false)
+}
+
+// reconcileStatefulSetWithRecoveryFence creates an out-of-band deleted rollout
+// actor at zero replicas. The parent first CAS-adopts the new StatefulSet UID in
+// status.storageRollout, then ordinary reconcileStatefulSet restores replica 1.
+// No unrecorded workload incarnation can start an identity-bearing Pod.
+func (r *GarageNodeReconciler) reconcileStatefulSetWithRecoveryFence(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	recoveryFence bool,
+) error {
 	log := logf.FromContext(ctx)
 	stsName := node.Name
 
@@ -393,8 +1027,49 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 	// Build container ports (same as cluster)
 	containerPorts := buildContainerPorts(cluster)
 
+	var configBody string
+	configBaseName := cluster.Name + "-config"
+	if nodeHasConfigOverrides(node) {
+		if err := r.reconcileNodeConfigMap(ctx, node, cluster); err != nil {
+			return fmt.Errorf("publishing exact GarageNode config revision: %w", err)
+		}
+		var err error
+		configBody, err = r.renderNodeGarageConfig(ctx, node, cluster)
+		if err != nil {
+			return err
+		}
+		configBaseName = garageNodeConfigBaseName(cluster, node)
+	} else {
+		cfgCtx, err := buildConfigContext(ctx, r.Client, cluster)
+		if err != nil {
+			return fmt.Errorf("building shared Garage config context: %w", err)
+		}
+		configBody = generateGarageConfig(cluster, cfgCtx)
+	}
+	configRevision, err := garageConfigRevision(ctx, r.nodeLocalPoolReader(), cluster, configBody)
+	if err != nil {
+		return fmt.Errorf("deriving exact Garage config revision: %w", err)
+	}
+	configName := garageConfigRevisionName(configBaseName, configRevision)
+	publishedConfig, configObject, err := readGarageConfigResource(
+		ctx, r.nodeLocalPoolReader(), cluster.Namespace, configName, garageConfigUsesSecret(cluster),
+	)
+	if err != nil {
+		return fmt.Errorf("reading exact immutable Garage config revision %s/%s: %w", cluster.Namespace, configName, err)
+	}
+	if publishedConfig != configBody {
+		return fmt.Errorf("immutable Garage config revision %s/%s does not match the current rendered input", cluster.Namespace, configName)
+	}
+	if nodeHasConfigOverrides(node) {
+		if !metav1.IsControlledBy(configObject, node) {
+			return fmt.Errorf("garageNode config revision %s/%s is not controlled by GarageNode %s", cluster.Namespace, configName, node.Name)
+		}
+	} else if !metav1.IsControlledBy(configObject, cluster) {
+		return fmt.Errorf("shared Garage config revision %s/%s is not controlled by GarageCluster %s", cluster.Namespace, configName, cluster.Name)
+	}
+
 	// Build volumes and mounts for this node
-	volumes, volumeMounts := r.buildNodeVolumesAndMounts(node, cluster)
+	volumes, volumeMounts := r.buildNodeVolumesAndMountsForConfig(node, cluster, configName)
 	volumeClaimTemplates := r.buildNodeVolumeClaimTemplates(node, cluster)
 
 	// Node-level pod config overrides (node takes precedence over cluster)
@@ -466,15 +1141,26 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 		Env:                       mergedEnv,
 		EnvFrom:                   mergedEnvFrom,
 	}, volumes, volumeMounts, containerPorts)
+	if err := validateGarageCredentialFileAccess(cluster, podSpec, "GarageNode "+node.Name); err != nil {
+		return err
+	}
 
-	// Build labels: merge cluster labels + node-specific labels
-	podLabels := r.labelsForNode(node, cluster)
+	// Merge only user-owned labels first. Operator selector/identity labels are
+	// overlaid last so even a grandfathered or admission-bypassed value cannot
+	// invalidate the StatefulSet selector, Service routing, or Scale projection.
+	userLabels := make(map[string]string)
 	for k, v := range clusterPodLabels {
-		podLabels[k] = v
+		userLabels[k] = v
 	}
 	for k, v := range node.Spec.PodLabels {
-		podLabels[k] = v
+		userLabels[k] = v
 	}
+	userLabels = workloadidentity.UserPodLabels(userLabels)
+	podLabels := maps.Clone(userLabels)
+	if podLabels == nil {
+		podLabels = make(map[string]string)
+	}
+	maps.Copy(podLabels, r.labelsForNode(node, cluster))
 
 	// Build annotations: merge cluster annotations + node-specific annotations.
 	// We assemble the user-provided portion first so it can feed the pod-spec-hash;
@@ -486,17 +1172,6 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 	for k, v := range node.Spec.PodAnnotations {
 		userAnnotations[k] = v
 	}
-	// Same idea for labels: collect the user-provided ones so hash sees them.
-	// (podLabels above already includes the operator-managed selector labels — pass
-	// only the user portion to keep the hash stable.)
-	userLabels := make(map[string]string)
-	for k, v := range clusterPodLabels {
-		userLabels[k] = v
-	}
-	for k, v := range node.Spec.PodLabels {
-		userLabels[k] = v
-	}
-
 	// Compute pod-spec-hash from the pod spec plus user-provided podAnnotations/podLabels so
 	// changes to those trigger a StatefulSet update.
 	podSpecHashStr := computePodSpecHash(podSpec, userAnnotations, userLabels)
@@ -505,28 +1180,43 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 	for k, v := range userAnnotations {
 		podAnnotations[k] = v
 	}
-	podAnnotations["garage.rajsingh.info/pod-spec-hash"] = podSpecHashStr
+	if node.Spec.Gateway {
+		// Match the empty marker written by released gateway workloads so an
+		// adopted or restarted metadata PVC remains byte-compatible.
+		podAnnotations[annotationGatewayDataMarker] = gatewayDataMarkerLegacyContent
+	}
+	podAnnotations[annotationPodSpecHash] = podSpecHashStr
 
-	// Include the mounted ConfigMap's content hash so pods restart when config changes.
-	// Per-node override CM when present (must match the buildNodeVolumesAndMounts logic),
-	// otherwise the shared cluster CM — without this, changes to cluster.spec.* never
+	// Include the mounted config resource's content hash so pods restart when config changes.
+	// Per-node override resource when present (must match buildNodeVolumesAndMounts),
+	// otherwise the shared cluster resource — without this, changes to cluster.spec.* never
 	// roll the per-node pods.
-	cmName := cluster.Name + "-config"
-	if nodeHasConfigOverrides(node) {
-		cmName = node.Name + "-config"
+	configAnnotationRevision, err := garageConfigAnnotationRevision(ctx, r.nodeLocalPoolReader(), cluster, configBody)
+	if err != nil {
+		return fmt.Errorf("deriving Garage config annotation revision: %w", err)
 	}
-	cm := &corev1.ConfigMap{}
-	if err := r.Get(ctx, types.NamespacedName{Name: cmName, Namespace: cluster.Namespace}, cm); err == nil {
-		h := sha256.Sum256([]byte(cm.Data["garage.toml"]))
-		podAnnotations["garage.rajsingh.info/config-hash"] = hex.EncodeToString(h[:8])
-	}
+	podAnnotations[annotationConfigHash] = configAnnotationRevision
 
 	replicas := int32(1)
+	if recoveryFence {
+		replicas = 0
+	}
+	// Every GarageNode StatefulSet represents one durable Garage identity,
+	// regardless of whether its data comes from PVC, SMB, or another mounted
+	// volume. Keep it OnDelete unconditionally so a shared image/config edit
+	// cannot make independent StatefulSet controllers restart every identity at
+	// once. The GarageCluster StorageRollout sequencer owns each pod handoff.
+	updateStrategy := appsv1.StatefulSetUpdateStrategy{Type: appsv1.OnDeleteStatefulSetStrategyType}
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      stsName,
 			Namespace: cluster.Namespace,
 			Labels:    r.labelsForNode(node, cluster),
+			Annotations: map[string]string{
+				annotationStorageRolloutInput: storageRolloutInputToken(
+					cluster, node, podSpecHashStr, podAnnotations[annotationConfigHash],
+				),
+			},
 		},
 		Spec: appsv1.StatefulSetSpec{
 			ServiceName: cluster.Name + "-headless",
@@ -538,7 +1228,7 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 			},
 			VolumeClaimTemplates:                 volumeClaimTemplates,
 			PodManagementPolicy:                  appsv1.ParallelPodManagement,
-			UpdateStrategy:                       appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
+			UpdateStrategy:                       updateStrategy,
 			PersistentVolumeClaimRetentionPolicy: stsPVCRetentionPolicy(cluster, node),
 		},
 	}
@@ -548,8 +1238,11 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 	}
 
 	existing := &appsv1.StatefulSet{}
-	err := r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, existing)
+	err = r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, existing)
 	if errors.IsNotFound(err) {
+		if nameErr := validateManagedGarageNodeName(node); nameErr != nil {
+			return fmt.Errorf("refusing to create a GarageNode StatefulSet with an unsafe derived Pod label: %w", nameErr)
+		}
 		log.Info("Creating StatefulSet for GarageNode", "name", stsName)
 		return r.Create(ctx, sts)
 	}
@@ -568,6 +1261,9 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 	// preserved with no downtime and no PVC rebind.
 	if existing.Spec.Selector != nil && existing.Spec.Selector.MatchLabels != nil &&
 		!equality.Semantic.DeepEqual(existing.Spec.Selector.MatchLabels, sts.Spec.Selector.MatchLabels) {
+		if nameErr := validateManagedGarageNodeName(node); nameErr != nil {
+			return fmt.Errorf("refusing to recreate a GarageNode StatefulSet with an unsafe derived Pod label: %w", nameErr)
+		}
 		if !existing.DeletionTimestamp.IsZero() {
 			// Already orphan-deleting from a prior reconcile; wait for it to clear,
 			// then the create branch above (IsNotFound) recreates it.
@@ -586,19 +1282,34 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 
 	// Check if update is needed
 	needsUpdate := false
-	existingPodSpecHash := existing.Spec.Template.Annotations["garage.rajsingh.info/pod-spec-hash"]
+	existingPodSpecHash := existing.Spec.Template.Annotations[annotationPodSpecHash]
 	if existingPodSpecHash != podSpecHashStr {
 		log.Info("Pod spec hash changed, updating StatefulSet", "old", existingPodSpecHash, "new", podSpecHashStr)
 		needsUpdate = true
 	}
 	// Also detect config-only changes (e.g. LB IP assigned, fsync override toggled)
 	if !needsUpdate {
-		existingConfigHash := existing.Spec.Template.Annotations["garage.rajsingh.info/config-hash"]
-		newConfigHash := sts.Spec.Template.Annotations["garage.rajsingh.info/config-hash"]
+		existingConfigHash := existing.Spec.Template.Annotations[annotationConfigHash]
+		newConfigHash := sts.Spec.Template.Annotations[annotationConfigHash]
 		if existingConfigHash != newConfigHash {
 			log.Info("Config hash changed, updating StatefulSet", "old", existingConfigHash, "new", newConfigHash)
 			needsUpdate = true
 		}
+	}
+	if !needsUpdate && !equality.Semantic.DeepEqual(existing.Spec.UpdateStrategy, sts.Spec.UpdateStrategy) {
+		log.Info("StatefulSet update strategy changed", "old", existing.Spec.UpdateStrategy.Type, "new", sts.Spec.UpdateStrategy.Type)
+		needsUpdate = true
+	}
+	if !needsUpdate && !equality.Semantic.DeepEqual(
+		existing.Spec.PersistentVolumeClaimRetentionPolicy,
+		sts.Spec.PersistentVolumeClaimRetentionPolicy,
+	) {
+		log.Info("StatefulSet PVC retention policy changed")
+		needsUpdate = true
+	}
+	if !needsUpdate && existing.Annotations[annotationStorageRolloutInput] != sts.Annotations[annotationStorageRolloutInput] {
+		log.Info("StatefulSet storage rollout input acknowledgment changed")
+		needsUpdate = true
 	}
 	// Restore replicas if the STS was scaled to 0 externally (e.g. during maintenance).
 	if existing.Spec.Replicas == nil || *existing.Spec.Replicas != replicas {
@@ -612,24 +1323,55 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 
 	existing.Spec.Template = sts.Spec.Template
 	existing.Spec.Replicas = &replicas
+	existing.Spec.UpdateStrategy = sts.Spec.UpdateStrategy
+	existing.Spec.PersistentVolumeClaimRetentionPolicy = sts.Spec.PersistentVolumeClaimRetentionPolicy
+	if existing.Annotations == nil {
+		existing.Annotations = make(map[string]string)
+	}
+	existing.Annotations[annotationStorageRolloutInput] = sts.Annotations[annotationStorageRolloutInput]
 	log.Info("Updating StatefulSet for GarageNode", "name", stsName)
 	return r.Update(ctx, existing)
 }
 
-// stsPVCRetentionPolicy translates spec.storage.pvcRetentionPolicy into the
-// StatefulSet PVC retention policy. Returns nil for clusters that don't set
-// the field, which leaves K8s' default of "Retain" — safe for stateful data
-// and matches the v1beta2 type defaults. #196 follow-up: this was a silent
-// no-op on storage STSes after #192 (the gateway STS already wires it).
+// stsPVCRetentionPolicy translates the owning tier's explicit PVC policy into
+// the per-GarageNode StatefulSet policy. Nil leaves Kubernetes' Retain/Retain
+// default, which is the established default for both storage and unified
+// per-GarageNode gateway identities.
 // pvcRetentionDelete is the API string for "delete PVCs when the STS is
 // deleted/scaled" — matches the enum value in the v1beta2 CRD.
 const pvcRetentionDelete = "Delete"
 
+// stsPVCRetentionPolicy returns the desired retention policy, spelling out the
+// API server's own default when the user set none.
+//
+// Returning nil here would be silently corrosive: the API server defaults the
+// stored StatefulSet to Retain/Retain, so the reconcile-time
+// DeepEqual(existing, desired) compared a defaulted struct against nil, decided
+// the policy had "changed", and rewrote the StatefulSet on every single pass.
+// Nearly no cluster sets pvcRetentionPolicy, so that hot loop ran for nearly
+// every GarageNode — burning API writes and slowing every other reconcile.
+// Retain/Retain is exactly what the API server was already storing, so this is
+// the same behaviour, just stated explicitly enough to compare equal.
 func stsPVCRetentionPolicy(cluster *garagev1beta2.GarageCluster, node *garagev1beta1.GarageNode) *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy {
-	if node.Spec.Gateway || !cluster.HasStorageTier() || cluster.Spec.Storage.PVCRetentionPolicy == nil {
-		return nil
+	apiServerDefault := func() *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy {
+		return &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+			WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+			WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+		}
 	}
-	rp := cluster.Spec.Storage.PVCRetentionPolicy
+	if node.Spec.Gateway {
+		if cluster.Spec.Gateway == nil || cluster.Spec.Gateway.PVCRetentionPolicy == nil {
+			return apiServerDefault()
+		}
+		return translatePVCRetentionPolicy(cluster.Spec.Gateway.PVCRetentionPolicy)
+	}
+	if !cluster.HasStorageTier() || cluster.Spec.Storage.PVCRetentionPolicy == nil {
+		return apiServerDefault()
+	}
+	return translatePVCRetentionPolicy(cluster.Spec.Storage.PVCRetentionPolicy)
+}
+
+func translatePVCRetentionPolicy(rp *garagev1beta2.PVCRetentionPolicy) *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy {
 	out := &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
 		WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
 		WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
@@ -749,7 +1491,7 @@ func nodeHasMultiHDD(node *garagev1beta1.GarageNode) bool {
 	return len(node.Spec.Storage.DataPaths) > 0
 }
 
-// lookupPVCCapacity returns a TOML-ready capacity string (e.g. "10Gi") for
+// lookupPVCCapacity returns a TOML-ready exact byte count for
 // the named PVC, preferring its spec.resources.requests.storage and falling
 // back to status.capacity.storage. Returns "" if neither is set or the PVC
 // is not found. Used by the per-node ConfigMap renderer to heal multi-HDD
@@ -762,10 +1504,10 @@ func (r *GarageNodeReconciler) lookupPVCCapacity(ctx context.Context, ns, name s
 		return ""
 	}
 	if req, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; ok && !req.IsZero() {
-		return req.String()
+		return garageBytesize(&req)
 	}
 	if cap, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok && !cap.IsZero() {
-		return cap.String()
+		return garageBytesize(&cap)
 	}
 	return ""
 }
@@ -787,9 +1529,20 @@ func emptyDirSource(size *resource.Quantity) *corev1.EmptyDirVolumeSource {
 
 // buildNodeVolumesAndMounts returns volumes and volume mounts for a GarageNode's StatefulSet.
 func (r *GarageNodeReconciler) buildNodeVolumesAndMounts(node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) ([]corev1.Volume, []corev1.VolumeMount) {
+	configName := cluster.Name + "-config"
+	if nodeHasConfigOverrides(node) {
+		configName = garageNodeConfigBaseName(cluster, node)
+	}
+	return r.buildNodeVolumesAndMountsForConfig(node, cluster, configName)
+}
+
+func (r *GarageNodeReconciler) buildNodeVolumesAndMountsForConfig(
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	configName string,
+) ([]corev1.Volume, []corev1.VolumeMount) {
 	volumeMounts := []corev1.VolumeMount{
 		{Name: configVolumeName, MountPath: configMountPath, ReadOnly: true},
-		{Name: RPCSecretKey, MountPath: rpcSecretMountPath, ReadOnly: true},
 		{Name: metadataVolName, MountPath: metadataPath},
 	}
 	if nodeHasMultiHDD(node) {
@@ -803,48 +1556,10 @@ func (r *GarageNodeReconciler) buildNodeVolumesAndMounts(node *garagev1beta1.Gar
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: dataVolName, MountPath: dataPath})
 	}
 
-	// RPC secret: gateway clusters with ConnectTo use the storage cluster's RPC secret.
-	rpcSecretName := cluster.Name + "-rpc-secret"
-	rpcSecretKey := RPCSecretKey
-	if cluster.HasGatewayTier() && cluster.Spec.ConnectTo != nil {
-		if cluster.Spec.ConnectTo.RPCSecretRef != nil {
-			rpcSecretName = cluster.Spec.ConnectTo.RPCSecretRef.Name
-			if cluster.Spec.ConnectTo.RPCSecretRef.Key != "" {
-				rpcSecretKey = cluster.Spec.ConnectTo.RPCSecretRef.Key
-			}
-		}
-	} else if cluster.Spec.Network.RPCSecretRef != nil {
-		rpcSecretName = cluster.Spec.Network.RPCSecretRef.Name
-		if cluster.Spec.Network.RPCSecretRef.Key != "" {
-			rpcSecretKey = cluster.Spec.Network.RPCSecretRef.Key
-		}
-	}
-
-	// Use a per-node ConfigMap when any node-specific garage.toml overrides are present.
-	// Otherwise fall back to the shared cluster ConfigMap.
-	configMapName := cluster.Name + "-config"
-	if nodeHasConfigOverrides(node) {
-		configMapName = node.Name + "-config"
-	}
-
 	volumes := []corev1.Volume{
 		{
-			Name: configVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: configMapName},
-				},
-			},
-		},
-		{
-			Name: RPCSecretKey,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  rpcSecretName,
-					DefaultMode: ptr.To[int32](0600),
-					Items:       []corev1.KeyToPath{{Key: rpcSecretKey, Path: RPCSecretKey}},
-				},
-			},
+			Name:         configVolumeName,
+			VolumeSource: garageConfigVolumeSource(cluster, configName),
 		},
 	}
 
@@ -878,6 +1593,10 @@ func (r *GarageNodeReconciler) buildNodeVolumesAndMounts(node *garagev1beta1.Gar
 			Name:         dataVolName,
 			VolumeSource: corev1.VolumeSource{EmptyDir: emptyDirSource(dataSize)},
 		})
+		if node.Spec.Gateway {
+			volumes = append(volumes, gatewayDataMarkerVolume())
+			volumeMounts = append(volumeMounts, gatewayDataMarkerMount())
+		}
 	case node.Spec.Storage != nil && node.Spec.Storage.Data != nil && node.Spec.Storage.Data.ExistingClaim != "":
 		volumes = append(volumes, corev1.Volume{
 			Name: dataVolName,
@@ -907,123 +1626,9 @@ func (r *GarageNodeReconciler) buildNodeVolumesAndMounts(node *garagev1beta1.Gar
 	}
 	// else: metadata comes from VolumeClaimTemplate
 
-	// Add admin token secret volume and mount if configured on cluster
-	if cluster.Spec.Admin != nil && cluster.Spec.Admin.AdminTokenSecretRef != nil {
-		adminTokenKey := DefaultAdminTokenKey
-		if cluster.Spec.Admin.AdminTokenSecretRef.Key != "" {
-			adminTokenKey = cluster.Spec.Admin.AdminTokenSecretRef.Key
-		}
-		volumes = append(volumes, corev1.Volume{
-			Name: DefaultAdminTokenKey,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  cluster.Spec.Admin.AdminTokenSecretRef.Name,
-					DefaultMode: ptr.To[int32](0600),
-					Items:       []corev1.KeyToPath{{Key: adminTokenKey, Path: DefaultAdminTokenKey}},
-				},
-			},
-		})
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      DefaultAdminTokenKey,
-			MountPath: adminSecretMountPath,
-			ReadOnly:  true,
-		})
-	}
-
-	// Add metrics token secret volume and mount if configured
-	if cluster.Spec.Admin != nil && cluster.Spec.Admin.MetricsTokenSecretRef != nil {
-		metricsTokenKey := metricsTokenVolumeName
-		if cluster.Spec.Admin.MetricsTokenSecretRef.Key != "" {
-			metricsTokenKey = cluster.Spec.Admin.MetricsTokenSecretRef.Key
-		}
-		volumes = append(volumes, corev1.Volume{
-			Name: metricsTokenVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  cluster.Spec.Admin.MetricsTokenSecretRef.Name,
-					DefaultMode: ptr.To[int32](0600),
-					Items:       []corev1.KeyToPath{{Key: metricsTokenKey, Path: metricsTokenVolumeName}},
-				},
-			},
-		})
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      metricsTokenVolumeName,
-			MountPath: "/secrets/metrics",
-			ReadOnly:  true,
-		})
-	}
-
-	// Add Consul discovery TLS secret volumes and mounts
-	if cluster.Spec.Discovery != nil && cluster.Spec.Discovery.Consul != nil &&
-		cluster.Spec.Discovery.Consul.Enabled != nil && *cluster.Spec.Discovery.Consul.Enabled {
-		consul := cluster.Spec.Discovery.Consul
-
-		if consul.CACertSecretRef != nil {
-			caCertKey := consulCACertKey
-			if consul.CACertSecretRef.Key != "" {
-				caCertKey = consul.CACertSecretRef.Key
-			}
-			volumes = append(volumes, corev1.Volume{
-				Name: consulCACertVolume,
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName:  consul.CACertSecretRef.Name,
-						DefaultMode: ptr.To[int32](0600),
-						Items:       []corev1.KeyToPath{{Key: caCertKey, Path: consulCACertKey}},
-					},
-				},
-			})
-			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name:      consulCACertVolume,
-				MountPath: "/secrets/consul/ca",
-				ReadOnly:  true,
-			})
-		}
-
-		if consul.ClientCertSecretRef != nil {
-			clientCertKey := consulClientCertKey
-			if consul.ClientCertSecretRef.Key != "" {
-				clientCertKey = consul.ClientCertSecretRef.Key
-			}
-			volumes = append(volumes, corev1.Volume{
-				Name: consulClientCertVolume,
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName:  consul.ClientCertSecretRef.Name,
-						DefaultMode: ptr.To[int32](0600),
-						Items:       []corev1.KeyToPath{{Key: clientCertKey, Path: consulClientCertKey}},
-					},
-				},
-			})
-			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name:      consulClientCertVolume,
-				MountPath: "/secrets/consul/client-cert",
-				ReadOnly:  true,
-			})
-		}
-
-		if consul.ClientKeySecretRef != nil {
-			clientKeyKey := consulClientKeyKey
-			if consul.ClientKeySecretRef.Key != "" {
-				clientKeyKey = consul.ClientKeySecretRef.Key
-			}
-			volumes = append(volumes, corev1.Volume{
-				Name: consulClientKeyVolume,
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName:  consul.ClientKeySecretRef.Name,
-						DefaultMode: ptr.To[int32](0600),
-						Items:       []corev1.KeyToPath{{Key: clientKeyKey, Path: consulClientKeyKey}},
-					},
-				},
-			})
-			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name:      consulClientKeyVolume,
-				MountPath: "/secrets/consul/client-key",
-				ReadOnly:  true,
-			})
-		}
-	}
+	credentialVolumes, credentialMounts := buildGarageCredentialVolumesAndMounts(cluster, node.Spec.Gateway)
+	volumes = append(volumes, credentialVolumes...)
+	volumeMounts = append(volumeMounts, credentialMounts...)
 
 	return volumes, volumeMounts
 }
@@ -1052,6 +1657,19 @@ func (r *GarageNodeReconciler) buildNodeVolumeClaimTemplates(node *garagev1beta1
 		}
 		return pvc
 	}
+	applySelector := func(pvc corev1.PersistentVolumeClaim, volume *garagev1beta1.NodeVolumeConfig, volumeName string, dataPathIndex int) corev1.PersistentVolumeClaim {
+		var selector *metav1.LabelSelector
+		if volume != nil {
+			selector = volume.Selector
+		}
+		if selector == nil {
+			selector = inheritedManagedPVCSelector(node, cluster, volumeName, dataPathIndex)
+		}
+		if selector != nil {
+			pvc.Spec.Selector = selector.DeepCopy()
+		}
+		return pvc
+	}
 
 	if node.Spec.Storage == nil {
 		return templates
@@ -1060,7 +1678,8 @@ func (r *GarageNodeReconciler) buildNodeVolumeClaimTemplates(node *garagev1beta1
 	// Metadata PVC (if not using existingClaim and not EmptyDir)
 	if meta := node.Spec.Storage.Metadata; meta != nil {
 		if meta.ExistingClaim == "" && meta.Type != garagev1beta1.VolumeTypeEmptyDir && meta.Size != nil {
-			templates = append(templates, addMetadata(buildBasePVC(metadataVolName, *meta.Size, meta.StorageClassName, meta.AccessModes), meta))
+			pvc := addMetadata(buildBasePVC(metadataVolName, *meta.Size, meta.StorageClassName, meta.AccessModes), meta)
+			templates = append(templates, applySelector(pvc, meta, metadataVolName, -1))
 		}
 	} else {
 		// Default metadata PVC when storage is specified but metadata config is omitted
@@ -1075,16 +1694,117 @@ func (r *GarageNodeReconciler) buildNodeVolumeClaimTemplates(node *garagev1beta1
 				if dp.ExistingClaim != "" || dp.Type == garagev1beta1.VolumeTypeEmptyDir || dp.Size == nil {
 					continue
 				}
-				templates = append(templates, addMetadata(buildBasePVC(nodeMultiHDDDataVolName(i), *dp.Size, dp.StorageClassName, dp.AccessModes), &dp))
+				pvc := addMetadata(buildBasePVC(nodeMultiHDDDataVolName(i), *dp.Size, dp.StorageClassName, dp.AccessModes), &dp)
+				templates = append(templates, applySelector(pvc, &dp, dataVolName, i))
 			}
 		default:
 			if data := node.Spec.Storage.Data; data != nil && data.ExistingClaim == "" && data.Type != garagev1beta1.VolumeTypeEmptyDir && data.Size != nil {
-				templates = append(templates, addMetadata(buildBasePVC(dataVolName, *data.Size, data.StorageClassName, data.AccessModes), data))
+				pvc := addMetadata(buildBasePVC(dataVolName, *data.Size, data.StorageClassName, data.AccessModes), data)
+				templates = append(templates, applySelector(pvc, data, dataVolName, -1))
 			}
 		}
 	}
 
 	return templates
+}
+
+// inheritedManagedPVCSelector is a compatibility fallback for an old
+// operator-generated child that predates NodeVolumeConfig.selector. It only
+// affects a newly created/missing StatefulSet claim template; reconciliation
+// never rewrites an existing StatefulSet or already-created PVC. Explicit
+// GarageNode selectors always win, including on ordinary Manual nodes.
+func inheritedManagedPVCSelector(
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	volumeName string,
+	dataPathIndex int,
+) *metav1.LabelSelector {
+	if !garageNodeUsesManagedPVCProfile(node, cluster) {
+		return nil
+	}
+	if node.Spec.Gateway {
+		if cluster.Spec.Gateway != nil && cluster.Spec.Gateway.Metadata != nil {
+			return cluster.Spec.Gateway.Metadata.Selector
+		}
+		return nil
+	}
+	if cluster.Spec.Storage == nil {
+		return nil
+	}
+	switch volumeName {
+	case metadataVolName:
+		if cluster.Spec.Storage.Metadata != nil {
+			return cluster.Spec.Storage.Metadata.Selector
+		}
+	case dataVolName:
+		data := cluster.Spec.Storage.Data
+		if data == nil {
+			return nil
+		}
+		if dataPathIndex >= 0 && dataPathIndex < len(data.Paths) &&
+			data.Paths[dataPathIndex].Volume != nil && data.Paths[dataPathIndex].Volume.Selector != nil {
+			return data.Paths[dataPathIndex].Volume.Selector
+		}
+		return data.Selector
+	}
+	return nil
+}
+
+func garageNodeUsesManagedPVCProfile(node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) bool {
+	if node == nil || cluster == nil ||
+		node.Spec.External != nil || isNodeLocalPoolBacked(node) ||
+		node.Spec.ClusterRef.Name != cluster.Name {
+		return false
+	}
+	refNamespace := node.Spec.ClusterRef.Namespace
+	if refNamespace == "" {
+		refNamespace = node.Namespace
+	}
+	if refNamespace != cluster.Namespace {
+		return false
+	}
+	if node.Labels[labelAppManagedBy] != managedByOperatorValue ||
+		!hasExactGarageClusterControllerReference(node, cluster) {
+		return false
+	}
+	if node.Spec.Gateway {
+		_, canonical := parseAutoModeGatewayOrdinal(autoNodeSlotForCycle(node), cluster.Name)
+		return canonical && cluster.Spec.LayoutPolicy != LayoutPolicyManual &&
+			cluster.HasStorageTier() && cluster.HasGatewayTier()
+	}
+	_, canonical := parseAutoModeOrdinal(autoNodeSlotForCycle(node), cluster.Name)
+	return canonical && cluster.EffectiveStorageLayoutPolicy() != LayoutPolicyManual
+}
+
+// applyInheritedManagedPVCSelectors snapshots the parent profile into a cycle
+// replacement before it stops being a direct GarageCluster child. This keeps
+// old pre-selector generated nodes repairable without trusting spoofable labels
+// on the sibling or mutating the original live PVC topology.
+func applyInheritedManagedPVCSelectors(
+	spec *garagev1beta1.GarageNodeSpec,
+	source *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+) {
+	if spec == nil || spec.Storage == nil || !garageNodeUsesManagedPVCProfile(source, cluster) {
+		return
+	}
+	if metadata := spec.Storage.Metadata; metadata != nil && metadata.Selector == nil {
+		if selector := inheritedManagedPVCSelector(source, cluster, metadataVolName, -1); selector != nil {
+			metadata.Selector = selector.DeepCopy()
+		}
+	}
+	if data := spec.Storage.Data; data != nil && data.Selector == nil {
+		if selector := inheritedManagedPVCSelector(source, cluster, dataVolName, -1); selector != nil {
+			data.Selector = selector.DeepCopy()
+		}
+	}
+	for i := range spec.Storage.DataPaths {
+		if spec.Storage.DataPaths[i].Selector == nil {
+			if selector := inheritedManagedPVCSelector(source, cluster, dataVolName, i); selector != nil {
+				spec.Storage.DataPaths[i].Selector = selector.DeepCopy()
+			}
+		}
+	}
 }
 
 // labelsForNode returns labels for a GarageNode's resources.
@@ -1103,7 +1823,7 @@ func (r *GarageNodeReconciler) labelsForNode(node *garagev1beta1.GarageNode, clu
 	if node.Spec.Gateway {
 		tier = tierGateway
 	}
-	return map[string]string{
+	labels := map[string]string{
 		labelAppName:      defaultAppName,
 		labelAppInstance:  cluster.Name,
 		labelAppComponent: "node",
@@ -1112,6 +1832,10 @@ func (r *GarageNodeReconciler) labelsForNode(node *garagev1beta1.GarageNode, clu
 		labelTier:         tier,
 		labelGarageNode:   node.Name,
 	}
+	if tier == tierStorage && !isNodeLocalPoolBacked(node) {
+		labels[labelStorageGroup] = storageGroupDefault
+	}
+	return labels
 }
 
 // selectorLabelsForNode returns the per-STS selector. It must be unique per
@@ -1128,8 +1852,17 @@ func (r *GarageNodeReconciler) selectorLabelsForNode(node *garagev1beta1.GarageN
 	}
 }
 
-func (r *GarageNodeReconciler) reconcileNode(ctx context.Context, node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster, garageClient *garage.Client) error {
+func (r *GarageNodeReconciler) reconcileNode(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	garageClient *garage.Client,
+	layoutOwner *garagev1beta2.GarageCluster,
+) error {
 	log := logf.FromContext(ctx)
+	if layoutOwner == nil {
+		return fmt.Errorf("canonical Garage layout owner is required")
+	}
 
 	// Discover or use the provided node ID. If a previously reconciled node is
 	// currently offline, discovery from its pod is impossible; retain the
@@ -1137,9 +1870,122 @@ func (r *GarageNodeReconciler) reconcileNode(ctx context.Context, node *garagev1
 	// be repaired through another healthy cluster admin endpoint. A live
 	// discovery always wins, so replacing a pod's persisted identity is still
 	// detected rather than masked by stale status.
-	nodeID := node.Spec.NodeID
-	if nodeID == "" {
-		discovered, discoverErr := r.discoverNodeID(ctx, node, cluster)
+	recoveryNodeID := canonicalGarageNodeID(node.Annotations[garagev1beta1.AnnotationNodeLocalPoolRecoveryNodeID])
+	var layout *garage.ClusterLayout
+	var managedIdentity *managedPodIdentity
+	usingObservedNodeID := false
+	nodeID := canonicalGarageNodeID(node.Spec.NodeID)
+	if nodeID != "" && node.Spec.External == nil && recoveryNodeID == "" {
+		var liveNodeID string
+		var err error
+		if r.managedNodeIDGetter != nil {
+			liveNodeID, err = r.managedNodeIDGetter(ctx, node, cluster)
+		} else {
+			managedIdentity, err = r.discoverNodeIdentityDirect(ctx, node, cluster)
+			if err == nil {
+				liveNodeID = managedIdentity.nodeID
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("verifying managed spec.nodeId against the exact live process: %w", err)
+		}
+		liveNodeID = canonicalGarageNodeID(liveNodeID)
+		if !isValidGarageNodeID(liveNodeID) {
+			return fmt.Errorf("managed Garage process reported invalid node ID %q while verifying spec.nodeId", liveNodeID)
+		}
+		if liveNodeID != nodeID {
+			return fmt.Errorf(
+				"%w: managed spec.nodeId pins identity %s, but the exact live process reports %s; refusing every layout and status mutation",
+				errLayoutMutationPending, shortID(nodeID), shortID(liveNodeID),
+			)
+		}
+		nodeID = liveNodeID
+	}
+	if recoveryNodeID != "" {
+		if !isNodeLocalPoolBacked(node) {
+			return fmt.Errorf("annotation %s is only valid on an internal node-local-pool GarageNode", garagev1beta1.AnnotationNodeLocalPoolRecoveryNodeID)
+		}
+		if node.Spec.NodeID != "" {
+			return fmt.Errorf("node-local-pool recovery requires live process discovery; spec.nodeId must be empty")
+		}
+		podIPs, err := r.getPodIPs(ctx, node, cluster)
+		if err != nil {
+			return fmt.Errorf("reading node-local-pool Pod addresses for identity recovery: %w", err)
+		}
+		liveIdentity, err := r.discoverNodeLocalPoolRecoveryNodeIdentity(ctx, node, cluster)
+		if err != nil {
+			return fmt.Errorf("discovering the node-local-pool process identity directly: %w", err)
+		}
+		managedIdentity = liveIdentity
+		liveNodeID := liveIdentity.nodeID
+		liveNodeID = canonicalGarageNodeID(liveNodeID)
+		if !isValidGarageNodeID(liveNodeID) {
+			return fmt.Errorf("node-local-pool process reported invalid Garage node ID %q", liveNodeID)
+		}
+		if !strings.EqualFold(liveNodeID, recoveryNodeID) {
+			return fmt.Errorf(
+				"%w: node-local pool %q on Kubernetes Node %q is pinned to Garage identity %s, but its live HostPath process reports %s; refusing to persist or assign the replacement identity",
+				errLayoutMutationPending,
+				node.Spec.NodeLocalPoolName,
+				node.Spec.KubernetesNodeName,
+				shortID(recoveryNodeID),
+				shortID(liveNodeID),
+			)
+		}
+		nodeID = liveNodeID
+
+		// A directly reached cold process might not yet be visible to the
+		// cluster-wide Admin endpoint. Reconnect the exact pinned identity before
+		// asking that endpoint to prove its committed role.
+		observedNodeID, observedErr := r.discoverNodeIDFromAdminAPI(ctx, garageClient, podIPs)
+		if observedErr != nil || !strings.EqualFold(observedNodeID, liveNodeID) {
+			if err := r.connectNodeToCluster(ctx, garageClient, liveNodeID, liveIdentity.podIP, cluster); err != nil {
+				return fmt.Errorf("connecting pinned node-local-pool identity %s to the cluster: %w", shortID(liveNodeID), err)
+			}
+		}
+
+		layout, err = garageClient.GetClusterLayout(ctx)
+		if err != nil {
+			return fmt.Errorf("reading committed Garage layout before node-local-pool recovery: %w", err)
+		}
+		expectedZone := r.effectiveNodeZone(ctx, node, cluster)
+		if err := validatePinnedNodeLocalPoolRecoveryRole(
+			cluster,
+			layout,
+			recoveryNodeID,
+			node.Spec.NodeLocalPoolName,
+			node.Spec.KubernetesNodeName,
+			expectedZone,
+		); err != nil {
+			return fmt.Errorf(
+				"%w: Garage identity %s is not the committed local role for node-local pool %q on Kubernetes Node %q: %v; refusing to create or repair a role from retained HostPath data",
+				errLayoutMutationPending,
+				shortID(liveNodeID),
+				node.Spec.NodeLocalPoolName,
+				node.Spec.KubernetesNodeName,
+				err,
+			)
+		}
+	} else if nodeID == "" {
+		// The cluster-wide status endpoint is useful for connectivity, but it is
+		// not an authoritative identity source: a replacement Pod can reuse an IP
+		// while Garage still reports the previous process. Query GetNodeInfo(self)
+		// on the exact ownership-proven Pod first and use the peer list only to
+		// decide whether that authenticated identity needs to be connected.
+		var identity *managedPodIdentity
+		var discoverErr error
+		if isNodeLocalPoolBacked(node) {
+			identity, discoverErr = r.discoverNodeLocalPoolRecoveryNodeIdentity(ctx, node, cluster)
+		} else {
+			identity, discoverErr = r.discoverNodeIdentityDirect(ctx, node, cluster)
+		}
+		discovered := ""
+		if discoverErr == nil {
+			discovered = canonicalGarageNodeID(identity.nodeID)
+			if !isValidGarageNodeID(discovered) {
+				return fmt.Errorf("managed Garage process reported invalid node ID %q", discovered)
+			}
+		}
 		var (
 			usedObserved bool
 			err          error
@@ -1149,44 +1995,27 @@ func (r *GarageNodeReconciler) reconcileNode(ctx context.Context, node *garagev1
 			return fmt.Errorf("failed to discover node ID: %w", err)
 		}
 		if usedObserved {
+			if err := r.validateManagedObservedIdentityFallback(ctx, node, cluster); err != nil {
+				return fmt.Errorf(
+					"%w: refusing stale status.nodeId fallback after direct managed-process discovery failed: %v (direct discovery: %v)",
+					errLayoutMutationPending, err, discoverErr,
+				)
+			}
+			usingObservedNodeID = true
 			log.Info("Node unavailable; using previously observed node ID for layout reconciliation", "nodeID", nodeID)
-		}
-	}
-
-	// If node ID is still empty, try to discover from Admin API using pod IPs.
-	// All pod IPs are used for address matching to handle dual-stack clusters where
-	// Garage may use a different IP family than the primary pod IP.
-	if nodeID == "" {
-		podIPs, err := r.getPodIPs(ctx, node, cluster)
-		if err != nil {
-			return fmt.Errorf("failed to get pod IPs for node discovery: %w", err)
-		}
-
-		discovered, err := r.discoverNodeIDFromAdminAPI(ctx, garageClient, podIPs)
-		if err != nil {
-			// Node might not be connected to the cluster yet.
-			// Try to discover its ID by connecting directly to the pod's Admin API.
-			log.Info("Node not found in cluster status, trying direct discovery", "podIPs", podIPs)
-			discovered, err = r.discoverNodeIDDirect(ctx, cluster, podIPs)
+		} else {
+			managedIdentity = identity
+			podIPs, err := r.getPodIPs(ctx, node, cluster)
 			if err != nil {
-				var usedObserved bool
-				nodeID, usedObserved, err = nodeIDFromDiscovery(discovered, err, node.Status.NodeID)
-				if err != nil {
-					return fmt.Errorf("failed to discover node ID: %w", err)
-				}
-				if usedObserved {
-					log.Info("Running node is unreachable; using previously observed node ID for layout reconciliation", "nodeID", nodeID)
-				}
-			} else {
-				// Connect this node to the cluster so other nodes can see it.
-				log.Info("Connecting node to cluster", "nodeID", discovered, "podIPs", podIPs)
-				if err := r.connectNodeToCluster(ctx, garageClient, discovered, podIPs[0], cluster); err != nil {
-					return fmt.Errorf("failed to connect node to cluster: %w", err)
+				return fmt.Errorf("reading managed Pod addresses after direct identity discovery: %w", err)
+			}
+			observedNodeID, observedErr := r.discoverNodeIDFromAdminAPI(ctx, garageClient, podIPs)
+			if observedErr != nil || canonicalGarageNodeID(observedNodeID) != discovered {
+				log.Info("Connecting exact managed identity to cluster", "nodeID", discovered, "podIP", identity.podIP)
+				if err := r.connectNodeToCluster(ctx, garageClient, discovered, identity.podIP, cluster); err != nil {
+					return fmt.Errorf("connecting exact managed identity %s to the cluster: %w", shortID(discovered), err)
 				}
 			}
-		}
-		if nodeID == "" {
-			nodeID = discovered
 		}
 	}
 
@@ -1194,69 +2023,127 @@ func (r *GarageNodeReconciler) reconcileNode(ctx context.Context, node *garagev1
 		return fmt.Errorf("node ID not found and could not be discovered")
 	}
 
-	// If the node's identity changed under us (its metadata was wiped — e.g. an
-	// in-place PVC clear — so Garage minted a fresh node_id on restart), the
-	// previous identity is now a dead role in the layout that nothing else
-	// reaps: the gateway tombstone reaper only matches capacity:null roles, and
-	// the -cycle add-before-remove flow is never triggered by an in-place wipe.
-	// Drop the stale role so Garage rebalances its partitions onto live nodes
-	// (including this node's new identity) instead of waiting forever for an
-	// identity that will never return. The wiped node holds no recoverable data
-	// by definition, so this only ever helps a degraded cluster recover.
-	previousNodeID := node.Status.NodeID
-	if previousNodeID != "" && previousNodeID != nodeID {
-		log.Info("Node identity changed; removing stale layout role",
-			"node", node.Name, "previousNodeID", previousNodeID, "newNodeID", nodeID)
-		if err := r.removeStaleNodeRole(ctx, garageClient, previousNodeID); err != nil {
-			return fmt.Errorf("removing stale node role %s after identity change: %w", previousNodeID, err)
+	nodeID = canonicalGarageNodeID(nodeID)
+	previousNodeID := canonicalGarageNodeID(node.Status.NodeID)
+	identityChanged := previousNodeID != "" && previousNodeID != nodeID
+	if err := r.validateGarageNodeIdentityOwner(ctx, node, cluster, nodeID); err != nil {
+		return err
+	}
+
+	// Read and validate an existing role before persisting a first observation.
+	// Otherwise copied HostPath metadata can turn another member's identity into
+	// durable status and a later reconciliation may mistake its pool/node tags
+	// for ordinary repairable drift.
+	if layout == nil {
+		var err error
+		layout, err = garageClient.GetClusterLayout(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get cluster layout before validating Garage identity ownership: %w", err)
 		}
 	}
-
-	node.Status.NodeID = nodeID
-
-	// Get current layout
-	layout, err := garageClient.GetClusterLayout(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get cluster layout: %w", err)
-	}
-
-	// Check if node is already in layout with correct settings
 	var existingRole *garage.LayoutRole
+	var previousRole *garage.LayoutRole
 	for i := range layout.Roles {
-		if layout.Roles[i].ID == nodeID {
-			existingRole = &layout.Roles[i]
-			break
+		role := &layout.Roles[i]
+		if canonicalGarageNodeID(role.ID) == nodeID {
+			existingRole = role
+		}
+		if identityChanged && canonicalGarageNodeID(role.ID) == previousNodeID {
+			previousRole = role
 		}
 	}
-
-	// Determine capacity
-	var capacity *uint64
-	if !node.Spec.Gateway {
-		if node.Spec.Capacity == nil {
-			return fmt.Errorf("capacity is required for non-gateway nodes")
+	if isNodeLocalPoolBacked(node) && existingRole != nil {
+		expectedZone := r.effectiveNodeZone(ctx, node, cluster)
+		if err := validatePinnedNodeLocalPoolRecoveryRole(
+			cluster, layout, nodeID, node.Spec.NodeLocalPoolName, node.Spec.KubernetesNodeName, expectedZone,
+		); err != nil {
+			return fmt.Errorf(
+				"IdentityCollision: discovered Garage identity %s is already committed to a different owner than node-local pool %q on Kubernetes Node %q: %w",
+				shortID(nodeID), node.Spec.NodeLocalPoolName, node.Spec.KubernetesNodeName, err,
+			)
 		}
-		nodeCapacity := uint64(node.Spec.Capacity.Value())
-		if nodeCapacity < 1024 {
-			return fmt.Errorf("capacity must be at least 1024 bytes (1 KB), got %d", nodeCapacity)
+	}
+	if previousNodeID == "" {
+		// Persist discovery in a separate reconciliation boundary before any
+		// Garage layout mutation. Besides letting sibling reconcilers authorize a
+		// staged bootstrap role, this closes a deletion-safety crash window: a
+		// role must never be committed while the owning GarageNode still has an
+		// empty durable status.nodeId that could later be mistaken for a process
+		// which never joined the layout.
+		observedPodUID := ""
+		if managedIdentity != nil {
+			if err := r.revalidateManagedPodIdentity(ctx, node, cluster, managedIdentity); err != nil {
+				return fmt.Errorf("%w: revalidating the exact managed Pod before persisting its first Garage identity: %v", errLayoutMutationPending, err)
+			}
+			observedPodUID = string(managedIdentity.podUID)
 		}
-		capacity = &nodeCapacity
+		apply := func() {
+			node.Status.NodeID = nodeID
+			if observedPodUID != "" {
+				node.Status.ObservedPodUID = observedPodUID
+			}
+		}
+		apply()
+		if err := UpdateStatusWithRetry(ctx, r.Client, node, apply); err != nil {
+			return fmt.Errorf("persisting first discovered Garage node ID before layout mutation: %w", err)
+		}
+		return fmt.Errorf("%w: persisted Garage node identity %s before its first layout mutation", errLayoutMutationPending, shortID(nodeID))
 	}
 
-	// Publish the effective node-specific RPC address in the replicated layout.
-	// Remote operators need this before the RPC mesh is connected; Garage's
-	// status API reports a disconnected peer's address as null, so
-	// rpc_public_addr in garage.toml alone cannot break the federation bootstrap
-	// chicken-and-egg. This covers explicit addresses, external nodes, and
-	// operator-managed LoadBalancer/NodePort endpoints.
-	rpcPublicAddr, err := r.effectiveNodeRPCPublicAddr(ctx, node, cluster)
+	desiredRole, err := r.desiredGarageNodeRoleChange(ctx, node, cluster, nodeID)
 	if err != nil {
-		return fmt.Errorf("resolving node RPC public address: %w", err)
+		return err
 	}
-	desiredTags := desiredNodeRoleTags(node.Spec.Tags, rpcPublicAddr)
-
-	// spec.zone unless spec.zoneFrom resolves a Kubernetes Node label (#294).
-	zone := r.effectiveNodeZone(ctx, node, cluster)
+	capacity := desiredRole.Capacity
+	desiredTags := desiredRole.Tags
+	zone := desiredRole.Zone
 	node.Status.Zone = zone
+	if identityChanged {
+		previousStoresBlocks := previousRole != nil && previousRole.Capacity != nil && *previousRole.Capacity > 0
+		desiredStoresBlocks := capacity != nil && *capacity > 0
+		if previousStoresBlocks || desiredStoresBlocks {
+			// A replacement process is already running, but status.nodeId is the
+			// durable owner of the unavailable source. Applying a role for the new
+			// identity before the old one is retired would create two data-bearing
+			// identities behind one GarageNode; a crash or blocked drain could then
+			// orphan the replacement role. Keep the replacement unassigned and retain
+			// the exact old identity so the administrator can invoke the normal
+			// destination-only lost-source workflow. That workflow fences this process
+			// before the old role is removed and the GarageNode is deleted/recreated.
+			if err := r.invalidateManagedGarageNodeIdentityObservation(ctx, node); err != nil {
+				return fmt.Errorf("invalidating stale managed-pod identity evidence: %w", err)
+			}
+			return fmt.Errorf(
+				"%w: GarageNode %s discovered replacement storage identity %s while status still owns %s; refusing to assign the replacement before the previous positive-capacity identity is retired: atomically set %s=%q and %s=%s, then follow the lost-source drain and delete workflow",
+				errLayoutMutationPending, node.Name, shortID(nodeID), shortID(previousNodeID),
+				garagev1beta1.AnnotationDrain, annotationTrue,
+				garagev1beta1.AnnotationAcknowledgeLostSource, previousNodeID,
+			)
+		}
+	}
+	if existingRole != nil {
+		existingStoresBlocks := existingRole.Capacity != nil && *existingRole.Capacity > 0
+		desiredStoresBlocks := capacity != nil && *capacity > 0
+		if existingStoresBlocks != desiredStoresBlocks {
+			return fmt.Errorf(
+				"refusing to convert GarageNode %s identity %s between storage and gateway roles in place; delete and drain the old identity, then create a distinct node in the other tier",
+				node.Name, shortID(nodeID),
+			)
+		}
+	}
+	gatewayReplacement := identityChanged && node.Spec.Gateway
+	if gatewayReplacement {
+		if err := r.ensureCapacitylessGarageNodeRetirementIntent(
+			ctx, node, layoutOwner, []string{previousNodeID},
+		); err != nil {
+			return err
+		}
+		if err := requireStorageDrainAuthorizedTargets(
+			layoutOwner, storageDrainActorForNode(node), []string{previousNodeID}, nil,
+		); err != nil {
+			return err
+		}
+	}
 
 	// Check if update is needed
 	needsUpdate := false
@@ -1278,7 +2165,8 @@ func (r *GarageNodeReconciler) reconcileNode(ctx context.Context, node *garagev1
 			updateReason = "capacity changed"
 		}
 		// Check for tag drift
-		if !tagSetEqual(existingRole.Tags, desiredTags) {
+		if !tagSetEqual(existingRole.Tags, desiredTags) &&
+			!legacyRoleOnlyMissingClusterUID(existingRole.Tags, desiredTags, string(cluster.UID)) {
 			needsUpdate = true
 			updateReason = "tags changed"
 			log.Info("Tag drift detected on node",
@@ -1289,7 +2177,22 @@ func (r *GarageNodeReconciler) reconcileNode(ctx context.Context, node *garagev1
 	}
 
 	if needsUpdate {
+		if storageDrainActorMatches(layoutOwner.Status.StorageDrain, storageDrainActorForNode(node)) && !gatewayReplacement {
+			return fmt.Errorf(
+				"%w: the active storage-drain actor may only remove its recorded target; wait for status.storageDrain to clear before adding or updating this GarageNode role",
+				errLayoutMutationPending,
+			)
+		}
 		log.Info("Updating node in layout", "nodeID", nodeID, "zone", zone, "reason", updateReason)
+		if managedIdentity != nil {
+			if err := r.revalidateManagedPodIdentity(ctx, node, cluster, managedIdentity); err != nil {
+				return fmt.Errorf("%w: revalidating the exact managed Pod before layout mutation: %v", errLayoutMutationPending, err)
+			}
+		} else if usingObservedNodeID {
+			if err := r.validateManagedObservedIdentityFallback(ctx, node, cluster); err != nil {
+				return fmt.Errorf("%w: revalidating observed managed identity before layout mutation: %v", errLayoutMutationPending, err)
+			}
+		}
 
 		if len(layout.StagedRoleChanges) > 0 {
 			alreadyStaged := false
@@ -1306,41 +2209,270 @@ func (r *GarageNodeReconciler) reconcileNode(ctx context.Context, node *garagev1
 			}
 		}
 
-		updates := []garage.NodeRoleChange{{
-			ID:       nodeID,
-			Zone:     zone,
-			Capacity: capacity,
-			Tags:     desiredTags,
-		}}
-
-		if err := garageClient.UpdateClusterLayout(ctx, updates); err != nil {
-			return fmt.Errorf("failed to update layout: %w", err)
+		updatesToStage := []garage.NodeRoleChange{desiredRole}
+		var intended []garage.NodeRoleChange
+		if gatewayReplacement {
+			// Commit the replacement assignment and old capacity-less role removal
+			// as one Garage layout version. This avoids an intermediate current
+			// layout that contains both identities and could be permanently held by
+			// the already-dead predecessor.
+			if previousRole != nil {
+				updatesToStage = append(updatesToStage, garage.NodeRoleChange{ID: previousNodeID, Remove: true})
+			}
+			intended = append([]garage.NodeRoleChange(nil), updatesToStage...)
+		} else {
+			intended, err = r.garageNodeStagingIntent(ctx, cluster, layout, desiredRole)
+			if err != nil {
+				return err
+			}
+		}
+		_, err = stageAndApplyExclusiveLayout(ctx, garageClient, layout, intended, nil, func() error {
+			if err := garageClient.UpdateClusterLayout(ctx, updatesToStage); err != nil {
+				return fmt.Errorf("failed to update layout: %w", err)
+			}
+			return nil
+		})
+		if err != nil {
+			if gatewayReplacement {
+				return fmt.Errorf("%w: combined gateway identity replacement has a durable exact target but Garage Apply did not confirm: %v", errLayoutMutationPending, err)
+			}
+			if garage.IsReplicationConstraint(err) {
+				return fmt.Errorf("%w: Garage is waiting for enough staged storage roles to satisfy replication constraints", errLayoutMutationPending)
+			}
+			return err
 		}
 
-		// ApplyStagedLayoutChanges re-reads the version after staging and
-		// tolerates the concurrent-writer race (apply rejection is a generic
-		// 500, not a 409 — so a returned error here is a genuine failure worth
-		// requeueing, not a benign version race).
-		if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
-			return fmt.Errorf("failed to apply layout: %w", err)
-		}
-
-		log.Info("Applied layout update", "nodeID", nodeID, "zone", zone)
+		log.Info("Applied layout update", "nodeID", nodeID, "zone", zone, "gatewayIdentityReplacement", gatewayReplacement)
+		// One successful Apply is the only topology mutation this critical
+		// section may perform. A later reconcile re-acquires the coordinator and
+		// proves the resulting layout history settled before handling identity
+		// cleanup or another node's drift.
+		return fmt.Errorf("%w: applied layout role for GarageNode %s", errLayoutMutationPending, node.Name)
 	}
 
+	// Capacity-less identities (gateways) can be replaced automatically: neither
+	// role stores blocks, so assigning the replacement above and then removing the
+	// stale role cannot bypass a data-migration proof. Positive-capacity identity
+	// changes returned through the explicit lost-source gate above.
+	if identityChanged {
+		if managedIdentity != nil {
+			if err := r.revalidateManagedPodIdentity(ctx, node, cluster, managedIdentity); err != nil {
+				return fmt.Errorf("%w: revalidating the exact managed Pod before stale gateway-role removal: %v", errLayoutMutationPending, err)
+			}
+		}
+		log.Info("Gateway identity changed; replacement assigned, removing stale layout role",
+			"node", node.Name, "previousNodeID", previousNodeID, "newNodeID", nodeID)
+		if err := r.removeStaleNodeRole(ctx, node, garageClient, previousNodeID, layoutOwner); err != nil {
+			return fmt.Errorf("removing stale node role %s after assigning replacement identity: %w", previousNodeID, err)
+		}
+		// The new identity is committed before the parent transaction is cleared;
+		// this prevents a crash from forgetting which replacement completed the
+		// recorded stale-role removal.
+	}
+
+	node.Status.NodeID = nodeID
 	return nil
 }
 
-// desiredNodeRoleTags returns a fresh tag slice and, when configured, carries
-// rpc_public_addr through Garage's replicated layout. The tag is operator-owned:
-// stale values are removed so changing the address cannot leave two candidates.
-func desiredNodeRoleTags(specTags []string, rpcPublicAddr string) []string {
-	desired := make([]string, 0, len(specTags)+1)
-	for _, tag := range specTags {
-		if !strings.HasPrefix(tag, nodeRPCAddressTagPrefix) {
-			desired = append(desired, tag)
+func (r *GarageNodeReconciler) validateGarageNodeIdentityOwner(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	nodeID string,
+) error {
+	if node == nil || cluster == nil || nodeID == "" {
+		return nil
+	}
+	if r.Client == nil && r.APIReader == nil {
+		// Some narrow unit tests exercise layout math without a Kubernetes
+		// client. Production reconciliation always supplies at least one reader.
+		return nil
+	}
+	siblings := &garagev1beta1.GarageNodeList{}
+	if err := r.nodeLocalPoolReader().List(ctx, siblings, client.InNamespace(node.Namespace)); err != nil {
+		return fmt.Errorf("listing GarageNodes before claiming identity %s: %w", shortID(nodeID), err)
+	}
+	for i := range siblings.Items {
+		sibling := &siblings.Items[i]
+		if sibling.Name == node.Name || sibling.Spec.ClusterRef.Name != cluster.Name ||
+			(sibling.Spec.ClusterRef.Namespace != "" && sibling.Spec.ClusterRef.Namespace != cluster.Namespace) {
+			continue
+		}
+		siblingNodeID, err := sibling.ResolvedGarageNodeID()
+		if err != nil {
+			return fmt.Errorf("resolving sibling GarageNode %s/%s identity before claiming %s: %w",
+				sibling.Namespace, sibling.Name, shortID(nodeID), err)
+		}
+		if canonicalGarageNodeID(siblingNodeID) != nodeID {
+			continue
+		}
+		return fmt.Errorf(
+			"IdentityCollision: Garage identity %s is already claimed by GarageNode %s/%s; refusing to let GarageNode %s/%s persist or mutate the same identity",
+			shortID(nodeID), sibling.Namespace, sibling.Name, node.Namespace, node.Name,
+		)
+	}
+	return nil
+}
+
+// invalidateManagedGarageNodeIdentityObservation clears the durable binding
+// between a Pod UID and status.nodeId as soon as direct discovery proves that
+// the same managed process now serves a different Garage identity. A later
+// storage-drain peer scan must not mistake the replacement Pod for a live
+// source of blocks owned by the old ID.
+func (r *GarageNodeReconciler) invalidateManagedGarageNodeIdentityObservation(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+) error {
+	if node == nil || (node.Status.ObservedPodUID == "" && !node.Status.Connected && node.Status.ObservedGeneration == 0) {
+		return nil
+	}
+	apply := func() {
+		node.Status.ObservedPodUID = ""
+		node.Status.Connected = false
+		node.Status.ObservedGeneration = 0
+	}
+	apply()
+	return UpdateStatusWithRetry(ctx, r.Client, node, apply)
+}
+
+// legacyRoleOnlyMissingClusterUID prevents a controller upgrade from creating
+// a no-op layout version solely to stamp every pre-feature role. Federated
+// sites do not share a Kubernetes lock and Garage's staging area has no CAS, so
+// simultaneous automatic retags would collide globally. New roles always get
+// the UID, and a legacy role picks it up whenever another real role change is
+// applied.
+func legacyRoleOnlyMissingClusterUID(existingTags, desiredTags []string, clusterUID string) bool {
+	if clusterUID == "" {
+		return false
+	}
+	for _, tag := range existingTags {
+		if strings.HasPrefix(tag, "cluster-uid:") {
+			return false
 		}
 	}
+	expectedUIDTag := "cluster-uid:" + clusterUID
+	withoutUID := make([]string, 0, len(desiredTags))
+	foundDesiredUID := false
+	for _, tag := range desiredTags {
+		if tag == expectedUIDTag {
+			foundDesiredUID = true
+			continue
+		}
+		withoutUID = append(withoutUID, tag)
+	}
+	return foundDesiredUID && tagSetEqual(existingTags, withoutUID)
+}
+
+func (r *GarageNodeReconciler) desiredGarageNodeRoleChange(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	nodeID string,
+) (garage.NodeRoleChange, error) {
+	var capacity *uint64
+	if !node.Spec.Gateway {
+		if node.Spec.Capacity == nil {
+			return garage.NodeRoleChange{}, fmt.Errorf("capacity is required for non-gateway nodes")
+		}
+		nodeCapacity := uint64(node.Spec.Capacity.Value())
+		if nodeCapacity < 1024 {
+			return garage.NodeRoleChange{}, fmt.Errorf("capacity must be at least 1024 bytes (1 KB), got %d", nodeCapacity)
+		}
+		capacity = &nodeCapacity
+	}
+	rpcPublicAddr, err := r.effectiveNodeRPCPublicAddr(ctx, node, cluster)
+	if err != nil {
+		return garage.NodeRoleChange{}, fmt.Errorf("resolving node RPC public address: %w", err)
+	}
+	operatorTags := []string{
+		fmt.Sprintf("cluster:%s/%s", cluster.Name, cluster.Namespace),
+	}
+	if cluster.UID != "" {
+		operatorTags = append(operatorTags, nodeClusterUIDTagPrefix+string(cluster.UID))
+	}
+	if node.Spec.Gateway {
+		operatorTags = append(operatorTags, "tier:"+tierGateway)
+	} else {
+		operatorTags = append(operatorTags, "tier:"+tierStorage)
+	}
+	if isNodeLocalPoolBacked(node) {
+		operatorTags = append(operatorTags,
+			nodeLocalPoolLayoutTagPrefix+node.Spec.NodeLocalPoolName,
+			"kubernetes-node:"+node.Spec.KubernetesNodeName,
+		)
+	}
+	return garage.NodeRoleChange{
+		ID:       nodeID,
+		Zone:     r.effectiveNodeZone(ctx, node, cluster),
+		Capacity: capacity,
+		Tags:     desiredNodeRoleTags(node.Spec.Tags, rpcPublicAddr, operatorTags...),
+	}, nil
+}
+
+// garageNodeStagingIntent admits only exact, live sibling GarageNode role
+// assignments left staged by an earlier replication-factor bootstrap attempt.
+// Removals, unknown IDs, and drift are owned by other operations and block
+// Apply instead of being committed opportunistically.
+func (r *GarageNodeReconciler) garageNodeStagingIntent(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	layout *garage.ClusterLayout,
+	desired garage.NodeRoleChange,
+) ([]garage.NodeRoleChange, error) {
+	intended := []garage.NodeRoleChange{desired}
+	if len(layout.StagedRoleChanges) == 0 {
+		return intended, nil
+	}
+	nodes := &garagev1beta1.GarageNodeList{}
+	if err := r.nodeLocalPoolReader().List(ctx, nodes, client.InNamespace(cluster.Namespace)); err != nil {
+		return nil, fmt.Errorf("listing GarageNodes to validate staged layout ownership: %w", err)
+	}
+	byID := make(map[string]*garagev1beta1.GarageNode)
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		if node.Spec.ClusterRef.Name != cluster.Name ||
+			(node.Spec.ClusterRef.Namespace != "" && node.Spec.ClusterRef.Namespace != cluster.Namespace) ||
+			!node.DeletionTimestamp.IsZero() {
+			continue
+		}
+		id := node.Status.NodeID
+		if id == "" {
+			id = node.Spec.NodeID
+		}
+		if id != "" {
+			byID[id] = node
+		}
+	}
+	seen := map[string]bool{desired.ID: true}
+	for i := range layout.StagedRoleChanges {
+		staged := layout.StagedRoleChanges[i]
+		if staged.ID == desired.ID {
+			continue
+		}
+		node := byID[staged.ID]
+		if node == nil || staged.Remove {
+			return nil, fmt.Errorf("%w: staged node %s is not an assignable live GarageNode owned by this cluster", errLayoutMutationPending, shortID(staged.ID))
+		}
+		expected, err := r.desiredGarageNodeRoleChange(ctx, node, cluster, staged.ID)
+		if err != nil || !sameStagedRoleChange(staged, expected) {
+			return nil, fmt.Errorf("%w: staged role for GarageNode %s does not match its desired operator state", errLayoutMutationPending, node.Name)
+		}
+		if !seen[expected.ID] {
+			intended = append(intended, expected)
+			seen[expected.ID] = true
+		}
+	}
+	return intended, nil
+}
+
+// desiredNodeRoleTags returns a fresh tag slice with one canonical set of
+// operator-owned metadata. Reserved values from specTags are discarded even if
+// admission was bypassed, so a GarageNode cannot forge another site's UID,
+// tier, pool membership, or RPC address in Garage's replicated layout.
+func desiredNodeRoleTags(specTags []string, rpcPublicAddr string, operatorTags ...string) []string {
+	desired := make([]string, 0, len(specTags)+len(operatorTags)+1)
+	desired = append(desired, operatorTags...)
+	desired = append(desired, userNodeLayoutTags(specTags)...)
 	if addr := strings.TrimSpace(rpcPublicAddr); addr != "" {
 		desired = append(desired, nodeRPCAddressTagPrefix+addr)
 	}
@@ -1352,27 +2484,95 @@ func desiredNodeRoleTags(specTags []string, rpcPublicAddr string) []string {
 // available again.
 func nodeIDFromDiscovery(discovered string, discoverErr error, observed string) (string, bool, error) {
 	if discoverErr == nil {
-		return discovered, false, nil
+		return canonicalGarageNodeID(discovered), false, nil
 	}
+	observed = canonicalGarageNodeID(observed)
 	if observed == "" {
 		return "", false, discoverErr
 	}
 	return observed, true, nil
 }
 
-func (r *GarageNodeReconciler) discoverNodeID(ctx context.Context, node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) (string, error) {
-	log := logf.FromContext(ctx)
-
-	// If external node, we can't discover - must be provided
-	if node.Spec.External != nil {
-		return "", fmt.Errorf("external nodes must have nodeId specified")
+// daemonSetPodForNode returns the storage DaemonSet pod scheduled on the
+// Kubernetes node this node-local-pool-backed GarageNode represents. Pods are
+// matched by the storage-tier labels the cluster-owned DaemonSet stamps on
+// its template ({labelCluster, labelTier=storage}), the DaemonSet controller
+// reference, and spec.nodeName.
+func (r *GarageNodeReconciler) daemonSetPodForNode(ctx context.Context, node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) (*corev1.Pod, error) {
+	if node.Spec.KubernetesNodeName == "" {
+		return nil, fmt.Errorf("node-local-pool-backed node %s has no spec.kubernetesNodeName", node.Name)
 	}
+	if node.Spec.NodeLocalPoolName == "" {
+		return nil, fmt.Errorf("node-local-pool-backed node %s has no spec.nodeLocalPoolName", node.Name)
+	}
+	daemonSet := &appsv1.DaemonSet{}
+	daemonSetKey := types.NamespacedName{
+		Name:      storageDaemonSetName(cluster, node.Spec.NodeLocalPoolName),
+		Namespace: cluster.Namespace,
+	}
+	if err := r.nodeLocalPoolReader().Get(ctx, daemonSetKey, daemonSet); err != nil {
+		return nil, fmt.Errorf("getting storage DaemonSet for pool %q: %w", node.Spec.NodeLocalPoolName, err)
+	}
+	if !metav1.IsControlledBy(daemonSet, cluster) {
+		return nil, fmt.Errorf(
+			"storage DaemonSet %s is not controlled by GarageCluster %s/%s",
+			daemonSet.Name,
+			cluster.Namespace,
+			cluster.Name,
+		)
+	}
+	pods := &corev1.PodList{}
+	if err := r.nodeLocalPoolReader().List(ctx, pods,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels(map[string]string{
+			labelCluster:       cluster.Name,
+			labelTier:          tierStorage,
+			labelNodeLocalPool: node.Spec.NodeLocalPoolName,
+		}),
+	); err != nil {
+		return nil, fmt.Errorf("listing storage DaemonSet pods: %w", err)
+	}
+	var active *corev1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !isStorageDaemonSetPodForPoolUID(cluster, node.Spec.NodeLocalPoolName, daemonSet.UID, pod) ||
+			pod.Spec.NodeName != node.Spec.KubernetesNodeName ||
+			!pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if active == nil || active.CreationTimestamp.Before(&pod.CreationTimestamp) {
+			active = pod
+		}
+	}
+	if active != nil {
+		return active, nil
+	}
+	return nil, fmt.Errorf("%w for node-local pool %q on Kubernetes node %q", errManagedPodAbsent, node.Spec.NodeLocalPoolName, node.Spec.KubernetesNodeName)
+}
 
-	// For managed nodes, the pod name is the same as the node name with -0 suffix
-	podName := node.Name + "-0"
-
-	log.Info("Attempting to discover node ID from pod", "pod", podName)
-	return r.getNodeIDFromPod(ctx, cluster.Namespace, podName)
+func (r *GarageNodeReconciler) statefulSetPodForNode(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+) (*corev1.Pod, error) {
+	statefulSet := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: node.Name, Namespace: node.Namespace}
+	if err := r.nodeLocalPoolReader().Get(ctx, key, statefulSet); err != nil {
+		return nil, fmt.Errorf("getting GarageNode StatefulSet %s: %w", node.Name, err)
+	}
+	if !metav1.IsControlledBy(statefulSet, node) {
+		return nil, fmt.Errorf("StatefulSet %s is not controlled by GarageNode %s", statefulSet.Name, node.Name)
+	}
+	pod := &corev1.Pod{}
+	if err := r.nodeLocalPoolReader().Get(ctx, types.NamespacedName{
+		Name: node.Name + "-0", Namespace: node.Namespace,
+	}, pod); err != nil {
+		return nil, fmt.Errorf("getting GarageNode pod %s-0: %w", node.Name, err)
+	}
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil || owner.Kind != kindStatefulSet || owner.UID != statefulSet.UID {
+		return nil, fmt.Errorf("pod %s is not controlled by the current StatefulSet %s", pod.Name, statefulSet.Name)
+	}
+	return pod, nil
 }
 
 // effectiveNodeZone resolves the layout zone for a GarageNode.
@@ -1382,18 +2582,16 @@ func (r *GarageNodeReconciler) discoverNodeID(ctx context.Context, node *garagev
 // look up the pod, follow spec.nodeName to the Kubernetes Node, and take the
 // configured label's value.
 //
-// Every failure to resolve falls back to spec.zone rather than erroring. A node
-// must always have a zone — Garage's layout role requires one — and the
-// fallback is correct in each case:
+// A node must always have a zone — Garage's layout role requires one. Before
+// the first successful resolution, failures fall back to spec.zone. After a
+// zone has been observed, transient workload gaps retain status.zone so an
+// OnDelete Pod replacement cannot manufacture two needless layout versions by
+// flipping to spec.zone and back:
 //
-//   - Pod not scheduled yet: the answer does not exist yet. The 1-minute
-//     requeue picks it up, and status.zone shows what is actually in the layout
-//     in the meantime.
+//   - Pod absent/not scheduled or Kubernetes Node temporarily unreadable: keep
+//     the last observed zone, or spec.zone when there is no observation yet.
 //   - Label absent on the Kubernetes Node: the cluster does not express that
-//     topology; the documented behaviour is to fall back.
-//   - Node unreadable (403): namespace-scoped installs grant no cluster-scoped
-//     RBAC, so `nodes` is simply not gettable. Failing here would wedge every
-//     GarageNode in such an install the moment someone set zoneFrom.
+//     topology any more; deliberately fall back to spec.zone.
 //
 // Re-resolution on every reconcile is deliberate: if a pod moves to a Kubernetes
 // Node in a different failure domain, the layout should say so. Upstream
@@ -1417,29 +2615,42 @@ func (r *GarageNodeReconciler) effectiveNodeZone(
 		return node.Spec.Zone
 	}
 
-	fallback := func(reason string, err error) string {
-		log.V(1).Info("zoneFrom unresolved, using spec.zone",
-			"node", node.Name, "nodeLabel", src.NodeLabel, "zone", node.Spec.Zone,
+	fallback := func(reason string, err error, retainObserved bool) string {
+		zone := node.Spec.Zone
+		if retainObserved && node.Status.Zone != "" {
+			zone = node.Status.Zone
+		}
+		log.V(1).Info("zoneFrom unresolved, using fallback zone",
+			"node", node.Name, "nodeLabel", src.NodeLabel, "zone", zone,
 			"reason", reason, "error", err)
-		return node.Spec.Zone
+		return zone
 	}
 
-	pod := &corev1.Pod{}
-	podName := node.Name + "-0"
-	if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: cluster.Namespace}, pod); err != nil {
-		return fallback("pod not found", err)
+	var pod *corev1.Pod
+	if isNodeLocalPoolBacked(node) {
+		dsPod, err := r.daemonSetPodForNode(ctx, node, cluster)
+		if err != nil {
+			return fallback("node-local-pool pod not found", err, true)
+		}
+		pod = dsPod
+	} else {
+		podName := node.Name + "-0"
+		pod = &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: cluster.Namespace}, pod); err != nil {
+			return fallback("pod not found", err, true)
+		}
 	}
 	if pod.Spec.NodeName == "" {
-		return fallback("pod not scheduled", nil)
+		return fallback("pod not scheduled", nil, true)
 	}
 
 	k8sNode := &corev1.Node{}
 	if err := r.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, k8sNode); err != nil {
-		return fallback("kubernetes node not readable", err)
+		return fallback("kubernetes node not readable", err, true)
 	}
 	zone := k8sNode.Labels[src.NodeLabel]
 	if zone == "" {
-		return fallback("label not set on kubernetes node", nil)
+		return fallback("label not set on kubernetes node", nil, false)
 	}
 	return zone
 }
@@ -1447,20 +2658,43 @@ func (r *GarageNodeReconciler) effectiveNodeZone(
 // getPodIPs returns all IP addresses assigned to the node's pod.
 // The first element is the primary IP (pod.Status.PodIP). On dual-stack clusters
 // additional IPs (IPv4 or IPv6) are appended from pod.Status.PodIPs.
+func (r *GarageNodeReconciler) managedPodForNode(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+) (*corev1.Pod, error) {
+	if node.Spec.External != nil {
+		return nil, fmt.Errorf("external nodes have no operator-managed Pod")
+	}
+	if isNodeLocalPoolBacked(node) {
+		return r.daemonSetPodForNode(ctx, node, cluster)
+	}
+	return r.statefulSetPodForNode(ctx, node)
+}
+
 func (r *GarageNodeReconciler) getPodIPs(ctx context.Context, node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) ([]string, error) {
 	if node.Spec.External != nil {
 		return nil, fmt.Errorf("external nodes must have nodeId specified")
 	}
-
-	podName := node.Name + "-0"
-
-	pod := &corev1.Pod{}
-	if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: cluster.Namespace}, pod); err != nil {
-		return nil, fmt.Errorf("failed to get pod %s: %w", podName, err)
+	pod, err := r.managedPodForNode(ctx, node, cluster)
+	if err != nil {
+		return nil, err
 	}
+	return managedPodIPs(pod)
+}
 
+func managedPodIPs(pod *corev1.Pod) ([]string, error) {
+	if pod == nil {
+		return nil, fmt.Errorf("managed Pod is missing")
+	}
+	if !pod.DeletionTimestamp.IsZero() {
+		return nil, fmt.Errorf("managed Pod %s is deleting", pod.Name)
+	}
+	if pod.Status.Phase != corev1.PodRunning {
+		return nil, fmt.Errorf("managed Pod %s is not running (phase: %s)", pod.Name, pod.Status.Phase)
+	}
 	if pod.Status.PodIP == "" {
-		return nil, fmt.Errorf("pod %s has no IP address yet", podName)
+		return nil, fmt.Errorf("pod %s has no IP address yet", pod.Name)
 	}
 
 	seen := map[string]bool{pod.Status.PodIP: true}
@@ -1493,70 +2727,155 @@ func (r *GarageNodeReconciler) discoverNodeIDFromAdminAPI(ctx context.Context, g
 // extractIPFromAddress extracts the IP address from an address string.
 // Handles both IPv4 (ip:port) and IPv6 ([ip]:port) formats.
 
-func (r *GarageNodeReconciler) getNodeIDFromPod(ctx context.Context, namespace, podName string) (string, error) {
-	pod := &corev1.Pod{}
-	if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, pod); err != nil {
-		return "", fmt.Errorf("failed to get pod %s: %w", podName, err)
-	}
-
-	// Check if pod has the node ID annotation
-	if nodeID, ok := pod.Annotations["garage.rajsingh.info/node-id"]; ok && nodeID != "" {
-		return nodeID, nil
-	}
-
-	// Pod must be running for discovery
-	if pod.Status.Phase != corev1.PodRunning {
-		return "", fmt.Errorf("pod %s is not running (phase: %s)", podName, pod.Status.Phase)
-	}
-
-	if pod.Status.PodIP == "" {
-		return "", fmt.Errorf("pod %s has no IP address yet", podName)
-	}
-
-	// Node ID will be discovered from Admin API in reconcileNode using pod IP
-	return "", nil
+type managedPodIdentity struct {
+	nodeID string
+	podIP  string
+	podUID types.UID
 }
 
-// discoverNodeIDDirect discovers a node's ID by connecting directly to the pod's Admin API.
-// This is used when the node hasn't yet connected to the cluster and isn't visible in cluster status.
-// discoverNodeIDDirect discovers a node's ID by connecting directly to the pod's Admin API.
-// This is used when the node hasn't yet connected to the cluster and isn't visible in cluster status.
-// podIPs[0] is the primary IP used to reach the pod; all IPs are tried for address matching.
-func (r *GarageNodeReconciler) discoverNodeIDDirect(ctx context.Context, cluster *garagev1beta2.GarageCluster, podIPs []string) (string, error) {
+func (r *GarageNodeReconciler) discoverNodeLocalPoolRecoveryNodeIdentity(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+) (*managedPodIdentity, error) {
+	if r.nodeLocalPoolRecoveryNodeIDGetter != nil {
+		pod, err := r.managedPodForNode(ctx, node, cluster)
+		if err != nil {
+			return nil, err
+		}
+		podIPs, err := managedPodIPs(pod)
+		if err != nil {
+			return nil, err
+		}
+		nodeID, err := r.nodeLocalPoolRecoveryNodeIDGetter(ctx, node, cluster, podIPs)
+		if err != nil {
+			return nil, err
+		}
+		return &managedPodIdentity{nodeID: nodeID, podIP: podIPs[0], podUID: pod.UID}, nil
+	}
+	return r.discoverNodeIdentityDirect(ctx, node, cluster)
+}
+
+// discoverNodeIdentityDirect resolves one exact owned Pod, uses that same
+// object's primary IP and mounted startup token to query Garage's process-local
+// identity, then re-resolves the managed Pod and requires its UID and selected
+// IP to be unchanged. This closes Pod replacement and IP-reuse races across the
+// network call.
+func (r *GarageNodeReconciler) discoverNodeIdentityDirect(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+) (*managedPodIdentity, error) {
 	log := logf.FromContext(ctx)
-
-	adminToken, err := GetAdminToken(ctx, r.Client, cluster)
+	// The caller already owns an exact GarageNode identity. Resolve its exact
+	// StatefulSet/DaemonSet Pod by controller UID and use that Pod's mounted
+	// Secret reference. Re-listing by mutable IP and a cluster-wide label can
+	// authenticate against a different incarnation that reused the address.
+	pod, err := r.managedPodForNode(ctx, node, cluster)
 	if err != nil {
-		return "", fmt.Errorf("failed to get admin token: %w", err)
+		return nil, fmt.Errorf("resolving exact managed Pod: %w", err)
+	}
+	podIPs, err := managedPodIPs(pod)
+	if err != nil {
+		return nil, err
+	}
+	adminToken, err := mountedStaticAdminToken(ctx, r.nodeLocalPoolReader(), pod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get exact Pod startup admin token: %w", err)
 	}
 
-	adminPort := int32(3903)
-	if cluster.Spec.Admin != nil && cluster.Spec.Admin.BindPort != 0 {
-		adminPort = cluster.Spec.Admin.BindPort
-	}
+	adminPort := getAdminPort(cluster)
 	directEndpoint := adminEndpoint(podIPs[0], adminPort)
 	directClient := garage.NewClient(directEndpoint, adminToken)
 
-	status, err := directClient.GetClusterStatus(ctx)
+	info, err := directClient.GetSelfNodeInfo(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to get status from pod directly: %w", err)
+		return nil, fmt.Errorf("failed to get self node info from pod directly: %w", err)
 	}
-
-	// First try matching by any pod IP address (works when rpc_public_addr is configured).
-	if id, ok := findNodeByIPs(status.Nodes, podIPs); ok {
-		log.Info("Discovered node ID from direct pod connection (by address)", "nodeID", id, "podIPs", podIPs)
-		return id, nil
+	freshPod, err := r.managedPodForNode(ctx, node, cluster)
+	if err != nil {
+		return nil, fmt.Errorf("re-resolving exact managed Pod after identity response: %w", err)
 	}
-
-	// Fall back to identifying the self-node by its unique peer state: isUp && lastSeenSecsAgo==nil.
-	// Garage sets PeerConnState::Ourself for the local node, which has no lastSeenSecsAgo and no
-	// address when rpc_public_addr is not configured — the common case for in-cluster pods.
-	if id, ok := findSelfNode(status.Nodes); ok {
-		log.Info("Discovered node ID from direct pod connection (as self)", "nodeID", id, "podIPs", podIPs)
-		return id, nil
+	if freshPod.UID != pod.UID {
+		return nil, fmt.Errorf("managed Pod changed UID from %s to %s while its Garage identity was queried", pod.UID, freshPod.UID)
 	}
+	freshIPs, err := managedPodIPs(freshPod)
+	if err != nil {
+		return nil, err
+	}
+	selectedIPStillOwned := false
+	for _, ip := range freshIPs {
+		if ip == podIPs[0] {
+			selectedIPStillOwned = true
+			break
+		}
+	}
+	if !selectedIPStillOwned {
+		return nil, fmt.Errorf("managed Pod %s no longer owns queried IP %s", pod.Name, podIPs[0])
+	}
+	log.Info("Discovered node ID from exact direct Pod self response", "nodeID", info.NodeID, "podIP", podIPs[0], "podUID", pod.UID)
+	return &managedPodIdentity{nodeID: info.NodeID, podIP: podIPs[0], podUID: pod.UID}, nil
+}
 
-	return "", fmt.Errorf("node not found in its own cluster status")
+// validateManagedObservedIdentityFallback permits an offline status.nodeId only
+// when Kubernetes proves that no current owned Pod exists, or when the current
+// Pod is the exact UID whose identity was previously observed. Read, ownership,
+// and UID ambiguity fail closed because a replacement can reuse both the
+// predecessor's stable Pod name and its IP address.
+func (r *GarageNodeReconciler) validateManagedObservedIdentityFallback(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+) error {
+	pod, err := r.managedPodForNode(ctx, node, cluster)
+	if err != nil {
+		if errors.IsNotFound(err) || stderrors.Is(err, errManagedPodAbsent) {
+			return nil
+		}
+		return fmt.Errorf("current managed Pod presence or ownership is ambiguous: %w", err)
+	}
+	observedPodUID := strings.TrimSpace(node.Status.ObservedPodUID)
+	if observedPodUID == "" {
+		return fmt.Errorf("current managed Pod %s/%s has UID %s, but status.observedPodUid is empty", pod.Namespace, pod.Name, pod.UID)
+	}
+	if string(pod.UID) != observedPodUID {
+		return fmt.Errorf(
+			"current managed Pod %s/%s has replacement UID %s, not previously authenticated UID %s",
+			pod.Namespace, pod.Name, pod.UID, observedPodUID,
+		)
+	}
+	return nil
+}
+
+// revalidateManagedPodIdentity closes the interval between a direct self query
+// and a durable status or Garage layout write. The same owned Pod UID must
+// still own the exact IP used for that process-local query.
+func (r *GarageNodeReconciler) revalidateManagedPodIdentity(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	identity *managedPodIdentity,
+) error {
+	if identity == nil || identity.podUID == "" || identity.podIP == "" {
+		return fmt.Errorf("direct managed-process identity has no complete Pod UID/IP binding")
+	}
+	pod, err := r.managedPodForNode(ctx, node, cluster)
+	if err != nil {
+		return err
+	}
+	if pod.UID != identity.podUID {
+		return fmt.Errorf("managed Pod changed UID from %s to %s after direct identity discovery", identity.podUID, pod.UID)
+	}
+	podIPs, err := managedPodIPs(pod)
+	if err != nil {
+		return err
+	}
+	for _, podIP := range podIPs {
+		if podIP == identity.podIP {
+			return nil
+		}
+	}
+	return fmt.Errorf("managed Pod %s/%s UID %s no longer owns directly queried IP %s", pod.Namespace, pod.Name, pod.UID, identity.podIP)
 }
 
 // connectNodeToCluster connects a new node to the cluster by calling ConnectNode.
@@ -1621,7 +2940,13 @@ func (r *GarageNodeReconciler) attemptOrphanedFinalize(ctx context.Context, node
 	defer cancel()
 
 	client := garage.NewClient(node.Status.ClusterAdminEndpoint, string(tokenData))
-	return r.removeNodeFromExternalLayout(cctx, node, client)
+	syntheticCluster := &garagev1beta2.GarageCluster{ObjectMeta: metav1.ObjectMeta{
+		Name:      node.Spec.ClusterRef.Name,
+		Namespace: node.Namespace,
+	}}
+	return runLayoutMutation(cctx, r.layoutMutationCoordinator(), syntheticCluster, client, func() error {
+		return r.removeNodeFromExternalLayout(cctx, node, client)
+	})
 }
 
 // removeNodeFromExternalLayout stages and applies a layout removal for the
@@ -1648,10 +2973,12 @@ func (r *GarageNodeReconciler) removeNodeFromExternalLayout(ctx context.Context,
 	}
 
 	updates := []garage.NodeRoleChange{{ID: node.Status.NodeID, Remove: true}}
-	if err := garageClient.UpdateClusterLayout(ctx, updates); err != nil {
-		return fmt.Errorf("stage node removal: %w", err)
-	}
-	if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
+	if _, err := stageAndApplyExclusiveLayout(ctx, garageClient, layout, updates, nil, func() error {
+		if err := garageClient.UpdateClusterLayout(ctx, updates); err != nil {
+			return fmt.Errorf("stage node removal: %w", err)
+		}
+		return nil
+	}); err != nil {
 		if garage.IsReplicationConstraint(err) {
 			// Best-effort cleanup; admin will need to add capacity or
 			// reduce replication to actually drop this entry.
@@ -1681,29 +3008,32 @@ func captureAdminEndpoint(node *garagev1beta1.GarageNode, cluster *garagev1beta2
 	}
 	// Unified / storage-only: layout lives on the local cluster admin.
 	if cluster.Spec.Admin != nil && cluster.Spec.Admin.AdminTokenSecretRef != nil {
-		adminPort := DefaultAdminPort
-		if cluster.Spec.Admin.BindPort != 0 {
-			adminPort = cluster.Spec.Admin.BindPort
-		}
+		adminPort := getAdminPort(cluster)
 		node.Status.ClusterAdminEndpoint = "http://" + svcFQDN(cluster.Name, cluster.Namespace, adminPort, clusterDomain)
 		ref := *cluster.Spec.Admin.AdminTokenSecretRef
 		node.Status.ClusterAdminTokenSecretRef = &ref
 	}
 }
 
-// removeStaleNodeRole drops a node_id's role from the layout. It is called from
-// reconcileNode when a managed node's discovered identity no longer matches the
-// last-known status.NodeID — i.e. the node's metadata was wiped and Garage
-// minted a fresh node_id. The previous identity is permanently gone, so its
-// layout role must be removed to let Garage rebalance its partitions off the
-// dead node. Mirrors finalize()'s safety: no-op if the role is already absent
-// or it is the last storage node, and tolerates a replication-constraint
-// rejection (logged; a later reconcile retries once capacity allows). Because
-// the stale role's data is gone, skip-dead-nodes is issued with AllowMissingData
-// so the layout doesn't stall in a draining version waiting for a node that
-// will never ack.
-func (r *GarageNodeReconciler) removeStaleNodeRole(ctx context.Context, garageClient *garage.Client, staleNodeID string) error {
+// removeStaleNodeRole drops a node_id's role from the layout. reconcileNode
+// calls it automatically only when a managed gateway's discovered identity no
+// longer matches status.NodeID: neither the old nor replacement role stores
+// blocks, so that transition is safe. A positive-capacity identity replacement
+// is held unassigned earlier and must use the explicit lost-source workflow.
+// The storage branches below remain as a defensive boundary for in-flight
+// upgrade/recovery state and fail closed unless normal source/destination proof
+// can identify a live source or the administrator acknowledges one is lost.
+func (r *GarageNodeReconciler) removeStaleNodeRole(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	garageClient *garage.Client,
+	staleNodeID string,
+	layoutOwner *garagev1beta2.GarageCluster,
+) error {
 	log := logf.FromContext(ctx)
+	if layoutOwner == nil {
+		return fmt.Errorf("canonical Garage layout owner is required")
+	}
 
 	layout, err := garageClient.GetClusterLayout(ctx)
 	if err != nil {
@@ -1722,6 +3052,34 @@ func (r *GarageNodeReconciler) removeStaleNodeRole(ctx context.Context, garageCl
 		}
 	}
 	if staleRole == nil {
+		proof := clusterStorageDrainProof(layoutOwner.Status.StorageDrain)
+		if node.Spec.Gateway && proof != nil && sameStorageDrainActor(proof.Actor, storageDrainActorForNode(node)) {
+			if len(proof.RemovedStorageNodeIDs) != 0 || !storageDrainRoleIntentIncludes(proof, staleNodeID) {
+				return fmt.Errorf("%w: gateway identity retirement has an invalid durable role-only target", errLayoutMutationPending)
+			}
+			if err := requireCapacitylessGatewayRetirementSettled(ctx, garageClient); err != nil {
+				return err
+			}
+			if proof.CompletedAt == nil {
+				if err := completeRoleOnlyGarageNodeDrain(ctx, r.Client, node, layoutOwner, layout); err != nil {
+					return err
+				}
+			}
+		}
+		if blockResyncIntentIncludes(proof, staleNodeID) || garageNodeStoresBlocks(node) {
+			// The spec/status identity is a backwards-compatible fallback for an
+			// operator upgrade that observes an already-removed role. New removals
+			// always persist this exact intent before Apply below.
+			if err := r.ensureNodeBlockResyncIntent(ctx, node, layoutOwner, layout, []string{staleNodeID}); err != nil {
+				return fmt.Errorf("%w: recording stale storage identity removal: %v", errLayoutMutationPending, err)
+			}
+			if err := waitForStorageRoleDrain(ctx, garageClient, staleNodeID); err != nil {
+				return fmt.Errorf("%w: waiting for stale storage identity layout history: %v", errLayoutMutationPending, err)
+			}
+			if err := r.requireBlockResyncQuiet(ctx, node, layoutOwner, garageClient); err != nil {
+				return fmt.Errorf("%w: waiting for stale storage identity block migration: %v", errLayoutMutationPending, err)
+			}
+		}
 		return nil
 	}
 
@@ -1729,56 +3087,81 @@ func (r *GarageNodeReconciler) removeStaleNodeRole(ctx context.Context, garageCl
 	if isStorageNode && storageNodeCount <= 1 {
 		log.Info("Refusing to remove last storage node role even though it is stale",
 			"staleNodeID", staleNodeID, "storageNodes", storageNodeCount)
-		return nil
+		return fmt.Errorf("%w: stale node %s is the last positive-capacity storage role", errUnsafeLayoutRoleRemoval, staleNodeID)
+	}
+	if isStorageNode {
+		if err := r.ensureNodeBlockResyncIntent(ctx, node, layoutOwner, layout, []string{staleNodeID}); err != nil {
+			return err
+		}
+		if err := requireStorageDrainAuthorizedTargets(
+			layoutOwner, storageDrainActorForNode(node), []string{staleNodeID}, []string{staleNodeID},
+		); err != nil {
+			return err
+		}
+	} else if node.Spec.Gateway {
+		if err := r.ensureCapacitylessGarageNodeRetirementIntent(ctx, node, layoutOwner, []string{staleNodeID}); err != nil {
+			return err
+		}
+		if err := requireStorageDrainAuthorizedTargets(
+			layoutOwner, storageDrainActorForNode(node), []string{staleNodeID}, nil,
+		); err != nil {
+			return err
+		}
 	}
 
 	updates := []garage.NodeRoleChange{{ID: staleNodeID, Remove: true}}
-	if err := garageClient.UpdateClusterLayout(ctx, updates); err != nil {
-		return fmt.Errorf("stage stale role removal: %w", err)
+	var beforeApply func(*garage.ClusterLayout) error
+	if isStorageNode {
+		beforeApply = func(staged *garage.ClusterLayout) error {
+			return requireStorageDrainBeforeApply(
+				ctx, r.Client, r.nodeLocalPoolReader(), layoutOwner, garageClient, staged, r.clusterHealthGetter,
+			)
+		}
 	}
-	if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
+	if _, err := stageAndApplyExclusiveLayoutWithCheck(ctx, garageClient, layout, updates, nil, func() error {
+		if err := garageClient.UpdateClusterLayout(ctx, updates); err != nil {
+			return fmt.Errorf("stage stale role removal: %w", err)
+		}
+		return nil
+	}, beforeApply); err != nil {
 		if garage.IsReplicationConstraint(err) {
 			log.Info("Cannot remove stale node role yet: would violate replication constraints; will retry",
 				"staleNodeID", staleNodeID, "storageNodes", storageNodeCount)
-			return nil
+			return fmt.Errorf("%w: stale role removal would violate replication constraints", errUnsafeLayoutRoleRemoval)
 		}
 		return fmt.Errorf("apply stale role removal: %w", err)
 	}
 	log.Info("Removed stale node role from layout", "staleNodeID", staleNodeID)
 
-	// The dead identity will never ack the new layout version, so advance the
-	// ack/sync trackers past it to keep the layout from stalling in a draining
-	// version. AllowMissingData is safe here: the stale node's data is gone with
-	// its wiped metadata, and the partitions rebuild from the surviving replicas.
-	appliedVersion, ok := reReadLayoutVersion(ctx, garageClient)
-	if !ok {
-		return nil
-	}
-	result, err := garageClient.ClusterLayoutSkipDeadNodes(ctx, garage.SkipDeadNodesRequest{
-		Version:          appliedVersion,
-		AllowMissingData: true,
-	})
-	if err != nil {
-		if !garage.IsBadRequest(err) {
-			log.Error(err, "Failed to skip dead node after stale role removal (will be retried)", "staleNodeID", staleNodeID)
-		}
-		return nil
-	}
-	if len(result.AckUpdated) > 0 || len(result.SyncUpdated) > 0 {
-		log.Info("Skipped dead node after stale role removal",
-			"staleNodeID", staleNodeID, "ackUpdated", len(result.AckUpdated), "syncUpdated", len(result.SyncUpdated))
-	}
-	return nil
+	// Surviving current members normally converge this removal without help;
+	// Garage prunes old history from their sync acknowledgements. If another
+	// current/down peer or pre-existing version blocks progress, however, the
+	// recovery API is global. Automatic reconciliation must wait instead of
+	// force-ACKing unrelated peers; an administrator may use the explicit
+	// annotation after assessing the whole layout.
+	return fmt.Errorf(
+		"%w: removed stale role %s; waiting for normal layout convergence or the explicit cluster-wide skip-dead-nodes recovery annotation",
+		errLayoutMutationPending, staleNodeID,
+	)
 }
 
-func (r *GarageNodeReconciler) finalize(ctx context.Context, node *garagev1beta1.GarageNode, garageClient *garage.Client) error {
+func (r *GarageNodeReconciler) finalize(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	garageClient *garage.Client,
+) error {
 	log := logf.FromContext(ctx)
 
-	if node.Status.NodeID == "" {
+	nodeID, err := node.ResolvedGarageNodeID()
+	if err != nil {
+		return fmt.Errorf("resolving durable GarageNode identity before finalization: %w", err)
+	}
+	if nodeID == "" {
 		return nil
 	}
 
-	log.Info("Removing node from layout", "nodeID", node.Status.NodeID)
+	log.Info("Removing node from layout", "nodeID", nodeID)
 
 	// Get current layout
 	layout, err := garageClient.GetClusterLayout(ctx)
@@ -1794,47 +3177,116 @@ func (r *GarageNodeReconciler) finalize(ctx context.Context, node *garagev1beta1
 		if role.Capacity != nil && *role.Capacity > 0 {
 			storageNodeCount++
 		}
-		if role.ID == node.Status.NodeID {
+		if canonicalGarageNodeID(role.ID) == nodeID {
 			inLayout = true
 			nodeRole = &layout.Roles[i]
 		}
 	}
 
 	if !inLayout {
-		log.Info("Node not in layout, nothing to remove")
+		proof := clusterStorageDrainProof(cluster.Status.StorageDrain)
+		if node.Spec.Gateway && proof != nil && sameStorageDrainActor(proof.Actor, storageDrainActorForNode(node)) {
+			if len(proof.RemovedStorageNodeIDs) != 0 || !storageDrainRoleIntentIncludes(proof, nodeID) {
+				return fmt.Errorf("%w: gateway retirement has an invalid durable role-only target", errLayoutMutationPending)
+			}
+			if err := requireCapacitylessGatewayRetirementSettled(ctx, garageClient); err != nil {
+				return err
+			}
+			if proof.CompletedAt == nil {
+				if err := completeRoleOnlyGarageNodeDrain(ctx, r.Client, node, cluster, layout); err != nil {
+					return err
+				}
+			}
+			log.Info("Gateway node role is absent and its metadata layout history settled", "nodeID", nodeID)
+			return nil
+		}
+		if blockResyncIntentIncludes(proof, nodeID) || garageNodeStoresBlocks(node) {
+			var intentErr error
+			if garageNodeAcknowledgesLostSource(node, nodeID) {
+				intentErr = r.ensureNodeLostSourceIntent(ctx, node, cluster, layout, garageClient, nodeID)
+			} else {
+				intentErr = r.ensureNodeBlockResyncIntent(ctx, node, cluster, layout, []string{nodeID})
+			}
+			if intentErr != nil {
+				return intentErr
+			}
+			if err := waitForStorageRoleDrain(ctx, garageClient, nodeID); err != nil {
+				return err
+			}
+			if err := r.requireBlockResyncQuiet(ctx, node, cluster, garageClient); err != nil {
+				return err
+			}
+		}
+		log.Info("Node role is absent and surviving storage nodes completed the block-resync quiet period")
 		return nil
 	}
 
 	isStorageNode := nodeRole != nil && nodeRole.Capacity != nil && *nodeRole.Capacity > 0
+	if isStorageNode && garageNodeAcknowledgesLostSource(node, nodeID) {
+		if err := requireGarageNodeLostSourceUnavailable(ctx, r.nodeLocalPoolReader(), node, cluster, garageClient, nodeID); err != nil {
+			return err
+		}
+		return fmt.Errorf(
+			"%w: lost source %s is still present in the Garage layout; first use Garage's explicit dead-node recovery to remove/apply that exact role and settle layout history, then the operator will verify surviving destinations",
+			errLayoutMutationPending, shortID(nodeID),
+		)
+	}
 	if isStorageNode && storageNodeCount <= 1 {
-		log.Info("Cannot remove last storage node from layout, skipping layout removal",
-			"nodeID", node.Status.NodeID, "storageNodes", storageNodeCount)
-		return nil
+		log.Info("Cannot remove last storage node from layout; retaining GarageNode finalizer",
+			"nodeID", nodeID, "storageNodes", storageNodeCount)
+		return fmt.Errorf("%w: node %s is the last positive-capacity storage role", errUnsafeLayoutRoleRemoval, nodeID)
+	}
+	if isStorageNode {
+		if err := r.ensureNodeBlockResyncIntent(ctx, node, cluster, layout, []string{nodeID}); err != nil {
+			return err
+		}
+		if err := requireStorageDrainAuthorizedTargets(
+			cluster, storageDrainActorForNode(node), []string{nodeID}, []string{nodeID},
+		); err != nil {
+			return err
+		}
+	} else if node.Spec.Gateway {
+		if err := r.ensureCapacitylessGarageNodeRetirementIntent(ctx, node, cluster, []string{nodeID}); err != nil {
+			return err
+		}
+		if err := requireStorageDrainAuthorizedTargets(
+			cluster, storageDrainActorForNode(node), []string{nodeID}, nil,
+		); err != nil {
+			return err
+		}
 	}
 
 	// Stage removal
 	updates := []garage.NodeRoleChange{{
-		ID:     node.Status.NodeID,
+		ID:     nodeID,
 		Remove: true,
 	}}
 
-	if err := garageClient.UpdateClusterLayout(ctx, updates); err != nil {
-		return fmt.Errorf("failed to stage node removal: %w", err)
-	}
-
-	if len(layout.StagedRoleChanges) > 0 {
-		log.Info("Adding removal to existing staged layout changes", "existingStagedCount", len(layout.StagedRoleChanges))
-	}
-
-	if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
-		if garage.IsReplicationConstraint(err) {
-			log.Info("Cannot remove node: would violate replication factor constraints. "+
-				"The node will be removed from Kubernetes but will remain in the Garage layout. "+
-				"Add more storage nodes or reduce the replication factor to fully remove this node.",
-				"nodeID", node.Status.NodeID, "storageNodes", storageNodeCount)
-			return nil
+	var beforeApply func(*garage.ClusterLayout) error
+	if isStorageNode {
+		beforeApply = func(staged *garage.ClusterLayout) error {
+			return requireStorageDrainBeforeApply(
+				ctx, r.Client, r.nodeLocalPoolReader(), cluster, garageClient, staged, r.clusterHealthGetter,
+			)
 		}
-		return fmt.Errorf("failed to apply layout removal: %w", err)
+	}
+	if _, err := stageAndApplyExclusiveLayoutWithCheck(ctx, garageClient, layout, updates, nil, func() error {
+		if err := garageClient.UpdateClusterLayout(ctx, updates); err != nil {
+			return fmt.Errorf("failed to stage node removal: %w", err)
+		}
+		return nil
+	}, beforeApply); err != nil {
+		recoveredErr := r.recoverNodeDrainApplyFailure(ctx, node, cluster, garageClient, updates, err)
+		if stderrors.Is(recoveredErr, errLayoutMutationPending) {
+			return recoveredErr
+		}
+		if garage.IsReplicationConstraint(err) {
+			log.Info("Cannot remove node: would violate replication constraints; retaining GarageNode finalizer. "+
+				"Add enough in-layout storage nodes or reduce the replication factor to continue.",
+				"nodeID", nodeID, "storageNodes", storageNodeCount)
+			return fmt.Errorf("%w: Garage rejected removal of node %s: %v", errUnsafeLayoutRoleRemoval, nodeID, recoveredErr)
+		}
+		return fmt.Errorf("failed to apply layout removal: %w", recoveredErr)
 	}
 
 	// Re-read the committed version. ApplyStagedLayoutChanges does not surface
@@ -1848,29 +3300,53 @@ func (r *GarageNodeReconciler) finalize(ctx context.Context, node *garagev1beta1
 		log.Info("Removed node from layout (could not re-read committed version)")
 	}
 
-	// For gateway nodes, immediately skip dead nodes. Gateways own no partitions
-	// so this is belt-and-suspenders (it advances ack/sync trackers so the
-	// removed entry never lingers in a Draining version), not a data operation.
-	// Only attempt it when we have a freshly re-read version — calling
-	// skip-dead-nodes against a guessed/stale version is worse than skipping it,
-	// and a later reconcile (or reconcileGatewayTombstones) re-drives the cleanup.
-	if node.Spec.Gateway && ok {
-		skipReq := garage.SkipDeadNodesRequest{
-			Version:          appliedVersion,
-			AllowMissingData: true,
+	// Applying a storage role removal creates a new current layout, but Garage
+	// keeps the previous version active while metadata assignments synchronize.
+	// Historical versions may still serve object blocks after those trackers
+	// clear, so retain the finalizer, activation label, and pod until every
+	// current storage node also reports a durable zero block-resync window.
+	if isStorageNode {
+		if err := waitForStorageRoleDrain(ctx, garageClient, nodeID); err != nil {
+			return err
 		}
-		result, err := garageClient.ClusterLayoutSkipDeadNodes(ctx, skipReq)
-		if err != nil {
-			if !garage.IsBadRequest(err) {
-				log.Error(err, "Failed to skip dead gateway node (will be cleaned up later)")
-			}
-		} else if len(result.AckUpdated) > 0 || len(result.SyncUpdated) > 0 {
-			log.Info("Skipped dead gateway node to prevent draining stall",
-				"ackUpdated", len(result.AckUpdated),
-				"syncUpdated", len(result.SyncUpdated))
+		if err := r.requireBlockResyncQuiet(ctx, node, cluster, garageClient); err != nil {
+			return err
 		}
 	}
 
+	if node.Spec.Gateway {
+		if err := requireCapacitylessGatewayRetirementSettled(ctx, garageClient); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: gateway role is absent and layout history settled; recording the durable terminal handoff on the next reconcile", errLayoutMutationPending)
+	}
+
+	return nil
+}
+
+func waitForStorageRoleDrain(ctx context.Context, garageClient *garage.Client, nodeID string) error {
+	history, err := garageClient.GetClusterLayoutHistory(ctx)
+	if err != nil {
+		return fmt.Errorf("checking layout-history drain for storage node %s: %w", nodeID, err)
+	}
+	if _, stillActive := history.UpdateTrackers[nodeID]; stillActive {
+		return fmt.Errorf(
+			"%w: storage node %s remains in an active older layout version (current version %d)",
+			errLayoutRoleDraining,
+			nodeID,
+			history.CurrentVersion,
+		)
+	}
+	if len(history.GetDrainingVersions()) > 0 && history.UpdateTrackers == nil {
+		// Current supported Garage versions return updateTrackers whenever more
+		// than one layout version is active. If that evidence is unavailable,
+		// fail closed instead of assuming the removed storage identity is safe.
+		return fmt.Errorf(
+			"%w: Garage reports draining layout versions but no update trackers while checking storage node %s",
+			errLayoutRoleDraining,
+			nodeID,
+		)
+	}
 	return nil
 }
 
@@ -1889,22 +3365,24 @@ func reReadLayoutVersion(ctx context.Context, garageClient *garage.Client) (uint
 }
 
 func (r *GarageNodeReconciler) updateStatus(ctx context.Context, node *garagev1beta1.GarageNode, phase string, err error) (ctrl.Result, error) {
-	node.Status.Phase = phase
-	if err == nil {
-		node.Status.ObservedGeneration = node.Generation
-	}
-
-	if err != nil {
+	observedGeneration := node.Generation
+	apply := func() {
+		node.Status.Phase = phase
+		if err == nil {
+			node.Status.ObservedGeneration = observedGeneration
+			return
+		}
 		meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
 			Type:               PhaseReady,
 			Status:             metav1.ConditionFalse,
 			Reason:             garagev1beta1.ReasonReconcileFailed,
 			Message:            err.Error(),
-			ObservedGeneration: node.Generation,
+			ObservedGeneration: observedGeneration,
 		})
 	}
+	apply()
 
-	if statusErr := UpdateStatusWithRetry(ctx, r.Client, node); statusErr != nil {
+	if statusErr := UpdateStatusWithRetry(ctx, r.Client, node, apply); statusErr != nil {
 		return ctrl.Result{}, statusErr
 	}
 
@@ -1914,9 +3392,57 @@ func (r *GarageNodeReconciler) updateStatus(ctx context.Context, node *garagev1b
 	return ctrl.Result{}, nil
 }
 
-func (r *GarageNodeReconciler) updateStatusFromGarage(ctx context.Context, node *garagev1beta1.GarageNode, garageClient *garage.Client) (ctrl.Result, error) {
+func (r *GarageNodeReconciler) updateStatusFromGarage(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	garageClient *garage.Client,
+) (ctrl.Result, error) {
 	if node.Status.NodeID == "" {
 		return r.updateStatus(ctx, node, "Pending", nil)
+	}
+
+	// A parent-controlled storage rollout may replace a pod without
+	// changing the GarageNode generation. Rediscover the identity directly from
+	// the current pod and record its UID only after it agrees with the reconciled
+	// node ID. The parent uses this handshake to distinguish fresh evidence from
+	// the previous pod's still-cached Connected/InLayout status. Every internally
+	// managed GarageNode participates: node-local-pool members use their DaemonSet pod,
+	// while PVC, SMB, and unified gateway members use their owned StatefulSet pod.
+	observedPodUID := ""
+	if node.Spec.External == nil {
+		var pod *corev1.Pod
+		var err error
+		if isNodeLocalPoolBacked(node) {
+			pod, err = r.daemonSetPodForNode(ctx, node, cluster)
+		} else {
+			pod, err = r.statefulSetPodForNode(ctx, node)
+		}
+		if err != nil {
+			return r.updateStatus(ctx, node, PhasePending, fmt.Errorf("waiting to observe current managed pod: %w", err))
+		}
+		// Probe this exact Pod's Admin API; matching its IP against the shared
+		// peer list is insufficient because a replacement identity may reuse
+		// the old process's Pod IP.
+		identity, err := r.discoverNodeIdentityDirect(ctx, node, cluster)
+		if err != nil {
+			return r.updateStatus(ctx, node, PhasePending, fmt.Errorf("waiting to verify Garage identity directly from managed pod %s: %w", pod.Name, err))
+		}
+		liveNodeID := identity.nodeID
+		if identity.podUID != pod.UID {
+			return r.updateStatus(ctx, node, PhasePending, fmt.Errorf("managed pod %s changed UID during direct identity verification", pod.Name))
+		}
+		liveNodeID = canonicalGarageNodeID(liveNodeID)
+		if liveNodeID != canonicalGarageNodeID(node.Status.NodeID) {
+			if err := r.invalidateManagedGarageNodeIdentityObservation(ctx, node); err != nil {
+				return ctrl.Result{}, fmt.Errorf("invalidating stale managed-pod identity evidence: %w", err)
+			}
+			return r.updateStatus(ctx, node, PhasePending, fmt.Errorf(
+				"managed pod %s reports Garage identity %s while status still tracks %s",
+				pod.Name, shortID(liveNodeID), shortID(node.Status.NodeID),
+			))
+		}
+		observedPodUID = string(pod.UID)
 	}
 
 	status, err := garageClient.GetClusterStatus(ctx)
@@ -1926,7 +3452,7 @@ func (r *GarageNodeReconciler) updateStatusFromGarage(ctx context.Context, node 
 
 	var nodeInfo *garage.NodeInfo
 	for i := range status.Nodes {
-		if status.Nodes[i].ID == node.Status.NodeID {
+		if canonicalGarageNodeID(status.Nodes[i].ID) == canonicalGarageNodeID(node.Status.NodeID) {
 			nodeInfo = &status.Nodes[i]
 			break
 		}
@@ -1939,54 +3465,87 @@ func (r *GarageNodeReconciler) updateStatusFromGarage(ctx context.Context, node 
 
 	var layoutRole *garage.LayoutRole
 	for i := range layout.Roles {
-		if layout.Roles[i].ID == node.Status.NodeID {
+		if canonicalGarageNodeID(layout.Roles[i].ID) == canonicalGarageNodeID(node.Status.NodeID) {
 			layoutRole = &layout.Roles[i]
 			break
 		}
 	}
 
-	node.Status.Phase = PhaseReady
-	node.Status.ObservedGeneration = node.Generation
-	node.Status.InLayout = layoutRole != nil
-
-	if layoutRole != nil {
-		node.Status.LayoutVersion = int64(layout.Version)
-	}
-
-	if nodeInfo != nil {
-		node.Status.Connected = nodeInfo.IsUp
-		if nodeInfo.Address != nil {
-			node.Status.Address = *nodeInfo.Address
-		}
-		if nodeInfo.IsUp {
-			now := metav1.Now()
-			node.Status.LastSeen = &now
-		}
-	}
-
+	inLayout := layoutRole != nil
+	connected := nodeInfo != nil && nodeInfo.IsUp
 	conditionStatus := metav1.ConditionTrue
 	reason := "NodeReady"
 	message := "Node is ready and in layout"
 
-	if !node.Status.InLayout {
+	if !inLayout {
 		conditionStatus = metav1.ConditionFalse
 		reason = "NotInLayout"
 		message = "Node is not yet in the cluster layout"
-	} else if nodeInfo != nil && !nodeInfo.IsUp {
+	} else if !connected {
 		conditionStatus = metav1.ConditionFalse
 		reason = "NodeDisconnected"
-		message = "Node is in layout but not connected"
+		message = "Node is in layout but its identity is not currently connected"
 	}
-
-	meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
+	readyCondition := metav1.Condition{
 		Type:               PhaseReady,
 		Status:             conditionStatus,
 		Reason:             reason,
 		Message:            message,
 		ObservedGeneration: node.Generation,
-	})
+	}
 
-	if err := UpdateStatusWithRetry(ctx, r.Client, node); err != nil {
+	// Capture values computed from this exact reconcile. If a concurrent spec or
+	// status write causes a conflict, UpdateStatusWithRetry re-fetches the object;
+	// this closure reapplies the Pod-identity handshake instead of silently
+	// succeeding with the freshly fetched (stale) status.
+	observedGeneration := node.Generation
+	nodeID := canonicalGarageNodeID(node.Status.NodeID)
+	zone := node.Status.Zone
+	adminEndpoint := node.Status.ClusterAdminEndpoint
+	var adminTokenRef *corev1.SecretKeySelector
+	if node.Status.ClusterAdminTokenSecretRef != nil {
+		copy := *node.Status.ClusterAdminTokenSecretRef
+		adminTokenRef = &copy
+	}
+	var address string
+	hasAddress := nodeInfo != nil && nodeInfo.Address != nil
+	if hasAddress {
+		address = *nodeInfo.Address
+	}
+	var lastSeen *metav1.Time
+	if connected {
+		now := metav1.Now()
+		lastSeen = &now
+	}
+	apply := func() {
+		node.Status.NodeID = nodeID
+		node.Status.Zone = zone
+		node.Status.ClusterAdminEndpoint = adminEndpoint
+		node.Status.ClusterAdminTokenSecretRef = adminTokenRef
+		node.Status.Phase = PhaseReady
+		node.Status.ObservedGeneration = observedGeneration
+		node.Status.InLayout = inLayout
+		if layoutRole != nil {
+			node.Status.LayoutVersion = int64(layout.Version)
+		}
+		node.Status.Connected = connected
+		if hasAddress {
+			node.Status.Address = address
+		}
+		if lastSeen != nil {
+			copy := *lastSeen
+			node.Status.LastSeen = &copy
+		}
+		if observedPodUID != "" {
+			node.Status.ObservedPodUID = observedPodUID
+		}
+		condition := readyCondition
+		condition.ObservedGeneration = observedGeneration
+		meta.SetStatusCondition(&node.Status.Conditions, condition)
+	}
+	apply()
+
+	if err := UpdateStatusWithRetry(ctx, r.Client, node, apply); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -2009,7 +3568,7 @@ func (r *GarageNodeReconciler) reconcileNodeService(ctx context.Context, node *g
 		return nil
 	}
 	ep := node.Spec.PublicEndpoint
-	svcName := node.Name + "-rpc"
+	svcName := boundedDNS1123LabelName(node.Name + "-rpc")
 
 	rpcPort := DefaultRPCPort
 	if cluster.Spec.Network.RPCBindPort != 0 {
@@ -2125,9 +3684,36 @@ func (r *GarageNodeReconciler) effectiveNodeRPCPublicAddr(ctx context.Context, n
 	return "", nil
 }
 
-// reconcileNodeConfigMap generates a per-node garage.toml ConfigMap by building a configContext
-// with node-specific overrides and calling the shared config generator.
+// reconcileNodeConfigMap generates a per-node garage.toml resource by building
+// a configContext with node-specific overrides and calling the shared generator.
 func (r *GarageNodeReconciler) reconcileNodeConfigMap(ctx context.Context, node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) error {
+	nodeConfig, err := r.renderNodeGarageConfig(ctx, node, cluster)
+	if err != nil {
+		return err
+	}
+	baseName := garageNodeConfigBaseName(cluster, node)
+	revision, err := garageConfigRevision(ctx, r.nodeLocalPoolReader(), cluster, nodeConfig)
+	if err != nil {
+		return err
+	}
+	name := garageConfigRevisionName(baseName, revision)
+	annotations := garageConfigRevisionAnnotations(baseName, nil)
+	labels := r.labelsForNode(node, cluster)
+	if garageConfigUsesSecret(cluster) {
+		_, err = reconcileGarageConfigSecret(
+			ctx, r.Client, r.Scheme, node, cluster.Namespace, name,
+			nodeConfig, revision, labels, annotations, true,
+		)
+		return err
+	}
+	_, err = reconcileGarageConfigMap(
+		ctx, r.Client, r.Scheme, node, cluster.Namespace, name,
+		nodeConfig, revision, labels, annotations, true,
+	)
+	return err
+}
+
+func (r *GarageNodeReconciler) renderNodeGarageConfig(ctx context.Context, node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) (string, error) {
 	// Start with a base context (resolves Consul token, cluster-level publicEndpoint, etc.)
 	// buildConfigContext only hard-errors when a configured secret (Consul token) is
 	// missing/incomplete. Do NOT render on that error: an empty context drops the
@@ -2136,7 +3722,7 @@ func (r *GarageNodeReconciler) reconcileNodeConfigMap(ctx context.Context, node 
 	// so the node goes PhaseFailed and requeues until the secret is present.
 	cfgCtx, err := buildConfigContext(ctx, r.Client, cluster)
 	if err != nil {
-		return fmt.Errorf("building node config context (config not ready): %w", err)
+		return "", fmt.Errorf("building node config context (config not ready): %w", err)
 	}
 
 	// A gateway node must never inherit the storage tier's rpc_public_addr from
@@ -2144,13 +3730,14 @@ func (r *GarageNodeReconciler) reconcileNodeConfigMap(ctx context.Context, node 
 	// still flows through NodeRPCPublicAddr below.
 	if node.Spec.Gateway {
 		cfgCtx.OmitClusterRPCPublicAddr = true
+		cfgCtx.ForceSingleDataDir = true
 	}
 
 	// Apply node-level rpc_public_addr via NodeRPCPublicAddr — this takes highest priority
 	// in writeRPCConfig, overriding even cluster.Spec.Network.RPCPublicAddr.
 	rpcPublicAddr, err := r.effectiveNodeRPCPublicAddr(ctx, node, cluster)
 	if err != nil {
-		return fmt.Errorf("resolving node RPC public address: %w", err)
+		return "", fmt.Errorf("resolving node RPC public address: %w", err)
 	}
 	cfgCtx.NodeRPCPublicAddr = rpcPublicAddr
 
@@ -2175,7 +3762,7 @@ func (r *GarageNodeReconciler) reconcileNodeConfigMap(ctx context.Context, node 
 				if !dp.ReadOnly {
 					switch {
 					case dp.Size != nil && !dp.Size.IsZero():
-						p.Capacity = dp.Size.String()
+						p.Capacity = garageBytesize(dp.Size)
 					case dp.ExistingClaim != "":
 						if cap := r.lookupPVCCapacity(ctx, cluster.Namespace, dp.ExistingClaim); cap != "" {
 							p.Capacity = cap
@@ -2191,7 +3778,7 @@ func (r *GarageNodeReconciler) reconcileNodeConfigMap(ctx context.Context, node 
 					// the claim binds; when no capacity is configurable at all the
 					// message tells the operator exactly which disk to fix.
 					if p.Capacity == "" {
-						return fmt.Errorf("data_dir entry %d (path %q) has no capacity: set spec.storage.dataPaths[%d].size, mark it readOnly, or wait for its existingClaim PVC to bind with a requested size", i, p.Path, i)
+						return "", fmt.Errorf("data_dir entry %d (path %q) has no capacity: set spec.storage.dataPaths[%d].size, mark it readOnly, or wait for its existingClaim PVC to bind with a requested size", i, p.Path, i)
 					}
 				}
 				paths = append(paths, p)
@@ -2200,29 +3787,7 @@ func (r *GarageNodeReconciler) reconcileNodeConfigMap(ctx context.Context, node 
 		}
 	}
 
-	nodeConfig := generateGarageConfig(cluster, cfgCtx)
-
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      node.Name + "-config",
-			Namespace: cluster.Namespace,
-		},
-		Data: map[string]string{configFileName: nodeConfig},
-	}
-	if err := controllerutil.SetControllerReference(node, cm, r.Scheme); err != nil {
-		return err
-	}
-
-	existing := &corev1.ConfigMap{}
-	err = r.Get(ctx, types.NamespacedName{Name: cm.Name, Namespace: cluster.Namespace}, existing)
-	if errors.IsNotFound(err) {
-		return r.Create(ctx, cm)
-	}
-	if err != nil {
-		return err
-	}
-	existing.Data = cm.Data
-	return r.Update(ctx, existing)
+	return generateGarageConfig(cluster, cfgCtx), nil
 }
 
 // mergeNodeEnv merges cluster-level env with per-node env. Entries from `node`
@@ -2294,26 +3859,149 @@ func effectiveNodeLogging(cluster *garagev1beta2.LoggingConfig, override *garage
 //     means a CM edit by hand or by a non-spec-changing code path would sit
 //     unrolled until the next periodic requeue.
 //
+//   - corev1.Pod (label- and owner-gated): pods are indirectly owned by a
+//     GarageNode through a StatefulSet, or by its parent GarageCluster through
+//     a node-local-pool DaemonSet. Owns() does not follow either relationship.
+//     Waking the exact GarageNode when one of those pods is replaced lets it
+//     publish the new Pod UID and directly verified Garage identity without
+//     making a healthy serialized rollout wait for the periodic safety tick.
+//
+//   - corev1.Node (cluster-scoped installs only, label changes only): maps the
+//     managed Pods scheduled on that Kubernetes Node back to their GarageNodes.
+//     This makes spec.zoneFrom update and fall back immediately when a topology
+//     label changes or is removed.
+//
 // Both predicates are intentionally narrow — generation predicate on the CR
 // + label gating in the CM mapper — to avoid waking GarageNode reconciles
 // for unrelated objects.
 func (r *GarageNodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	clusterTemplatePredicate := predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool { return true },
+		DeleteFunc: func(event.DeleteEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldCluster, oldOK := e.ObjectOld.(*garagev1beta2.GarageCluster)
+			newCluster, newOK := e.ObjectNew.(*garagev1beta2.GarageCluster)
+			if !oldOK || !newOK {
+				return false
+			}
+			return oldCluster.Generation != newCluster.Generation ||
+				currentStaticCredentialsSecretName(oldCluster) != currentStaticCredentialsSecretName(newCluster) ||
+				oldCluster.Annotations[annotationStaticCredentialsRevision] != newCluster.Annotations[annotationStaticCredentialsRevision]
+		},
+	}
+	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&garagev1beta1.GarageNode{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&corev1.Secret{}).
 		Owns(&corev1.Service{}).
 		Watches(
 			&garagev1beta2.GarageCluster{},
 			handler.EnqueueRequestsFromMapFunc(r.nodesForCluster),
-			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			builder.WithPredicates(clusterTemplatePredicate),
 		).
 		Watches(
 			&corev1.ConfigMap{},
-			handler.EnqueueRequestsFromMapFunc(r.nodesForClusterConfigMap),
+			handler.EnqueueRequestsFromMapFunc(r.nodesForClusterConfigResource),
 		).
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.nodesForClusterConfigResource),
+		).
+		Watches(
+			&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(r.nodeForManagedPod),
+		)
+	if r.ClusterScoped {
+		bldr = bldr.Watches(
+			&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(r.nodesForKubernetesNode),
+			builder.WithPredicates(predicate.LabelChangedPredicate{}),
+		)
+	}
+	return bldr.
 		Named("garagenode").
 		Complete(r)
+}
+
+// nodesForKubernetesNode fans a topology-label event out only to operator
+// managed Pods that are currently scheduled on that exact Kubernetes Node.
+// nodeForManagedPod preserves the StatefulSet/DaemonSet ownership boundary and
+// derives the durable GarageNode key for both workload shapes.
+func (r *GarageNodeReconciler) nodesForKubernetesNode(ctx context.Context, obj client.Object) []reconcile.Request {
+	kubernetesNode, ok := obj.(*corev1.Node)
+	if !ok || kubernetesNode.Name == "" {
+		return nil
+	}
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.MatchingLabels{labelAppManagedBy: operatorName}); err != nil {
+		return nil
+	}
+	seen := make(map[types.NamespacedName]struct{})
+	out := make([]reconcile.Request, 0)
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Spec.NodeName != kubernetesNode.Name {
+			continue
+		}
+		for _, request := range r.nodeForManagedPod(ctx, pod) {
+			if _, duplicate := seen[request.NamespacedName]; duplicate {
+				continue
+			}
+			seen[request.NamespacedName] = struct{}{}
+			out = append(out, request)
+		}
+	}
+	return out
+}
+
+// nodeForManagedPod maps both managed storage implementations back to their
+// durable GarageNode identity. The map is intentionally label- and
+// controller-owner-gated: a matching event only enqueues reconciliation, while
+// daemonSetPodForNode/statefulSetPodForNode still prove the exact live workload
+// UID before any status or layout change is accepted.
+func (r *GarageNodeReconciler) nodeForManagedPod(_ context.Context, obj client.Object) []reconcile.Request {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil
+	}
+	labels := pod.GetLabels()
+	if labels[labelAppManagedBy] != operatorName {
+		return nil
+	}
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil {
+		return nil
+	}
+
+	// PVC, SMB, and unified gateway Pods are indirectly owned by GarageNode
+	// through a same-name StatefulSet. labelGarageNode is stable across Pod
+	// replacement and avoids depending on the `<node>-0` naming convention.
+	if nodeName := labels[labelGarageNode]; nodeName != "" {
+		if owner.Kind != kindStatefulSet {
+			return nil
+		}
+		return []reconcile.Request{{NamespacedName: types.NamespacedName{
+			Name: nodeName, Namespace: pod.Namespace,
+		}}}
+	}
+
+	// A node-local-pool Pod is directly owned by a DaemonSet and has no
+	// labelGarageNode because one template represents many identities. Its
+	// deterministic GarageNode name is keyed by the cluster, pool, and the
+	// Kubernetes Node on which the Pod was scheduled.
+	clusterName := labels[labelCluster]
+	nodeLocalPoolName := labels[labelNodeLocalPool]
+	if owner.Kind != daemonSetKind ||
+		labels[labelTier] != tierStorage ||
+		labels[labelStorageGroup] != storageGroupNodeLocal ||
+		clusterName == "" || nodeLocalPoolName == "" || pod.Spec.NodeName == "" {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{
+		Name:      nodeLocalPoolGarageNodeName(clusterName, nodeLocalPoolName, pod.Spec.NodeName),
+		Namespace: pod.Namespace,
+	}}}
 }
 
 // nodesForCluster maps a GarageCluster event to reconcile requests for every
@@ -2354,24 +4042,39 @@ func (r *GarageNodeReconciler) nodesForCluster(ctx context.Context, obj client.O
 // labelled with {labelCluster: <cluster>, labelAppManagedBy: operator}. We
 // match on the labels first to avoid useless wake-ups, then verify the
 // name matches the cluster-shared convention so we don't fan out for the
-// `<cluster>-gateway-config` CM (which only the gateway Deployment consumes).
-func (r *GarageNodeReconciler) nodesForClusterConfigMap(ctx context.Context, obj client.Object) []reconcile.Request {
-	cm, ok := obj.(*corev1.ConfigMap)
-	if !ok {
+// `<cluster>-gateway-config` CM (which only the edge gateway StatefulSet consumes).
+func (r *GarageNodeReconciler) nodesForClusterConfigResource(ctx context.Context, obj client.Object) []reconcile.Request {
+	if _, configMap := obj.(*corev1.ConfigMap); !configMap {
+		if _, secret := obj.(*corev1.Secret); !secret {
+			return nil
+		}
+	}
+	if obj == nil {
 		return nil
 	}
-	labels := cm.GetLabels()
+	labels := obj.GetLabels()
 	clusterName := labels[labelCluster]
 	if clusterName == "" || labels[labelAppManagedBy] != operatorName {
 		return nil
 	}
-	// Per-node override CMs are already covered by Owns(ConfigMap); skip
-	// the gateway-only CM since no GarageNode consumes it.
-	if cm.Name != clusterName+"-config" {
+	// Per-node revisions are already covered by Owns for both kinds. Fan out
+	// only the exact shared base revision (plus its legacy fixed-name form); the
+	// historical gateway-only resource has no GarageNode consumer.
+	sharedBaseName := clusterName + "-config"
+	baseName := obj.GetAnnotations()[annotationGarageConfigBaseName]
+	if baseName == "" && obj.GetName() == sharedBaseName {
+		baseName = sharedBaseName
+	}
+	if baseName != sharedBaseName {
+		return nil
+	}
+	cluster := &garagev1beta2.GarageCluster{}
+	if err := r.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: obj.GetNamespace()}, cluster); err != nil ||
+		!metav1.IsControlledBy(obj, cluster) {
 		return nil
 	}
 	nodes := &garagev1beta1.GarageNodeList{}
-	if err := r.List(ctx, nodes, client.InNamespace(cm.Namespace)); err != nil {
+	if err := r.List(ctx, nodes, client.InNamespace(obj.GetNamespace())); err != nil {
 		return nil
 	}
 	var out []reconcile.Request
@@ -2380,7 +4083,7 @@ func (r *GarageNodeReconciler) nodesForClusterConfigMap(ctx context.Context, obj
 		if n.Spec.ClusterRef.Name != clusterName {
 			continue
 		}
-		if n.Spec.ClusterRef.Namespace != "" && n.Spec.ClusterRef.Namespace != cm.Namespace {
+		if n.Spec.ClusterRef.Namespace != "" && n.Spec.ClusterRef.Namespace != obj.GetNamespace() {
 			continue
 		}
 		out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Name: n.Name, Namespace: n.Namespace}})

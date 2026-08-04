@@ -4,10 +4,16 @@ A Kubernetes operator for managing [Garage](https://garagehq.deuxfleurs.fr/) - a
 
 ## Prerequisites
 
-- Kubernetes 1.25+
+- Kubernetes 1.25+. The experimental
+  [`spec.storage.nodeLocalPools`](../../docs/node-local-pools.md) feature
+  requires Kubernetes 1.27+ for Pod scheduling gates and fails closed on older
+  or incompatible servers; clusters that do not use it retain the 1.25 floor.
 - Helm 3.8+
 - Garage **v2.0.0 or newer** (the operator drives the `/v2` admin API exclusively; v2.3.0 is the tested default). See [Garage version compatibility](../../README.md#garage-version-compatibility).
-- cert-manager for admission and conversion webhook certificates, unless `webhooks.enabled=false`
+- cert-manager for admission and conversion webhook certificates, unless
+  `webhooks.enabled=false`. That disabled mode is limited to local development
+  or simple v1beta2-only installs; it is unsupported for `nodeLocalPools` and
+  removes the admission boundary for prepared storage deletion.
 - (Optional) Prometheus Operator for ServiceMonitor and PrometheusRule resources
 
 > `appVersion` tracks the **operator** version, not Garage. The Garage version
@@ -61,7 +67,8 @@ See [values.yaml](values.yaml) for the full list of configurable parameters.
 | `resources.limits.memory` | Memory limit | `256Mi` |
 | `resources.requests.cpu` | CPU request | `10m` |
 | `resources.requests.memory` | Memory request | `128Mi` |
-| `leaderElection.enabled` | Enable leader election for HA deployments | `true` |
+| `leaderElection.enabled` | Require one active controller manager through leader election | `true` |
+| `leaderElection.unsafeAllowDisabled` | Explicitly acknowledge unsupported single-replica operation without leader election | `false` |
 | `logLevel` | Operator log level | `info` |
 | `clusterDomain` | Kubernetes cluster domain used for service FQDNs | `cluster.local` |
 
@@ -89,7 +96,7 @@ See [values.yaml](values.yaml) for the full list of configurable parameters.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `webhooks.enabled` | Enable admission and conversion webhooks | `true` |
+| `webhooks.enabled` | Enable admission and conversion webhooks; required for `nodeLocalPools` and admission-protected storage deletion | `true` |
 | `webhooks.failurePolicy` | Webhook failure policy | `Fail` |
 | `webhooks.certManager.enabled` | Use cert-manager for certificates | `true` |
 

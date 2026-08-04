@@ -11,13 +11,13 @@ You may obtain a copy of the License at
 package v1beta2
 
 // HasStorageTier returns true when the cluster declares a storage tier
-// (StatefulSet + PVCs are reconciled).
+// (an optional default group and/or node-local pools may be reconciled).
 func (g *GarageCluster) HasStorageTier() bool {
 	return g != nil && g.Spec.Storage != nil
 }
 
 // HasGatewayTier returns true when the cluster declares a gateway tier
-// (Deployment + EmptyDir is reconciled).
+// (persistent-identity StatefulSet workloads are reconciled by default).
 func (g *GarageCluster) HasGatewayTier() bool {
 	return g != nil && g.Spec.Gateway != nil
 }
@@ -36,6 +36,12 @@ func (g *GarageCluster) EffectiveStorageLayoutPolicy() string {
 	return g.Spec.LayoutPolicy
 }
 
+// HasNodeLocalPools returns true when the storage tier declares at least one
+// additive node-local pool.
+func (g *GarageCluster) HasNodeLocalPools() bool {
+	return g != nil && g.Spec.Storage != nil && len(g.Spec.Storage.NodeLocalPools) > 0
+}
+
 // IsManagementHandle returns true when this cluster is a pure connection handle
 // to an external Garage cluster: only spec.connectTo is set, with neither a
 // storage nor a gateway tier. The operator reconciles no workload for such a CR;
@@ -43,6 +49,23 @@ func (g *GarageCluster) EffectiveStorageLayoutPolicy() string {
 // resolved from spec.connectTo. See issue #269.
 func (g *GarageCluster) IsManagementHandle() bool {
 	return g != nil && g.Spec.Storage == nil && g.Spec.Gateway == nil && g.Spec.ConnectTo != nil
+}
+
+// EffectiveDeletionPolicy keeps deletion of pre-feature federated objects
+// fail-closed. Omission means Destroy for an independent store, but Drain when
+// remoteClusters declares that this CR is one site of a surviving layout.
+// Explicit Destroy remains the destructive acknowledgement.
+func (g *GarageCluster) EffectiveDeletionPolicy() DeletionPolicy {
+	if g == nil {
+		return DeletionPolicyDestroy
+	}
+	if g.Spec.DeletionPolicy != "" {
+		return g.Spec.DeletionPolicy
+	}
+	if len(g.Spec.RemoteClusters) > 0 {
+		return DeletionPolicyDrain
+	}
+	return DeletionPolicyDestroy
 }
 
 // IsEdgeGateway returns true when this cluster is a gateway-only cluster that

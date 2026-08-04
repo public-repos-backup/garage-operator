@@ -23,8 +23,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+const testAdminTokenID = "abc123"
 
 func TestZoneRedundancy_MarshalJSON(t *testing.T) {
 	tests := []struct {
@@ -519,6 +522,143 @@ func TestWorkerInfo_ThrottledState(t *testing.T) {
 	}
 }
 
+func TestListWorkersPreservesStructuredPerNodeResults(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/ListWorkers" || r.URL.Query().Get("node") != "*" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var request struct {
+			BusyOnly  bool `json:"busyOnly"`
+			ErrorOnly bool `json:"errorOnly"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.BusyOnly || request.ErrorOnly {
+			http.Error(w, "unexpected filters", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"success": {
+				"storage-a": [{"id":7,"name":"Block resync worker #1","state":"idle","errors":0,"consecutiveErrors":0,"queueLength":3,"persistentErrors":1,"freeform":[]}]
+			},
+			"error": {"historical-node":"not connected"}
+		}`)
+	}))
+	defer server.Close()
+
+	workers, err := NewClient(server.URL, "token").ListWorkers(context.Background(), "*", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(workers.Success["storage-a"]) != 1 || workers.Success["storage-a"][0].QueueLength == nil ||
+		*workers.Success["storage-a"][0].QueueLength != 3 || workers.Success["storage-a"][0].PersistentErrors == nil ||
+		*workers.Success["storage-a"][0].PersistentErrors != 1 {
+		t.Fatalf("unexpected block-resync worker response: %+v", workers.Success["storage-a"])
+	}
+	if workers.Error["historical-node"] != "not connected" {
+		t.Fatalf("per-node error map was lost: %+v", workers.Error)
+	}
+}
+
+func TestGetSelfNodeInfoRequiresExactConsistentMultiResponse(t *testing.T) {
+	nodeID := strings.Repeat("a", 64)
+	otherID := strings.Repeat("b", 64)
+	tests := []struct {
+		name    string
+		payload string
+		wantErr string
+	}{
+		{
+			name:    "exact self response",
+			payload: `{"success":{"` + nodeID + `":{"nodeId":"` + strings.ToUpper(nodeID) + `"}},"error":{}}`,
+		},
+		{
+			name:    "embedded dispatch error",
+			payload: `{"success":{"` + nodeID + `":{"nodeId":"` + nodeID + `"}},"error":{"` + nodeID + `":"unavailable"}}`,
+			wantErr: "dispatch failed",
+		},
+		{
+			name:    "missing success",
+			payload: `{"success":{},"error":{}}`,
+			wantErr: "exactly one",
+		},
+		{
+			name: "multiple successes",
+			payload: `{"success":{"` + nodeID + `":{"nodeId":"` + nodeID + `"},"` +
+				otherID + `":{"nodeId":"` + otherID + `"}},"error":{}}`,
+			wantErr: "exactly one",
+		},
+		{
+			name:    "map key and body disagree",
+			payload: `{"success":{"` + nodeID + `":{"nodeId":"` + otherID + `"}},"error":{}}`,
+			wantErr: "does not match",
+		},
+		{
+			name:    "malformed identity",
+			payload: `{"success":{"short":{"nodeId":"short"}},"error":{}}`,
+			wantErr: "64 hexadecimal",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/v2/GetNodeInfo" || r.URL.Query().Get("node") != "self" {
+					http.NotFound(w, r)
+					return
+				}
+				_, _ = io.WriteString(w, test.payload)
+			}))
+			defer server.Close()
+
+			info, err := NewClient(server.URL, "token").GetSelfNodeInfo(context.Background())
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error = %v, want substring %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info == nil || info.NodeID != nodeID {
+				t.Fatalf("self node info = %+v, want canonical ID %s", info, nodeID)
+			}
+		})
+	}
+}
+
+func TestLaunchRepairRequiresPerNodeSuccess(t *testing.T) {
+	t.Run("exact node success", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v2/LaunchRepairOperation" || r.URL.Query().Get("node") != "storage-a" {
+				http.NotFound(w, r)
+				return
+			}
+			var request LaunchRepairRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.RepairType != "blocks" {
+				http.Error(w, "unexpected request", http.StatusBadRequest)
+				return
+			}
+			_, _ = io.WriteString(w, `{"success":{"storage-a":null},"error":{}}`)
+		}))
+		defer server.Close()
+		if err := NewClient(server.URL, "token").LaunchRepair(context.Background(), "storage-a", "Blocks"); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("embedded node failure", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"success":{},"error":{"storage-a":"not connected"}}`)
+		}))
+		defer server.Close()
+		err := NewClient(server.URL, "token").LaunchRepair(context.Background(), "storage-a", "Blocks")
+		if err == nil || !strings.Contains(err.Error(), "not connected") {
+			t.Fatalf("embedded dispatch failure was accepted: %v", err)
+		}
+	})
+}
+
 func float32Ptr(v float32) *float32 {
 	return &v
 }
@@ -560,10 +700,9 @@ const (
 	pathApplyClusterLayout = "/v2/ApplyClusterLayout"
 )
 
-// TestApplyStagedLayoutChanges exercises the concurrent-writer-safe apply path.
-// Garage returns a generic 500 ("Invalid new layout version") on a version
-// race — NOT a 409 — so the helper must re-read the layout to decide whether a
-// sibling writer already committed our staged change.
+// TestApplyStagedLayoutChanges exercises the coordinated apply path. Garage
+// returns a generic 500 (not a 409) on a version race; that error must surface
+// because a newer version alone does not prove our requested role landed.
 func TestApplyStagedLayoutChanges(t *testing.T) {
 	t.Run("no staged changes does not apply", func(t *testing.T) {
 		applied := false
@@ -617,22 +756,14 @@ func TestApplyStagedLayoutChanges(t *testing.T) {
 		}
 	})
 
-	t.Run("version race resolved when sibling already applied", func(t *testing.T) {
-		// Apply is rejected with a generic 500; the subsequent GetClusterLayout
-		// shows the version already advanced past our target, so the helper
-		// treats it as success.
+	t.Run("version race surfaces for coordinated retry", func(t *testing.T) {
 		getCalls := 0
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case pathGetClusterLayout:
 				getCalls++
 				w.Header().Set("Content-Type", "application/json")
-				if getCalls == 1 {
-					_, _ = w.Write([]byte(`{"version":7,"roles":[],"stagedRoleChanges":[{"id":"n1","zone":"z","tags":[]}]}`))
-				} else {
-					// Sibling committed; version advanced and staging cleared.
-					_, _ = w.Write([]byte(`{"version":8,"roles":[{"id":"n1","zone":"z","tags":[]}],"stagedRoleChanges":[]}`))
-				}
+				_, _ = w.Write([]byte(`{"version":7,"roles":[],"stagedRoleChanges":[{"id":"n1","zone":"z","tags":[]}]}`))
 			case pathApplyClusterLayout:
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = w.Write([]byte(`{"code":"InternalError","message":"Invalid new layout version"}`))
@@ -643,8 +774,11 @@ func TestApplyStagedLayoutChanges(t *testing.T) {
 		defer srv.Close()
 
 		c := NewClient(srv.URL, "tok")
-		if err := c.ApplyStagedLayoutChanges(context.Background()); err != nil {
-			t.Fatalf("expected race to resolve to success, got: %v", err)
+		if err := c.ApplyStagedLayoutChanges(context.Background()); err == nil {
+			t.Fatal("expected version race to surface")
+		}
+		if getCalls != 1 {
+			t.Fatalf("GetClusterLayout calls = %d, want 1; do not infer success from a later version", getCalls)
 		}
 	})
 
@@ -692,7 +826,7 @@ func TestConnectNode_ReturnsErrorWhenGarageReportsFailure(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "test-token")
-	result, err := c.ConnectNode(context.Background(), "abc123", "192.168.0.53:3901")
+	result, err := c.ConnectNode(context.Background(), testAdminTokenID, "192.168.0.53:3901")
 
 	if err == nil {
 		t.Fatal("expected ConnectNode to return an error")
@@ -705,5 +839,147 @@ func TestConnectNode_ReturnsErrorWhenGarageReportsFailure(t *testing.T) {
 	}
 	if got := err.Error(); got != "ConnectClusterNodes failed: Error establishing RPC connection" {
 		t.Fatalf("unexpected error: %q", got)
+	}
+}
+
+func TestAdminTokenAPI(t *testing.T) {
+	const bearer = "bootstrap-token"
+	var calls []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+bearer {
+			t.Fatalf("Authorization = %q", got)
+		}
+		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v2/ListAdminTokens":
+			_, _ = w.Write([]byte(`[{"id":"abc123","created":"2026-07-31T12:00:00Z","name":"operator","expiration":null,"expired":false,"scope":["*"]},{"id":null,"created":null,"name":"admin_token (from daemon configuration)","expiration":null,"expired":false,"scope":["*"]}]`))
+		case "/v2/GetAdminTokenInfo":
+			if r.URL.Query().Get("id") != testAdminTokenID || r.URL.Query().Get("search") != "" {
+				t.Fatalf("unexpected info query: %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"id":"abc123","created":"2026-07-31T12:00:00Z","name":"operator","expiration":null,"expired":false,"scope":["*"]}`))
+		case "/v2/CreateAdminToken":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["name"] != "operator" || body["neverExpires"] != true {
+				t.Fatalf("unexpected create body: %#v", body)
+			}
+			if scope, ok := body["scope"].([]any); !ok || len(scope) != 1 || scope[0] != "*" {
+				t.Fatalf("unexpected create scope: %#v", body["scope"])
+			}
+			_, _ = w.Write([]byte(`{"secretToken":"abc123.secret","id":"abc123","created":"2026-07-31T12:00:00Z","name":"operator","expiration":null,"expired":false,"scope":["*"]}`))
+		case "/v2/UpdateAdminToken":
+			if r.URL.Query().Get("id") != testAdminTokenID {
+				t.Fatalf("unexpected update query: %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"id":"abc123","created":"2026-07-31T12:00:00Z","name":"renamed","expiration":null,"expired":false,"scope":["*"]}`))
+		case "/v2/DeleteAdminToken":
+			if r.Method != http.MethodPost || r.URL.Query().Get("id") != testAdminTokenID {
+				t.Fatalf("unexpected delete request: %s %s", r.Method, r.URL.RequestURI())
+			}
+			_, _ = w.Write([]byte(`null`))
+		case "/v2/GetCurrentAdminTokenInfo":
+			_, _ = w.Write([]byte(`{"id":"abc123","created":"2026-07-31T12:00:00Z","name":"operator","expiration":null,"expired":false,"scope":["*"]}`))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, bearer)
+	tokens, err := c.ListAdminTokens(context.Background())
+	if err != nil || len(tokens) != 2 || tokens[0].ID == nil || *tokens[0].ID != testAdminTokenID || tokens[1].ID != nil {
+		t.Fatalf("ListAdminTokens = %#v, %v", tokens, err)
+	}
+	if _, err := c.GetAdminTokenInfo(context.Background(), testAdminTokenID, ""); err != nil {
+		t.Fatal(err)
+	}
+	name := "operator"
+	scope := []string{"*"}
+	created, err := c.CreateAdminToken(context.Background(), AdminTokenUpdate{
+		Name: &name, NeverExpires: true, Scope: &scope,
+	})
+	if err != nil || created.SecretToken != "abc123.secret" || created.ID == nil || *created.ID != testAdminTokenID {
+		t.Fatalf("CreateAdminToken = %#v, %v", created, err)
+	}
+	rename := "renamed"
+	updated, err := c.UpdateAdminToken(context.Background(), testAdminTokenID, AdminTokenUpdate{Name: &rename})
+	if err != nil || updated.Name != rename {
+		t.Fatalf("UpdateAdminToken = %#v, %v", updated, err)
+	}
+	if err := c.DeleteAdminToken(context.Background(), testAdminTokenID); err != nil {
+		t.Fatal(err)
+	}
+	current, err := c.GetCurrentAdminTokenInfo(context.Background())
+	if err != nil || current.ID == nil || *current.ID != testAdminTokenID {
+		t.Fatalf("GetCurrentAdminTokenInfo = %#v, %v", current, err)
+	}
+	if len(calls) != 6 {
+		t.Fatalf("calls = %#v", calls)
+	}
+}
+
+func TestAdminTokenAPIRejectsInvalidInputsAndResponses(t *testing.T) {
+	c := NewClient("http://unused", "token")
+	if _, err := c.GetAdminTokenInfo(context.Background(), "", ""); err == nil {
+		t.Fatal("empty id/search accepted")
+	}
+	if _, err := c.GetAdminTokenInfo(context.Background(), "id", "search"); err == nil {
+		t.Fatal("both id and search accepted")
+	}
+	if err := c.DeleteAdminToken(context.Background(), ""); err == nil {
+		t.Fatal("empty delete id accepted")
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/CreateAdminToken":
+			_, _ = w.Write([]byte(`{"id":"abc","name":"missing secret","expired":false,"scope":["*"]}`))
+		case "/v2/ListAdminTokens":
+			_, _ = w.Write([]byte(`not-json`))
+		default:
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Invalid bearer token"}`))
+		}
+	}))
+	defer srv.Close()
+	c = NewClient(srv.URL, "token")
+	if _, err := c.CreateAdminToken(context.Background(), AdminTokenUpdate{}); err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("incomplete create response accepted: %v", err)
+	}
+	if _, err := c.ListAdminTokens(context.Background()); err == nil || !strings.Contains(err.Error(), "unmarshal") {
+		t.Fatalf("malformed list response accepted: %v", err)
+	}
+	if _, err := c.GetCurrentAdminTokenInfo(context.Background()); !IsForbidden(err) {
+		t.Fatalf("403 not recognized as forbidden: %v", err)
+	}
+}
+
+func TestClusterHealthAcceptsGarageV20AndV21StorageNodeFields(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{name: "Garage v2.0", body: `{"status":"healthy","storageNodes":3,"storageNodesOk":2}`, want: 2},
+		{name: "Garage v2.1+", body: `{"status":"healthy","storageNodes":3,"storageNodesUp":2}`, want: 2},
+		{name: "matching transition fields", body: `{"storageNodesOk":2,"storageNodesUp":2}`, want: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var health ClusterHealth
+			if err := json.Unmarshal([]byte(tc.body), &health); err != nil {
+				t.Fatal(err)
+			}
+			if health.StorageNodesUp != tc.want {
+				t.Fatalf("StorageNodesUp = %d, want %d", health.StorageNodesUp, tc.want)
+			}
+		})
+	}
+	var health ClusterHealth
+	if err := json.Unmarshal([]byte(`{"storageNodesOk":1,"storageNodesUp":2}`), &health); err == nil {
+		t.Fatal("conflicting compatibility fields were accepted")
 	}
 }

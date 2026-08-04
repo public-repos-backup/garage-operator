@@ -23,34 +23,34 @@ import (
 
 // GarageAdminTokenSpec defines the desired state of GarageAdminToken.
 //
-// GarageAdminToken provisions secrets for accessing the Garage Admin HTTP API.
+// GarageAdminToken provisions a static bootstrap Secret for the Garage Admin
+// HTTP API. The referenced GarageCluster must explicitly select this Secret in
+// spec.admin.adminTokenSecretRef. This resource does not create a row in
+// Garage's dynamic Admin-token table, and deletion does not revoke bytes that a
+// running Garage process already loaded at startup.
 // Admin tokens authenticate differently from S3 keys (GarageKey) — they use
 // Bearer token auth against the admin port (default 3903) instead of HMAC-SHA256.
 //
-// The operator writes the token as an admin_token_file in Garage's TOML config.
-// File-based tokens always have full admin access; there is no scope restriction.
-// To create scoped tokens, use Garage's Admin API (CreateAdminToken) directly —
-// this resource is for provisioning the full-access operator/tooling token.
+// Static configured tokens always have full admin access and no server-side
+// name, scope, or expiry metadata. Use Garage's Admin API directly for a
+// user-managed scoped/dynamic token.
 type GarageAdminTokenSpec struct {
 	// ClusterRef references the GarageCluster this token belongs to
 	// +required
 	ClusterRef ClusterReference `json:"clusterRef"`
 
-	// Name is a friendly name for this admin token
-	// If not set, metadata.name is used
+	// Name is retained for compatibility but rejected because static bootstrap
+	// material has no Garage-side friendly name.
 	// +optional
 	Name string `json:"name,omitempty"`
 
-	// ExpiresAt sets when this token should be rotated.
-	// The operator tracks this and sets the TokenExpired condition when the date passes,
-	// but does NOT automatically rotate or revoke the token — rotation requires manual action
-	// (update or delete the GarageAdminToken resource). Use NeverExpires to suppress expiry tracking.
-	// Mutually exclusive with NeverExpires.
+	// ExpiresAt is retained for compatibility but rejected because static
+	// configured tokens have no Garage-side expiry or revocation record.
 	// +optional
 	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
 
-	// NeverExpires sets the token to never expire.
-	// Mutually exclusive with ExpiresAt.
+	// NeverExpires is retained for compatibility. Static configured tokens are
+	// always non-expiring, so this field is deprecated and has no effect.
 	// +optional
 	NeverExpires bool `json:"neverExpires"`
 
@@ -92,16 +92,24 @@ type AdminTokenSecretTemplate struct {
 
 // GarageAdminTokenStatus defines the observed state of GarageAdminToken
 type GarageAdminTokenStatus struct {
-	// TokenID is the Garage-assigned token ID (first 8 chars)
+	// TokenID is a short display fingerprint of the generated static token. It is
+	// not a Garage-assigned dynamic token ID.
 	// +optional
 	TokenID string `json:"tokenId,omitempty"`
+
+	// TokenDigest is the full SHA-256 digest of the static bearer. The controller
+	// uses it to detect mutation of an existing generated Secret without exposing
+	// any bearer bytes.
+	// +optional
+	TokenDigest string `json:"tokenDigest,omitempty"`
 
 	// Phase represents the current phase
 	// +kubebuilder:validation:Enum=Pending;Creating;Ready;Deleting;Failed;Expired;Unknown
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
-	// ExpiresAt is when this token expires (if set)
+	// ExpiresAt is deprecated and always cleared because static configured
+	// tokens have no Garage-side expiry record.
 	// +optional
 	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
 
@@ -130,7 +138,7 @@ type GarageAdminTokenStatus struct {
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // GarageAdminToken is the Schema for the garageadmintokens API
-// It manages admin API tokens for Garage clusters
+// It manages static Admin API bootstrap material for Garage clusters.
 type GarageAdminToken struct {
 	metav1.TypeMeta `json:",inline"`
 

@@ -36,6 +36,7 @@ import (
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
+	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
 // conflictInjectingClient wraps a client.Client and injects a Conflict error
@@ -79,13 +80,31 @@ var _ = Describe("GarageCluster Auto-mode (#190)", func() {
 	)
 
 	var (
-		reconciler *GarageClusterReconciler
-		cluster    *garagev1beta2.GarageCluster
-		clusterNN  types.NamespacedName
+		reconciler       *GarageClusterReconciler
+		cluster          *garagev1beta2.GarageCluster
+		clusterNN        types.NamespacedName
+		layoutHistory    *garage.LayoutHistoryResponse
+		layoutHistoryErr error
 	)
 
 	BeforeEach(func() {
-		reconciler = &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		layoutHistoryErr = nil
+		layoutHistory = &garage.LayoutHistoryResponse{
+			CurrentVersion: 1,
+			Versions: []garage.LayoutVersion{{
+				Version:      1,
+				Status:       garage.LayoutVersionStatusCurrent,
+				StorageNodes: 3,
+			}},
+		}
+		reconciler = &GarageClusterReconciler{
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			layoutHistoryGetter: func(_ context.Context, _ *garagev1beta2.GarageCluster) (*garage.LayoutHistoryResponse, error) {
+				return layoutHistory, layoutHistoryErr
+			},
+		}
 	})
 
 	// teardown removes the cluster and any operator-owned GarageNodes / STSes
@@ -109,6 +128,33 @@ var _ = Describe("GarageCluster Auto-mode (#190)", func() {
 			_ = k8sClient.Delete(ctx, &n)
 		}
 		_ = k8sClient.Delete(ctx, &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: clusterNN.Name, Namespace: testNamespace}})
+	}
+
+	markAutoStorageNodesReady := func() {
+		for i, item := range listOperatorOwnedStorageNodes(clusterNN.Name).Items {
+			node := item.DeepCopy()
+			node.Status.NodeID = fmt.Sprintf("%064x", i+1)
+			node.Status.ObservedPodUID = "pod-uid-" + node.Name
+			node.Status.Connected = true
+			node.Status.InLayout = true
+			node.Status.ObservedGeneration = node.Generation
+			Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+		}
+	}
+
+	completePreparedNodeDrain := func(node *garagev1beta1.GarageNode) {
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(node), node)).To(Succeed())
+		Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+		proof, err := storageDrainRemovalIntent(
+			nil, storageDrainActorForNode(node),
+			[]string{node.Status.NodeID}, []string{node.Status.NodeID}, time.Now(),
+		)
+		Expect(err).NotTo(HaveOccurred())
+		proof.ManagedPodUIDs = map[string]string{node.Status.NodeID: node.Status.ObservedPodUID}
+		completedAt := metav1.Now()
+		proof.CompletedAt = &completedAt
+		cluster.Status.StorageDrain = v1beta2StorageDrainStatus(proof)
+		Expect(k8sClient.Status().Update(ctx, cluster)).To(Succeed())
 	}
 
 	AfterEach(func() {
@@ -164,9 +210,34 @@ var _ = Describe("GarageCluster Auto-mode (#190)", func() {
 			}
 		})
 
+		It("does not treat an in-flight DaemonSet activation as an empty-cluster bootstrap", func() {
+			reconciler.ClusterScoped = true
+			activationLabel := nodeLocalPoolActivationLabel(cluster, testTagLocal)
+			k8sNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+				Name: uniqueClusterName(cluster.Name + "-activated"),
+				Labels: map[string]string{
+					activationLabel: nodeLocalPoolActivationLabelValue,
+				},
+			}}
+			Expect(k8sClient.Create(ctx, k8sNode)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, k8sNode)
+			})
+
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			Expect(listOperatorOwnedStorageNodes(clusterNN.Name).Items).To(BeEmpty())
+			Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+			condition := meta.FindStatusCondition(cluster.Status.Conditions, garagev1beta1.ConditionStorageTopologyReady)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(garagev1beta1.ReasonStorageTopologyWaitingForLayoutSync))
+			Expect(condition.Message).To(ContainSubstring("activated node-local-pool identity"))
+		})
+
 		It("scales up by creating new GarageNodes", func() {
 			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
 			Expect(listOperatorOwnedStorageNodes(clusterNN.Name).Items).To(HaveLen(3))
+			markAutoStorageNodesReady()
 
 			Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
 			cluster.Spec.Storage.Replicas = 5
@@ -174,11 +245,76 @@ var _ = Describe("GarageCluster Auto-mode (#190)", func() {
 
 			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
 			gnList := listOperatorOwnedStorageNodes(clusterNN.Name)
+			Expect(gnList.Items).To(HaveLen(4), "only one post-bootstrap storage identity may be admitted per settled layout transition")
+			markAutoStorageNodesReady()
+
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			gnList = listOperatorOwnedStorageNodes(clusterNN.Name)
 			Expect(gnList.Items).To(HaveLen(5))
+		})
+
+		It("waits for a gateway-originated layout transition before scaling storage up", func() {
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			markAutoStorageNodesReady()
+
+			Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+			cluster.Spec.Storage.Replicas = 4
+			Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+
+			layoutHistory = &garage.LayoutHistoryResponse{
+				CurrentVersion: 4,
+				Versions: []garage.LayoutVersion{
+					{Version: 3, Status: garage.LayoutVersionStatusDraining, GatewayNodes: 1},
+					{Version: 4, Status: garage.LayoutVersionStatusCurrent},
+				},
+			}
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			Expect(listOperatorOwnedStorageNodes(clusterNN.Name).Items).To(HaveLen(3))
+			Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+			condition := meta.FindStatusCondition(cluster.Status.Conditions, garagev1beta1.ConditionStorageTopologyReady)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(garagev1beta1.ReasonStorageTopologyWaitingForLayoutSync))
+			Expect(condition.Message).To(ContainSubstring("version(s) 3"))
+
+			layoutHistory = &garage.LayoutHistoryResponse{
+				CurrentVersion: 4,
+				Versions: []garage.LayoutVersion{{
+					Version: 4,
+					Status:  garage.LayoutVersionStatusCurrent,
+				}},
+			}
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			Expect(listOperatorOwnedStorageNodes(clusterNN.Name).Items).To(HaveLen(4))
+		})
+
+		It("fails closed when the Admin API cannot prove layout convergence", func() {
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			markAutoStorageNodesReady()
+
+			Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+			cluster.Spec.Storage.Replicas = 4
+			Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+			layoutHistoryErr = fmt.Errorf("admin endpoint unavailable")
+
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			Expect(listOperatorOwnedStorageNodes(clusterNN.Name).Items).To(HaveLen(3),
+				"an unverifiable layout must not admit another identity")
+			Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+			condition := meta.FindStatusCondition(
+				cluster.Status.Conditions,
+				garagev1beta1.ConditionStorageTopologyReady,
+			)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(garagev1beta1.ReasonStorageTopologyWaitingForLayoutSync))
+			Expect(condition.Message).To(ContainSubstring("refusing to start"))
+			Expect(condition.Message).To(ContainSubstring("admin endpoint unavailable"))
 		})
 
 		It("scales down by deleting GarageNodes for ordinals >= replicas", func() {
 			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			markAutoStorageNodesReady()
 
 			Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
 			cluster.Spec.Storage.Replicas = 2
@@ -187,6 +323,15 @@ var _ = Describe("GarageCluster Auto-mode (#190)", func() {
 			cluster.Spec.Replication.Factor = 1
 			Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
 
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			candidate := &garagev1beta1.GarageNode{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: autoModeGarageNodeName(cluster.Name, 2), Namespace: cluster.Namespace,
+			}, candidate)).To(Succeed())
+			Expect(candidate.DeletionTimestamp.IsZero()).To(BeTrue())
+			Expect(candidate.Annotations).To(HaveKeyWithValue(garagev1beta1.AnnotationDrain, annotationTrue))
+
+			completePreparedNodeDrain(candidate)
 			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
 
 			Eventually(func() []string {
@@ -242,6 +387,86 @@ var _ = Describe("GarageCluster Auto-mode (#190)", func() {
 			Expect(c).NotTo(BeNil())
 			Expect(c.Status).To(Equal(metav1.ConditionTrue))
 			Expect(c.Reason).To(Equal(garagev1beta1.ReasonScaleDownWouldBreakQuorum))
+		})
+
+		It("waits for layout convergence and drains excess ordinals one at a time", func() {
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			markAutoStorageNodesReady()
+
+			for _, ordinal := range []int32{1, 2} {
+				node := &garagev1beta1.GarageNode{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{
+					Name:      autoModeGarageNodeName(cluster.Name, ordinal),
+					Namespace: cluster.Namespace,
+				}, node)).To(Succeed())
+				node.Finalizers = []string{garageNodeFinalizer}
+				Expect(k8sClient.Update(ctx, node)).To(Succeed())
+			}
+
+			Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+			cluster.Spec.Storage.Replicas = 1
+			cluster.Spec.Replication.Factor = 1
+			Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+
+			layoutHistory = &garage.LayoutHistoryResponse{
+				CurrentVersion: 2,
+				Versions: []garage.LayoutVersion{
+					{Version: 1, Status: garage.LayoutVersionStatusDraining},
+					{Version: 2, Status: garage.LayoutVersionStatusCurrent},
+				},
+			}
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			for _, ordinal := range []int32{1, 2} {
+				node := &garagev1beta1.GarageNode{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{
+					Name:      autoModeGarageNodeName(cluster.Name, ordinal),
+					Namespace: cluster.Namespace,
+				}, node)).To(Succeed())
+				Expect(node.DeletionTimestamp.IsZero()).To(BeTrue())
+			}
+			Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+			condition := meta.FindStatusCondition(cluster.Status.Conditions, garagev1beta1.ConditionStorageTopologyReady)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(garagev1beta1.ReasonStorageTopologyWaitingForLayoutSync))
+			Expect(condition.Message).To(ContainSubstring("version(s) 1"))
+
+			layoutHistory = &garage.LayoutHistoryResponse{
+				CurrentVersion: 2,
+				Versions: []garage.LayoutVersion{{
+					Version: 2,
+					Status:  garage.LayoutVersionStatusCurrent,
+				}},
+			}
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+
+			highest := &garagev1beta1.GarageNode{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      autoModeGarageNodeName(cluster.Name, 2),
+				Namespace: cluster.Namespace,
+			}, highest)).To(Succeed())
+			Expect(highest.DeletionTimestamp.IsZero()).To(BeTrue())
+			Expect(highest.Annotations).To(HaveKeyWithValue(garagev1beta1.AnnotationDrain, annotationTrue))
+			completePreparedNodeDrain(highest)
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(highest), highest)).To(Succeed())
+			Expect(highest.DeletionTimestamp.IsZero()).To(BeFalse())
+			next := &garagev1beta1.GarageNode{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      autoModeGarageNodeName(cluster.Name, 1),
+				Namespace: cluster.Namespace,
+			}, next)).To(Succeed())
+			Expect(next.DeletionTimestamp.IsZero()).To(BeTrue())
+
+			By("not starting the next drain while the first GarageNode finalizer is active")
+			Expect(reconciler.reconcileAutoModeStorageNodes(ctx, cluster)).To(Succeed())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(next), next)).To(Succeed())
+			Expect(next.DeletionTimestamp.IsZero()).To(BeTrue())
+			Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+			condition = meta.FindStatusCondition(cluster.Status.Conditions, garagev1beta1.ConditionStorageTopologyReady)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Reason).To(Equal(garagev1beta1.ReasonStorageTopologyDraining))
+			Expect(condition.Message).To(ContainSubstring(highest.Name))
 		})
 	})
 
@@ -571,7 +796,10 @@ var _ = Describe("GarageCluster Auto-mode (#190)", func() {
 					},
 				}
 				Expect(k8sClient.Create(ctx, gn)).To(Succeed())
+				gn.Status.NodeID = nodeName
 				gn.Status.Connected = true
+				gn.Status.InLayout = true
+				gn.Status.ObservedGeneration = gn.Generation
 				Expect(k8sClient.Status().Update(ctx, gn)).To(Succeed())
 			}
 
@@ -623,10 +851,11 @@ var _ = Describe("GarageCluster Auto-mode (#190)", func() {
 					},
 				}
 				Expect(k8sClient.Create(ctx, gn)).To(Succeed())
-				if i == 0 {
-					gn.Status.Connected = true
-					Expect(k8sClient.Status().Update(ctx, gn)).To(Succeed())
-				}
+				gn.Status.NodeID = nodeName
+				gn.Status.InLayout = true
+				gn.Status.ObservedGeneration = gn.Generation
+				gn.Status.Connected = i == 0
+				Expect(k8sClient.Status().Update(ctx, gn)).To(Succeed())
 			}
 
 			_, err := reconciler.updateStatusFromCluster(ctx, cluster)
@@ -737,7 +966,21 @@ var _ = Describe("buildAutoModeStorageNode PublicEndpoint propagation (bug #7)",
 	// pollution failure mode.
 
 	makeReconciler := func() *GarageClusterReconciler {
-		return &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		return &GarageClusterReconciler{
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			layoutHistoryGetter: func(_ context.Context, _ *garagev1beta2.GarageCluster) (*garage.LayoutHistoryResponse, error) {
+				return &garage.LayoutHistoryResponse{
+					CurrentVersion: 1,
+					Versions: []garage.LayoutVersion{{
+						Version:      1,
+						Status:       garage.LayoutVersionStatusCurrent,
+						StorageNodes: 2,
+					}},
+				}, nil
+			},
+		}
 	}
 	makeCluster := func(name string, ep *garagev1beta2.PublicEndpointConfig) *garagev1beta2.GarageCluster {
 		return &garagev1beta2.GarageCluster{
@@ -849,10 +1092,17 @@ var _ = Describe("buildAutoModeStorageNode PublicEndpoint propagation (bug #7)",
 		Expect(gnList.Items).To(HaveLen(2))
 		for _, n := range gnList.Items {
 			Expect(n.Spec.PublicEndpoint).To(BeNil())
+			node := n.DeepCopy()
+			node.Status.NodeID = "node-" + node.Name
+			node.Status.Connected = true
+			node.Status.InLayout = true
+			node.Status.ObservedGeneration = node.Generation
+			Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
 		}
 
-		// Add the PublicEndpoint and reconcile again — existing nodes
-		// should pick up the new PublicEndpoint via the drift path.
+		// Add the PublicEndpoint. Role-affecting drift is serialized just like
+		// scale-up: one node updates, reports the new generation committed, and
+		// only then may the next node update.
 		fresh := &garagev1beta2.GarageCluster{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: testNamespace}, fresh)).To(Succeed())
 		fresh.Spec.PublicEndpoint = &garagev1beta2.PublicEndpointConfig{
@@ -867,6 +1117,20 @@ var _ = Describe("buildAutoModeStorageNode PublicEndpoint propagation (bug #7)",
 
 		gnList = listOperatorOwnedStorageNodes(clusterName)
 		Expect(gnList.Items).To(HaveLen(2))
+		updated := 0
+		for _, item := range gnList.Items {
+			if item.Spec.PublicEndpoint == nil {
+				continue
+			}
+			updated++
+			node := item.DeepCopy()
+			node.Status.ObservedGeneration = node.Generation
+			Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+		}
+		Expect(updated).To(Equal(1), "only one node drift update may begin per settled layout transition")
+
+		Expect(r.reconcileAutoModeStorageNodes(ctx, fresh)).To(Succeed())
+		gnList = listOperatorOwnedStorageNodes(clusterName)
 		for _, n := range gnList.Items {
 			Expect(n.Spec.PublicEndpoint).NotTo(BeNil(), "drift detection must propagate PublicEndpoint to existing node %s", n.Name)
 			Expect(n.Spec.PublicEndpoint.Type).To(Equal(publicEndpointTypeLoadBalancer))
@@ -877,9 +1141,11 @@ var _ = Describe("buildAutoModeStorageNode PublicEndpoint propagation (bug #7)",
 })
 
 var _ = Describe("buildAutoModeStorageNode PVC metadata propagation (#289)", func() {
-	It("copies metadata and data labels and annotations to the generated GarageNode", func() {
+	It("copies metadata and data PVC metadata and selectors to the generated GarageNode", func() {
 		const backupPolicyAnnotation = "dr.example.com/policy"
 		size := resource.MustParse("10Gi")
+		metadataSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"disk.example.com/kind": metadataVolName}}
+		dataSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"disk.example.com/kind": dataVolName}}
 		cluster := &garagev1beta2.GarageCluster{
 			ObjectMeta: metav1.ObjectMeta{Name: "pvc-metadata", Namespace: testNamespace},
 			Spec: garagev1beta2.GarageClusterSpec{
@@ -887,12 +1153,14 @@ var _ = Describe("buildAutoModeStorageNode PVC metadata propagation (#289)", fun
 					Replicas: 1,
 					Metadata: &garagev1beta2.VolumeConfig{
 						Size:        &size,
-						Labels:      map[string]string{"volume": "metadata"},
+						Selector:    metadataSelector,
+						Labels:      map[string]string{"volume": metadataVolName},
 						Annotations: map[string]string{backupPolicyAnnotation: "hourly"},
 					},
 					Data: &garagev1beta2.VolumeConfig{
 						Size:        &size,
-						Labels:      map[string]string{"volume": "data"},
+						Selector:    dataSelector,
+						Labels:      map[string]string{"volume": dataVolName},
 						Annotations: map[string]string{backupPolicyAnnotation: "daily"},
 					},
 				},
@@ -901,10 +1169,62 @@ var _ = Describe("buildAutoModeStorageNode PVC metadata propagation (#289)", fun
 
 		node, err := (&GarageClusterReconciler{Scheme: k8sClient.Scheme()}).buildAutoModeStorageNode(cluster, 0, "", "", nil)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(node.Spec.Storage.Metadata.Labels).To(HaveKeyWithValue("volume", "metadata"))
+		Expect(node.Spec.Storage.Metadata.Labels).To(HaveKeyWithValue("volume", metadataVolName))
 		Expect(node.Spec.Storage.Metadata.Annotations).To(HaveKeyWithValue(backupPolicyAnnotation, "hourly"))
-		Expect(node.Spec.Storage.Data.Labels).To(HaveKeyWithValue("volume", "data"))
+		Expect(node.Spec.Storage.Metadata.Selector).To(Equal(metadataSelector))
+		Expect(node.Labels).To(HaveKeyWithValue(labelAutoNodeSlot, node.Name))
+		Expect(node.Spec.Storage.Data.Labels).To(HaveKeyWithValue("volume", dataVolName))
 		Expect(node.Spec.Storage.Data.Annotations).To(HaveKeyWithValue(backupPolicyAnnotation, "daily"))
+		Expect(node.Spec.Storage.Data.Selector).To(Equal(dataSelector))
+	})
+
+	It("uses per-path selectors with the top-level data selector as fallback", func() {
+		size := resource.MustParse("10Gi")
+		defaultSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"disk.example.com/tier": "bulk"}}
+		fastSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"disk.example.com/tier": testFastValue}}
+		cluster := &garagev1beta2.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-path-selectors", Namespace: testNamespace},
+			Spec: garagev1beta2.GarageClusterSpec{Storage: &garagev1beta2.StorageSpec{
+				Replicas: 1,
+				Metadata: &garagev1beta2.VolumeConfig{Size: &size},
+				Data: &garagev1beta2.VolumeConfig{
+					Selector: defaultSelector,
+					Paths: []garagev1beta2.DataPath{
+						{Path: testFastDataPath, Volume: &garagev1beta2.DataPathVolumeConfig{Size: &size, Selector: fastSelector}},
+						{Path: "/data/bulk", Volume: &garagev1beta2.DataPathVolumeConfig{Size: &size}},
+					},
+				},
+			}},
+		}
+
+		node, err := (&GarageClusterReconciler{Scheme: k8sClient.Scheme()}).buildAutoModeStorageNode(cluster, 0, "", "", nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(node.Spec.Storage.DataPaths).To(HaveLen(2))
+		Expect(node.Spec.Storage.DataPaths[0].Selector).To(Equal(fastSelector))
+		Expect(node.Spec.Storage.DataPaths[1].Selector).To(Equal(defaultSelector))
+	})
+
+	It("does not retrofit a restored parent selector onto an existing generated identity", func() {
+		size := resource.MustParse("10Gi")
+		current := &garagev1beta1.GarageNode{Spec: garagev1beta1.GarageNodeSpec{
+			Storage: &garagev1beta1.NodeStorageConfig{
+				Metadata: &garagev1beta1.NodeVolumeConfig{Size: &size},
+				Data:     &garagev1beta1.NodeVolumeConfig{Size: &size},
+			},
+		}}
+		desired := current.DeepCopy()
+		desired.Spec.Storage.Metadata.Selector = &metav1.LabelSelector{
+			MatchLabels: map[string]string{testDiskTypeLabel: metadataVolName},
+		}
+		desired.Spec.Storage.Data.Selector = &metav1.LabelSelector{
+			MatchLabels: map[string]string{testDiskTypeLabel: dataVolName},
+		}
+
+		Expect(autoModeStorageNodeNeedsUpdate(current, desired)).To(BeFalse(),
+			"selector-only drift must not reselect retained PVCs")
+		applyAutoModeStorageNodeUpdate(current, desired)
+		Expect(current.Spec.Storage.Metadata.Selector).To(BeNil())
+		Expect(current.Spec.Storage.Data.Selector).To(BeNil())
 	})
 })
 
@@ -1160,7 +1480,7 @@ var _ = Describe("buildAutoModeStorageNode zoneFrom propagation (#294)", func() 
 		return &garagev1beta2.GarageCluster{
 			ObjectMeta: metav1.ObjectMeta{Name: "zf-cluster", Namespace: testNamespace},
 			Spec: garagev1beta2.GarageClusterSpec{
-				Zone:     "site-a",
+				Zone:     testSiteA,
 				ZoneFrom: zoneFrom,
 				Storage: &garagev1beta2.StorageSpec{
 					Replicas: 2,
@@ -1181,7 +1501,7 @@ var _ = Describe("buildAutoModeStorageNode zoneFrom propagation (#294)", func() 
 			Expect(err).NotTo(HaveOccurred())
 			Expect(node.Spec.ZoneFrom).NotTo(BeNil(), "ordinal %d", ord)
 			Expect(node.Spec.ZoneFrom.NodeLabel).To(Equal(rackLabel))
-			Expect(node.Spec.Zone).To(Equal("site-a"),
+			Expect(node.Spec.Zone).To(Equal(testSiteA),
 				"spec.zone must remain set as the fallback for unscheduled pods and unlabelled nodes")
 		}
 	})
@@ -1201,12 +1521,12 @@ var _ = Describe("buildAutoModeStorageNode zoneFrom propagation (#294)", func() 
 		node, err := r.buildAutoModeGatewayNode(makeCluster(&garagev1beta2.ZoneSource{NodeLabel: rackLabel}), 0, "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(node.Spec.ZoneFrom).To(BeNil())
-		Expect(node.Spec.Zone).To(Equal("site-a"))
+		Expect(node.Spec.Zone).To(Equal(testSiteA))
 	})
 
 	It("detects zoneFrom drift so an edit to the cluster reaches existing nodes", func() {
 		withZoneFrom := func(label string) *garagev1beta1.GarageNode {
-			n := &garagev1beta1.GarageNode{Spec: garagev1beta1.GarageNodeSpec{Zone: "site-a"}}
+			n := &garagev1beta1.GarageNode{Spec: garagev1beta1.GarageNodeSpec{Zone: testSiteA}}
 			if label != "" {
 				n.Spec.ZoneFrom = &garagev1beta1.ZoneSource{NodeLabel: label}
 			}
@@ -1216,5 +1536,28 @@ var _ = Describe("buildAutoModeStorageNode zoneFrom propagation (#294)", func() 
 		Expect(autoModeStorageNodeNeedsUpdate(withZoneFrom(rackLabel), withZoneFrom(""))).To(BeTrue())
 		Expect(autoModeStorageNodeNeedsUpdate(withZoneFrom(rackLabel), withZoneFrom("other/label"))).To(BeTrue())
 		Expect(autoModeStorageNodeNeedsUpdate(withZoneFrom(rackLabel), withZoneFrom(rackLabel))).To(BeFalse())
+	})
+
+	It("applies storage RPC address drift instead of detecting it forever", func() {
+		current := &garagev1beta1.GarageNode{
+			Spec: garagev1beta1.GarageNodeSpec{
+				Network: &garagev1beta1.NodeNetworkConfig{RPCPublicAddr: "old.example:3901"},
+			},
+		}
+		desired := &garagev1beta1.GarageNode{
+			Spec: garagev1beta1.GarageNodeSpec{
+				Network: &garagev1beta1.NodeNetworkConfig{RPCPublicAddr: "new.example:3901"},
+			},
+		}
+
+		Expect(autoModeStorageNodeNeedsUpdate(current, desired)).To(BeTrue())
+		applyAutoModeStorageNodeUpdate(current, desired)
+		Expect(current.Spec.Network).NotTo(BeNil())
+		Expect(current.Spec.Network.RPCPublicAddr).To(Equal("new.example:3901"))
+		Expect(autoModeStorageNodeNeedsUpdate(current, desired)).To(BeFalse())
+
+		applyAutoModeStorageNodeUpdate(current, &garagev1beta1.GarageNode{})
+		Expect(current.Spec.Network).To(BeNil(),
+			"removing storage.rpcPublicAddr must clear the per-node override")
 	})
 })

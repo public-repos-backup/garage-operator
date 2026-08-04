@@ -43,12 +43,12 @@
               "additionalProperties": false
             },
             "bindAddress": {
-              "description": "BindAddress is a custom bind address for the Admin API.\nCan be a TCP address or Unix socket path (e.g., \"unix:///run/garage/admin.sock\").\nIf set, this overrides BindPort.",
+              "description": "BindAddress is a custom wildcard TCP bind address for the Admin API.\nManaged workloads accept \"0.0.0.0:3903\" or \"[::]:3903\". Unix sockets,\nempty hosts, loopback, and specific hosts are rejected\nbecause Services and direct Pod probes must reach every Garage process.\nIf set, its port overrides BindPort for all generated endpoints. The\neffective Admin API TCP port is immutable after GarageCluster creation.",
               "type": "string"
             },
             "bindPort": {
               "default": 3903,
-              "description": "BindPort is the port to bind for admin API",
+              "description": "BindPort is the port to bind for admin API. The effective Admin API TCP\nport is immutable after the GarageCluster is created.",
               "format": "int32",
               "maximum": 65535,
               "minimum": 1,
@@ -1243,6 +1243,14 @@
           },
           "type": "array"
         },
+        "deletionPolicy": {
+          "description": "DeletionPolicy is Destroy for whole-store teardown or Drain for federated\nsite retirement. When omitted, standalone clusters retain legacy Destroy\nbehavior. Federated deletion requires an explicit choice and fails closed as\nDrain if admission is bypassed.",
+          "enum": [
+            "Destroy",
+            "Drain"
+          ],
+          "type": "string"
+        },
         "discovery": {
           "description": "Discovery configures peer discovery mechanisms",
           "properties": {
@@ -1481,11 +1489,27 @@
           "additionalProperties": false
         },
         "layoutManagement": {
-          "description": "LayoutManagement controls automatic layout application behavior.\nBy default, staged layout changes are NOT applied automatically \u2014 the operator\nstages them and waits for manual approval (or the force-layout-apply annotation).\nSet autoApply: true to apply changes automatically once minNodesHealthy are connected.",
+          "description": "LayoutManagement controls automatic layout application behavior.\nWith autoApply disabled, gateway tombstones are reported but are neither\nstaged nor applied; remove those exact roles with the Garage CLI or enable\nautoApply. The force-layout-apply annotation is only a legacy/bootstrap\nbelow-replication-factor override and does not approve tombstones.",
           "properties": {
             "autoApply": {
               "description": "AutoApply automatically applies staged layout changes",
               "type": "boolean"
+            },
+            "drain": {
+              "description": "Drain is the layout-wide positive-capacity removal policy. It mirrors the\nv1beta2 hub so conversion preserves external/federated assertions even on\nconnection-only management handles.",
+              "properties": {
+                "unverifiedPeersPolicy": {
+                  "default": "Block",
+                  "description": "UnverifiedPeersPolicy defaults to Block. AssumeConsistent is required for\nfederated or externally managed processes and is a deliberate maintenance\nassertion, not an online safety guarantee.",
+                  "enum": [
+                    "Block",
+                    "AssumeConsistent"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object",
+              "additionalProperties": false
             },
             "minNodesHealthy": {
               "description": "MinNodesHealthy is the minimum healthy nodes required before applying layout changes",
@@ -1988,7 +2012,7 @@
         },
         "replicas": {
           "default": 3,
-          "description": "Replicas is the number of Garage nodes to deploy in this cluster.\nSet to 0 to keep the cluster declared but stop all pods.",
+          "description": "Replicas controls the legacy operator-managed storage or gateway group.\nSet it to 0 to disable that group. Ordinary Manual GarageNodes remain\nindependently declared, as do v1beta2 node-local pools preserved through\nthe conversion payload.",
           "format": "int32",
           "minimum": 0,
           "type": "integer"
@@ -2463,7 +2487,7 @@
                             "type": "object"
                           },
                           "selector": {
-                            "description": "Selector to select PVs.",
+                            "description": "Selector matches pre-provisioned PVs for newly created claims. Kubernetes\ndoes not dynamically provision a PV when this is set; StorageClassName must\nalso match the target PV.",
                             "properties": {
                               "matchExpressions": {
                                 "description": "matchExpressions is a list of label selector requirements. The requirements are ANDed.",
@@ -2536,7 +2560,7 @@
                             "type": "string"
                           },
                           "volumeClaimTemplateSpec": {
-                            "description": "VolumeClaimTemplateSpec allows full customization of the PVC.",
+                            "description": "VolumeClaimTemplateSpec is retained for API compatibility but is not\nsupported by operator-managed workloads. Admission rejects new or changed\nvalues; an unchanged legacy value is tolerated only so it can be removed.\nUse the explicit PVC fields above, or pre-provision a PVC and reference it\nfrom an ordinary GarageNode storage existingClaim.\nDeprecated: use explicit PVC fields or GarageNode existingClaim.",
                             "properties": {
                               "accessModes": {
                                 "description": "accessModes contains the desired access modes the volume should have.\nMore info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1",
@@ -2717,7 +2741,7 @@
                   "type": "array"
                 },
                 "selector": {
-                  "description": "Selector to select PVs. Only valid when Type=PersistentVolumeClaim.",
+                  "description": "Selector matches pre-provisioned PVs for newly created claims. Kubernetes\ndoes not dynamically provision a PV when this is set. Only valid when\nType=PersistentVolumeClaim; StorageClassName must also match the target PV.",
                   "properties": {
                     "matchExpressions": {
                       "description": "matchExpressions is a list of label selector requirements. The requirements are ANDed.",
@@ -2790,7 +2814,7 @@
                   "type": "string"
                 },
                 "volumeClaimTemplateSpec": {
-                  "description": "VolumeClaimTemplateSpec allows full customization of the PVC.\nOnly valid when Type=PersistentVolumeClaim.",
+                  "description": "VolumeClaimTemplateSpec is retained for API compatibility but is not\nsupported by operator-managed workloads. Admission rejects new or changed\nvalues; an unchanged legacy value is tolerated only so it can be removed.\nArbitrary claim-template dataSource or volumeName settings can clone a\nmetadata node_key or bind multiple Garage identities to one disk. Use the\nexplicit PVC fields above, or pre-provision a PVC and reference it from an\nordinary GarageNode storage existingClaim.\nDeprecated: use explicit PVC fields or GarageNode existingClaim.",
                   "properties": {
                     "accessModes": {
                       "description": "accessModes contains the desired access modes the volume should have.\nMore info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1",
@@ -2966,7 +2990,7 @@
               "type": "boolean"
             },
             "env": {
-              "description": "Env is a list of environment variables to set on the Garage container\nin the storage tier. These are appended AFTER the operator's built-in vars.",
+              "description": "Env is a list of environment variables to set on the Garage container in\nthe storage tier. Garage config-path and RPC/Admin/metrics credential\nvariables are operator-reserved because drain safety and mesh identity rely\non the rendered config and pinned immutable Secrets.",
               "items": {
                 "description": "EnvVar represents an environment variable present in a Container.",
                 "properties": {
@@ -3124,7 +3148,7 @@
               "type": "array"
             },
             "envFrom": {
-              "description": "EnvFrom is a list of sources to populate environment variables in the\nGarage container for the storage tier.",
+              "description": "EnvFrom is a list of sources to populate environment variables in the\nGarage container for the storage tier. A source prefix must not be capable\nof injecting an operator-reserved Garage variable.",
               "items": {
                 "description": "EnvFromSource represents the source of a set of ConfigMaps or Secrets",
                 "properties": {
@@ -3251,7 +3275,7 @@
                             "type": "object"
                           },
                           "selector": {
-                            "description": "Selector to select PVs.",
+                            "description": "Selector matches pre-provisioned PVs for newly created claims. Kubernetes\ndoes not dynamically provision a PV when this is set; StorageClassName must\nalso match the target PV.",
                             "properties": {
                               "matchExpressions": {
                                 "description": "matchExpressions is a list of label selector requirements. The requirements are ANDed.",
@@ -3324,7 +3348,7 @@
                             "type": "string"
                           },
                           "volumeClaimTemplateSpec": {
-                            "description": "VolumeClaimTemplateSpec allows full customization of the PVC.",
+                            "description": "VolumeClaimTemplateSpec is retained for API compatibility but is not\nsupported by operator-managed workloads. Admission rejects new or changed\nvalues; an unchanged legacy value is tolerated only so it can be removed.\nUse the explicit PVC fields above, or pre-provision a PVC and reference it\nfrom an ordinary GarageNode storage existingClaim.\nDeprecated: use explicit PVC fields or GarageNode existingClaim.",
                             "properties": {
                               "accessModes": {
                                 "description": "accessModes contains the desired access modes the volume should have.\nMore info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1",
@@ -3505,7 +3529,7 @@
                   "type": "array"
                 },
                 "selector": {
-                  "description": "Selector to select PVs. Only valid when Type=PersistentVolumeClaim.",
+                  "description": "Selector matches pre-provisioned PVs for newly created claims. Kubernetes\ndoes not dynamically provision a PV when this is set. Only valid when\nType=PersistentVolumeClaim; StorageClassName must also match the target PV.",
                   "properties": {
                     "matchExpressions": {
                       "description": "matchExpressions is a list of label selector requirements. The requirements are ANDed.",
@@ -3578,7 +3602,7 @@
                   "type": "string"
                 },
                 "volumeClaimTemplateSpec": {
-                  "description": "VolumeClaimTemplateSpec allows full customization of the PVC.\nOnly valid when Type=PersistentVolumeClaim.",
+                  "description": "VolumeClaimTemplateSpec is retained for API compatibility but is not\nsupported by operator-managed workloads. Admission rejects new or changed\nvalues; an unchanged legacy value is tolerated only so it can be removed.\nArbitrary claim-template dataSource or volumeName settings can clone a\nmetadata node_key or bind multiple Garage identities to one disk. Use the\nexplicit PVC fields above, or pre-provision a PVC and reference it from an\nordinary GarageNode storage existingClaim.\nDeprecated: use explicit PVC fields or GarageNode existingClaim.",
                   "properties": {
                     "accessModes": {
                       "description": "accessModes contains the desired access modes the volume should have.\nMore info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1",
@@ -3982,7 +4006,7 @@
           "additionalProperties": false
         },
         "zone": {
-          "description": "Zone is the Garage layout zone assigned to all nodes in this cluster.\nGarage distributes object replicas across zones for fault tolerance \u2014 data\nsurvives the loss of an entire zone as long as enough zones remain for quorum.\n\nEach cluster in a federation must have a unique zone name.\nSingle-cluster deployments may omit this (Garage uses a default zone).\n\nExamples: \"us-east-1\", \"rack-a\", \"dc1\", \"zone-a\"",
+          "description": "Zone is the static Garage layout zone used by members of this cluster and\nthe fallback for storage members whose ZoneFrom label cannot be resolved.\nGarage distributes object replicas across actual layout zones for fault\ntolerance. When ZoneFrom is configured, one workload-owning cluster may\ncontain roles in multiple zones.\n\nSingle-zone deployments may omit this (Garage uses a default zone).\n\nExamples: \"us-east-1\", \"rack-a\", \"dc1\", \"zone-a\"",
           "type": "string"
         },
         "zoneFrom": {
@@ -4226,6 +4250,53 @@
           "type": "object",
           "additionalProperties": false
         },
+        "factorMigration": {
+          "description": "FactorMigration is mirrored from the storage version so v1beta1 status\nconversion and delete admission cannot erase or overlook an in-flight\nreplication-factor migration.",
+          "properties": {
+            "completedAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "force": {
+              "type": "boolean"
+            },
+            "fromFactor": {
+              "type": "integer"
+            },
+            "message": {
+              "type": "string"
+            },
+            "phase": {
+              "enum": [
+                "Validating",
+                "ScalingDown",
+                "Purging",
+                "Verifying",
+                "RebuildingLayout",
+                "Converging",
+                "Completed",
+                "Failed"
+              ],
+              "type": "string"
+            },
+            "phaseStartedAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "purgeId": {
+              "type": "string"
+            },
+            "startedAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "toFactor": {
+              "type": "integer"
+            }
+          },
+          "type": "object",
+          "additionalProperties": false
+        },
         "health": {
           "description": "Health contains cluster health information",
           "properties": {
@@ -4311,7 +4382,7 @@
               "type": "integer"
             },
             "versions": {
-              "description": "Versions contains the history of layout versions",
+              "description": "Versions contains at most 64 current, draining, and recent historical\nlayout versions for diagnosis. Controller safety decisions read Garage's\ncomplete live layout history instead of relying on this bounded projection.",
               "items": {
                 "description": "LayoutVersionInfo contains information about a layout version",
                 "properties": {
@@ -4336,6 +4407,7 @@
                 "type": "object",
                 "additionalProperties": false
               },
+              "maxItems": 64,
               "type": "array"
             }
           },
@@ -4574,6 +4646,15 @@
           "format": "int64",
           "type": "integer"
         },
+        "scaleReplicas": {
+          "description": "ScaleReplicas is the actual number of non-terminating Pods selected by\nScaleSelector. For a storage view this includes only the default\nStatefulSet/PVC group and excludes node-local pools and gateways. For a\nv1beta1 edge-gateway view it includes the gateway Pods.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "scaleSelector": {
+          "description": "ScaleSelector is the serialized exact Pod selector paired with\nScaleReplicas by the scale subresource. It is deliberately narrower than\nSelector so hidden v1beta2 node-local pools or unified gateways do not\ncontaminate v1beta1 scale status.",
+          "type": "string"
+        },
         "scrubStatus": {
           "description": "ScrubStatus contains the status of data scrub operations",
           "properties": {
@@ -4646,7 +4727,7 @@
           "additionalProperties": false
         },
         "selector": {
-          "description": "Selector is the serialized label selector for pods managed by this cluster.\nRequired for the scale subresource to work with HPA/VPA.",
+          "description": "Selector is the serialized label selector for pods managed by this cluster.\nThis is the aggregate cluster selector and is not used by the scale\nsubresource.",
           "type": "string"
         },
         "stagedLayoutVersion": {
@@ -4658,6 +4739,238 @@
           "description": "StagedRoles is the number of roles in the staged layout",
           "format": "int32",
           "type": "integer"
+        },
+        "storageDrain": {
+          "description": "StorageDrain records the single cluster-wide positive-capacity removal and\nblock-migration proof.",
+          "properties": {
+            "actor": {
+              "description": "StorageDrainActorStatus identifies the exact object authorized to advance a\ncluster-wide storage-drain transaction.",
+              "properties": {
+                "apiVersion": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "GarageCluster",
+                    "GarageNode"
+                  ],
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "namespace": {
+                  "type": "string"
+                },
+                "uid": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name",
+                "namespace",
+                "uid"
+              ],
+              "type": "object",
+              "additionalProperties": false
+            },
+            "completedAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "errorCount": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "layoutVersion": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "managedPodUids": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "queueLength": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "quietSince": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "removedStorageNodeIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "repairBaselines": {
+              "additionalProperties": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "repairWorkerIds": {
+              "additionalProperties": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "requiresEmptyQueue": {
+              "type": "boolean"
+            },
+            "resyncErrorBaselines": {
+              "additionalProperties": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "roleRemovalNodeIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "startedAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "targetHash": {
+              "type": "string"
+            },
+            "transactionId": {
+              "type": "string"
+            },
+            "unavailableSourceNodeIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "verificationNodeIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "actor",
+            "errorCount",
+            "layoutVersion",
+            "queueLength",
+            "removedStorageNodeIds",
+            "requiresEmptyQueue",
+            "roleRemovalNodeIds",
+            "startedAt",
+            "targetHash",
+            "transactionId"
+          ],
+          "type": "object",
+          "additionalProperties": false
+        },
+        "storageRollout": {
+          "description": "StorageRollout is controller-owned durable state for the single managed\npod handoff currently in progress.",
+          "properties": {
+            "clusterGeneration": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "desiredConfigHash": {
+              "type": "string"
+            },
+            "desiredPodSpecHash": {
+              "type": "string"
+            },
+            "garageNodeGeneration": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "garageNodeId": {
+              "type": "string"
+            },
+            "garageNodeName": {
+              "type": "string"
+            },
+            "garageNodeUid": {
+              "type": "string"
+            },
+            "kubernetesNodeName": {
+              "type": "string"
+            },
+            "kubernetesNodeUid": {
+              "type": "string"
+            },
+            "nodeLocalPoolName": {
+              "type": "string"
+            },
+            "persistentVolumeClaims": {
+              "items": {
+                "description": "StorageRolloutPersistentVolumeClaimStatus mirrors the hub's exact\nStatefulSet storage-identity boundary during conversion.",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "uid": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "uid"
+                ],
+                "type": "object",
+                "additionalProperties": false
+              },
+              "type": "array"
+            },
+            "previousPodUid": {
+              "type": "string"
+            },
+            "recoveryPodName": {
+              "type": "string"
+            },
+            "recoveryPodUid": {
+              "type": "string"
+            },
+            "recoveryRequest": {
+              "type": "string"
+            },
+            "retiredWorkloadUids": {
+              "description": "Recovery fails closed before a 33rd retired controller incarnation so the\nexact old-Pod exclusion set remains bounded in the conversion transport.",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 32,
+              "type": "array"
+            },
+            "statefulSetWorkloadRecreationSafe": {
+              "type": "boolean"
+            },
+            "workloadFenced": {
+              "type": "boolean"
+            },
+            "workloadUid": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "desiredConfigHash",
+            "desiredPodSpecHash",
+            "garageNodeId",
+            "garageNodeUid",
+            "previousPodUid",
+            "workloadUid"
+          ],
+          "type": "object",
+          "additionalProperties": false
         },
         "storageStats": {
           "description": "StorageStats contains cluster-wide storage statistics",

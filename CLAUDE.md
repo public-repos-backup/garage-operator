@@ -420,7 +420,7 @@ Implementation: `migrateLegacyStorageSTSIfNeeded` in
 
 | Category | Options |
 |----------|---------|
-| **Tiers** | `spec.storage` (StatefulSet + PVCs) and/or `spec.gateway` (Deployment + EmptyDir) |
+| **Tiers** | `spec.storage` (optional default PVC group plus node-local pools) and/or `spec.gateway` (persistent-identity gateway workloads by default) |
 | **Replication** | `spec.replication.factor` (1-7), `consistencyMode` (consistent/degraded/dangerous) |
 | **Storage tier** | `spec.storage.{replicas,metadata,data,resources,nodeSelector,tolerations,…}` |
 | **Gateway tier** | `spec.gateway.{replicas,resources,nodeSelector,rpcPublicAddr,…}` |
@@ -582,10 +582,11 @@ On failure, `succeeded: false` and `error` contains the message. The annotation 
 | `FederationConfigured` | False when `spec.remoteClusters` is set but no `rpc_public_addr`/`publicEndpoint` (HelloMessage advertises the unroutable pod IP) | set `spec.network.rpcPublicAddr` or a `publicEndpoint` (also a webhook admission warning) |
 | `PeerUnreachable` | True when a peer has been continuously down (`is_up:false`) beyond ~10m — surfaced in `status.unreachablePeers`. Detection is duration-based via `lastSeenSecsAgo` (the admin API can't read Garage's internal `Abandoned` state). | the operator's periodic `ConnectClusterNodes` nudge is the recovery path (esp. for single-link edge gateways) |
 
-Validation notes: a roleless gateway is **not** a deterministic 403 — S3 auth
-falls back to a quorum `get()` that succeeds in a healthy cluster; the
-`capacity: nil` gateway role is a resilience/latency optimization (local-first
-auth, decoupled from storage availability). `degraded` mode lowers only READ
+Validation notes: on the tested Garage v2.3.0, a roleless gateway has no locally
+replicated key record and S3 authentication returns `403 Forbidden: No such
+key`; that sig-auth path does not fall back to a quorum read. The `capacity:
+nil` gateway role is therefore required for local authentication data, not only
+a latency optimization. `degraded` mode lowers only READ
 quorum; it does **not** unblock stuck metadata (GarageKey/bucket) writes — those
 need a reachable majority of roled nodes (`floor(N/2)+1`), and stale gateway
 entries inflate N only in `consistent` mode (so tombstone cleanup matters for
@@ -815,4 +816,3 @@ to perform a non-disruptive node swap:
 Use case: replace a node whose underlying disk is failing without taking the
 cluster below quorum or losing the layout slot. A TODO marker is placed in
 `internal/controller/garagenode_controller.go` near the top of `Reconcile`.
-

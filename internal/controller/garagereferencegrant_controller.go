@@ -138,7 +138,7 @@ func (r *GarageReferenceGrantReconciler) findUsers(ctx context.Context, grant *g
 	}
 	for _, tok := range tokens.Items {
 		if crossNSRefsGrant(&tok.Spec.ClusterRef, tok.Namespace, grant) {
-			users = append(users, garagev1beta1.ReferenceGrantUser{Kind: "GarageAdminToken", Name: tok.Name, Namespace: tok.Namespace})
+			users = append(users, garagev1beta1.ReferenceGrantUser{Kind: kindGarageAdminToken, Name: tok.Name, Namespace: tok.Namespace})
 		}
 	}
 

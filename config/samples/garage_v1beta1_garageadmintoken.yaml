@@ -1,34 +1,18 @@
 ---
-# Admin token with no expiration
-# Note: The operator uses file-based admin tokens which always have full access.
-# For scoped/restricted tokens, use Garage's Admin API directly (CreateAdminToken).
+# Static Admin bootstrap material. The GarageCluster named below must explicitly
+# set spec.admin.adminTokenSecretRef.name: garage-admin-bootstrap and must be in
+# this namespace. The CR does not create a dynamic Garage token row; deleting it
+# does not revoke a token already loaded by a running Garage process.
 apiVersion: garage.rajsingh.info/v1beta1
 kind: GarageAdminToken
 metadata:
-  name: admin-full
+  name: admin-bootstrap
   namespace: garage-operator-system
 spec:
   clusterRef:
     name: garage
-  name: Full Admin Token
   neverExpires: true
   secretTemplate:
-    name: garage-admin-full
+    name: garage-admin-bootstrap
     tokenKey: admin-token
     includeEndpoint: true
----
-# Admin token with expiration date
-apiVersion: garage.rajsingh.info/v1beta1
-kind: GarageAdminToken
-metadata:
-  name: admin-expiring
-  namespace: garage-operator-system
-spec:
-  clusterRef:
-    name: garage
-  name: Expiring Admin Token
-  expiresAt: "2027-12-31T23:59:59Z"
-  secretTemplate:
-    name: garage-admin-expiring
-    tokenKey: admin-token
-    endpointKey: admin-endpoint

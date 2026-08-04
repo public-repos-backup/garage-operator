@@ -24,7 +24,7 @@ import (
 
 // These tests cover the tier-scoping behavior of the in-cluster API Services.
 // The historical <cr> Service selected on instance=<cr> alone, which matches
-// BOTH storage StatefulSet pods AND gateway Deployment pods. That round-robined
+// BOTH storage pods AND gateway pods. That round-robined
 // admin/S3 traffic through gateway pods even when the storage tier was
 // directly reachable. The fix scopes <cr> to the storage tier and adds a
 // sibling <cr>-gateway Service for the gateway tier.
@@ -292,12 +292,48 @@ var _ = Describe("apiServiceSelector storage-tier selector", func() {
 
 	It("keeps the unified tier selector for the gateway tier", func() {
 		cluster := &garagev1beta2.GarageCluster{
-			ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: apiSelectorNS},
+			ObjectMeta: metav1.ObjectMeta{Name: testEdgeValue, Namespace: apiSelectorNS},
 		}
 		Expect(r.apiServiceSelector(cluster, tierGateway)).To(Equal(map[string]string{
 			labelAppName:     defaultAppName,
-			labelAppInstance: "edge",
+			labelAppInstance: testEdgeValue,
 			labelTier:        tierGateway,
 		}))
+	})
+})
+
+var _ = Describe("managed Admin API endpoint", func() {
+	It("derives Services and container ports from admin.bindAddress", func() {
+		cluster := &garagev1beta2.GarageCluster{Spec: garagev1beta2.GarageClusterSpec{
+			Admin: &garagev1beta2.AdminConfig{BindPort: 3903, BindAddress: "[::]:4903"},
+		}}
+		Expect(getAdminPort(cluster)).To(Equal(int32(4903)))
+
+		servicePorts := apiServicePorts(cluster)
+		adminServicePort := int32(0)
+		for i := range servicePorts {
+			if servicePorts[i].Name == adminPortName {
+				adminServicePort = servicePorts[i].Port
+				Expect(servicePorts[i].TargetPort.IntVal).To(Equal(int32(4903)))
+			}
+		}
+		Expect(adminServicePort).To(Equal(int32(4903)))
+
+		containerPorts := buildContainerPorts(cluster)
+		adminContainerPort := int32(0)
+		for i := range containerPorts {
+			if containerPorts[i].Name == adminPortName {
+				adminContainerPort = containerPorts[i].ContainerPort
+			}
+		}
+		Expect(adminContainerPort).To(Equal(int32(4903)))
+	})
+
+	It("fails closed for an Admin API address that a managed Pod Service cannot reach", func() {
+		cluster := &garagev1beta2.GarageCluster{Spec: garagev1beta2.GarageClusterSpec{
+			Admin: &garagev1beta2.AdminConfig{BindAddress: "127.0.0.1:4903"},
+		}}
+		_, err := managedAdminPort(cluster)
+		Expect(err).To(MatchError(ContainSubstring("not reachable through every managed Pod")))
 	})
 })

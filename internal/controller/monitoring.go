@@ -7,6 +7,7 @@ import (
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -59,6 +60,17 @@ func (r *GarageClusterReconciler) reconcileMonitoring(ctx context.Context, clust
 	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, sm)
 
 	desired := r.buildServiceMonitor(cluster, name, namespace)
+	if token, ready, tokenErr := getReadyOperatorMetricsToken(ctx, r.Client, cluster); tokenErr != nil {
+		return tokenErr
+	} else if ready && token != "" && len(desired.Spec.Endpoints) > 0 {
+		desired.Spec.Endpoints[0].Authorization = &monitoringv1.SafeAuthorization{
+			Type: "Bearer",
+			Credentials: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: operatorMetricsTokenSecretName(cluster)},
+				Key:                  metricsTokenKey,
+			},
+		}
+	}
 	if errors.IsNotFound(err) {
 		log.Info("creating ServiceMonitor", "name", name)
 		return r.Create(ctx, desired)
@@ -66,10 +78,70 @@ func (r *GarageClusterReconciler) reconcileMonitoring(ctx context.Context, clust
 	if err != nil {
 		return fmt.Errorf("get ServiceMonitor: %w", err)
 	}
+	if desiredSnapshot := currentStaticCredentialsSecretName(cluster); desiredSnapshot != "" &&
+		len(desired.Spec.Endpoints) > 0 && desired.Spec.Endpoints[0].Authorization != nil &&
+		desired.Spec.Endpoints[0].Authorization.Credentials != nil &&
+		desired.Spec.Endpoints[0].Authorization.Credentials.Name == desiredSnapshot &&
+		len(sm.Spec.Endpoints) > 0 && sm.Spec.Endpoints[0].Authorization != nil &&
+		sm.Spec.Endpoints[0].Authorization.Credentials != nil &&
+		sm.Spec.Endpoints[0].Authorization.Credentials.Name != desiredSnapshot {
+		allCurrent, err := r.allMetricsTargetsUseStaticCredentialSnapshot(ctx, cluster, desiredSnapshot)
+		if err != nil {
+			return err
+		}
+		if !allCurrent {
+			// Garage reads metrics_api_token only at process start. Preserve the
+			// previous scrape bearer until every selectable Pod has moved to the
+			// new immutable startup revision.
+			desired.Spec.Endpoints[0].Authorization = sm.Spec.Endpoints[0].Authorization.DeepCopy()
+		}
+	}
 
+	if equality.Semantic.DeepEqual(sm.Labels, desired.Labels) && equality.Semantic.DeepEqual(sm.Spec, desired.Spec) {
+		return nil
+	}
 	sm.Labels = desired.Labels
 	sm.Spec = desired.Spec
 	return r.Update(ctx, sm)
+}
+
+func (r *GarageClusterReconciler) allMetricsTargetsUseStaticCredentialSnapshot(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	snapshotName string,
+) (bool, error) {
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels(map[string]string{labelCluster: cluster.Name}),
+	); err != nil {
+		return false, fmt.Errorf("listing metrics target Pods before credential handoff: %w", err)
+	}
+	found := false
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+		found = true
+		matched := false
+		for j := range pod.Spec.Containers {
+			if pod.Spec.Containers[j].Name != defaultAppName {
+				continue
+			}
+			for k := range pod.Spec.Containers[j].Env {
+				env := &pod.Spec.Containers[j].Env[k]
+				if env.Name == envGarageMetricsToken && env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil &&
+					env.ValueFrom.SecretKeyRef.Name == snapshotName {
+					matched = true
+				}
+			}
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return found, nil
 }
 
 func (r *GarageClusterReconciler) buildServiceMonitor(cluster *garagev1beta2.GarageCluster, name, namespace string) *monitoringv1.ServiceMonitor {
@@ -92,14 +164,18 @@ func (r *GarageClusterReconciler) buildServiceMonitor(cluster *garagev1beta2.Gar
 	}
 	if cluster.Spec.Admin != nil && cluster.Spec.Admin.MetricsTokenSecretRef != nil {
 		ref := cluster.Spec.Admin.MetricsTokenSecretRef
+		secretName := ref.Name
 		key := ref.Key
-		if key == "" {
+		if snapshot := currentStaticCredentialsSecretName(cluster); snapshot != "" {
+			secretName = snapshot
+			key = metricsTokenKey
+		} else if key == "" {
 			key = metricsTokenKey
 		}
 		endpoint.Authorization = &monitoringv1.SafeAuthorization{
 			Type: "Bearer",
 			Credentials: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: ref.Name},
+				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
 				Key:                  key,
 			},
 		}

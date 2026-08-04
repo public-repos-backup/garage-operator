@@ -33,7 +33,7 @@ import (
 // test namespace names used across the reference-grant table tests
 const (
 	nsApp     = "app"
-	nsStorage = "storage"
+	nsStorage = tierStorage
 	nsData    = "data"
 )
 

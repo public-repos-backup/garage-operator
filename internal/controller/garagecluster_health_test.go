@@ -17,17 +17,21 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
+
+const testHealthRemoteName = "remote-a"
 
 func condStatus(cluster *garagev1beta2.GarageCluster, condType string) (metav1.ConditionStatus, bool) {
 	c := meta.FindStatusCondition(cluster.Status.Conditions, condType)
@@ -104,12 +108,12 @@ func TestSetClusterHealthConditions_RemoteRecentBlipNotStale(t *testing.T) {
 	recent := metav1.NewTime(time.Now().Add(-2 * time.Minute))
 	cluster := &garagev1beta2.GarageCluster{
 		Spec: garagev1beta2.GarageClusterSpec{
-			RemoteClusters: []garagev1beta2.RemoteClusterConfig{{Name: "ottawa"}},
+			RemoteClusters: []garagev1beta2.RemoteClusterConfig{{Name: testOttawaName}},
 			Network:        garagev1beta2.NetworkConfig{RPCPublicAddr: "node:3901"},
 		},
 		Status: garagev1beta2.GarageClusterStatus{
 			RemoteClusters: []garagev1beta2.RemoteClusterStatus{
-				{Name: "ottawa", Connected: false, LastSeen: &recent},
+				{Name: testOttawaName, Connected: false, LastSeen: &recent},
 			},
 		},
 	}
@@ -122,10 +126,10 @@ func TestSetClusterHealthConditions_RemoteRecentBlipNotStale(t *testing.T) {
 func TestSetClusterHealthConditions_FederationMissingRPCAddr(t *testing.T) {
 	cluster := &garagev1beta2.GarageCluster{
 		Spec: garagev1beta2.GarageClusterSpec{
-			RemoteClusters: []garagev1beta2.RemoteClusterConfig{{Name: "remote-a"}},
+			RemoteClusters: []garagev1beta2.RemoteClusterConfig{{Name: testHealthRemoteName}},
 		},
 		Status: garagev1beta2.GarageClusterStatus{
-			RemoteClusters: []garagev1beta2.RemoteClusterStatus{{Name: "remote-a", Connected: true}},
+			RemoteClusters: []garagev1beta2.RemoteClusterStatus{{Name: testHealthRemoteName, Connected: true}},
 		},
 	}
 	setClusterHealthConditions(cluster)
@@ -136,6 +140,104 @@ func TestSetClusterHealthConditions_FederationMissingRPCAddr(t *testing.T) {
 	}
 	if cluster.Status.LayoutDiagnosis == "" {
 		t.Fatal("expected a diagnosis for missing rpc_public_addr under federation")
+	}
+}
+
+func TestSetClusterHealthConditions_NodeLocalPoolsRequirePerIdentityRoutes(t *testing.T) {
+	capacity := resource.MustParse("500Gi")
+	cluster := &garagev1beta2.GarageCluster{
+		Spec: garagev1beta2.GarageClusterSpec{
+			RemoteClusters: []garagev1beta2.RemoteClusterConfig{{Name: testHealthRemoteName}},
+			Network:        garagev1beta2.NetworkConfig{RPCPublicAddr: testSharedRPCPublicAddr},
+			Storage: &garagev1beta2.StorageSpec{NodeLocalPools: []garagev1beta2.NodeLocalPoolSpec{{
+				Name:     testTagLocal,
+				Capacity: &capacity,
+			}}},
+		},
+	}
+	setClusterHealthConditions(cluster)
+	if st, _ := condStatus(cluster, garagev1beta1.ConditionFederationConfigured); st != metav1.ConditionFalse {
+		t.Fatalf("shared RPC address must not mask an unaddressed node-local pool, got %v", st)
+	}
+
+	cluster.Spec.Storage.NodeLocalPools[0].Network = &garagev1beta2.NodeLocalPoolNetworkSpec{
+		RPCPublicAddrTemplate: testNodeAddressTemplate,
+	}
+	setClusterHealthConditions(cluster)
+	if st, _ := condStatus(cluster, garagev1beta1.ConditionFederationConfigured); st != metav1.ConditionTrue {
+		t.Fatalf("per-node-local pool address should satisfy federation routing, got %v", st)
+	}
+}
+
+func TestClusterRPCAddressGaps_MixedStorageGroups(t *testing.T) {
+	capacity := resource.MustParse("500Gi")
+	cluster := &garagev1beta2.GarageCluster{
+		Spec: garagev1beta2.GarageClusterSpec{
+			LayoutPolicy: LayoutPolicyAuto,
+			Storage: &garagev1beta2.StorageSpec{
+				Replicas:       1,
+				NodeLocalPools: []garagev1beta2.NodeLocalPoolSpec{{Name: testTagLocal, Capacity: &capacity}},
+			},
+			Gateway: &garagev1beta2.GatewaySpec{Replicas: 1},
+		},
+	}
+
+	gaps := strings.Join(clusterRPCAddressGaps(cluster), ",")
+	for _, want := range []string{"default StatefulSet/PVC group", "gateway tier", "node-local pool local"} {
+		if !strings.Contains(gaps, want) {
+			t.Fatalf("gaps %q do not include %q", gaps, want)
+		}
+	}
+
+	cluster.Spec.Storage.RPCPublicAddr = "storage-{ordinal}.example.net:3901"
+	cluster.Spec.Gateway.RPCPublicAddr = "gateway-{ordinal}.example.net:3901"
+	gaps = strings.Join(clusterRPCAddressGaps(cluster), ",")
+	if gaps != "node-local pool local" {
+		t.Fatalf("tier addresses must not mask an unaddressed node-local pool, got %q", gaps)
+	}
+
+	cluster.Spec.Storage.NodeLocalPools[0].Network = &garagev1beta2.NodeLocalPoolNetworkSpec{
+		RPCPublicAddrTemplate: testNodeAddressTemplate,
+	}
+	if gaps := clusterRPCAddressGaps(cluster); len(gaps) != 0 {
+		t.Fatalf("all identity groups are addressed, got gaps %v", gaps)
+	}
+
+	cluster.Spec.Storage.RPCPublicAddr = ""
+	cluster.Spec.Gateway.RPCPublicAddr = ""
+	cluster.Spec.Network.RPCPublicAddrSubnet = "100.64.0.0/10"
+	if gaps := clusterRPCAddressGaps(cluster); len(gaps) != 0 {
+		t.Fatalf("an explicit routable subnet should cover every identity, got gaps %v", gaps)
+	}
+}
+
+func TestClusterRPCAddressGaps_MixedManualSMBAndNodeLocalPool(t *testing.T) {
+	capacity := resource.MustParse("500Gi")
+	cluster := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: testOttawaName, Namespace: testGarageValue},
+		Spec: garagev1beta2.GarageClusterSpec{
+			LayoutPolicy: LayoutPolicyManual,
+			Storage: &garagev1beta2.StorageSpec{
+				Replicas: 0,
+				NodeLocalPools: []garagev1beta2.NodeLocalPoolSpec{{
+					Name: testTagLocal, Capacity: &capacity,
+					Network: &garagev1beta2.NodeLocalPoolNetworkSpec{RPCPublicAddrTemplate: testNodeAddressTemplate},
+				}},
+			},
+		},
+	}
+	smb := garagev1beta1.GarageNode{
+		ObjectMeta: metav1.ObjectMeta{Name: testSMBNodeName, Namespace: testGarageValue},
+		Spec: garagev1beta1.GarageNodeSpec{
+			ClusterRef: garagev1beta1.ClusterReference{Name: cluster.Name},
+		},
+	}
+	if gaps := clusterRPCAddressGaps(cluster, []garagev1beta1.GarageNode{smb}); len(gaps) != 1 || gaps[0] != "storage GarageNode smb-a" {
+		t.Fatalf("unaddressed Manual SMB identity was not diagnosed: %v", gaps)
+	}
+	smb.Spec.Network = &garagev1beta1.NodeNetworkConfig{RPCPublicAddr: "smb-a.example.net:3901"}
+	if gaps := clusterRPCAddressGaps(cluster, []garagev1beta1.GarageNode{smb}); len(gaps) != 0 {
+		t.Fatalf("addressed SMB and node-local-pool identities should be complete, got %v", gaps)
 	}
 }
 
@@ -269,5 +371,50 @@ func TestSetClusterHealthConditions_QuorumIsMostSevere(t *testing.T) {
 	// The diagnosis line should be the quorum problem (most severe), not the remote one.
 	if got := cluster.Status.LayoutDiagnosis; got == "" || !strings.Contains(got, "write quorum") {
 		t.Fatalf("expected the quorum problem to win the diagnosis line, got %q", got)
+	}
+}
+
+func TestSetClusterHealthConditions_BoundsRepeatedMemberInventories(t *testing.T) {
+	t.Parallel()
+	old := metav1.NewTime(time.Now().Add(-5 * time.Hour))
+	cluster := &garagev1beta2.GarageCluster{
+		Spec: garagev1beta2.GarageClusterSpec{
+			Network: garagev1beta2.NetworkConfig{RPCPublicAddr: "node.example.com:3901"},
+		},
+		Status: garagev1beta2.GarageClusterStatus{
+			Health: &garagev1beta2.ClusterHealth{Partitions: 256, PartitionsQuorum: 256},
+		},
+	}
+	for i := 0; i < 256; i++ {
+		name := fmt.Sprintf("member-%03d-%s", i, strings.Repeat("x", 48))
+		cluster.Spec.RemoteClusters = append(cluster.Spec.RemoteClusters,
+			garagev1beta2.RemoteClusterConfig{Name: name})
+		cluster.Status.RemoteClusters = append(cluster.Status.RemoteClusters,
+			garagev1beta2.RemoteClusterStatus{Name: name, LastSeen: &old})
+		cluster.Status.UnreachablePeers = append(cluster.Status.UnreachablePeers,
+			fmt.Sprintf("%016x (down 2562047h47m)", i))
+		cluster.Status.GatewayNodesNotInLayout = append(cluster.Status.GatewayNodesNotInLayout, name)
+	}
+
+	setClusterHealthConditions(cluster)
+	for _, conditionType := range []string{
+		garagev1beta1.ConditionRemoteClustersHealthy,
+		garagev1beta1.ConditionPeerUnreachable,
+		garagev1beta1.ConditionGatewayLayoutDegraded,
+	} {
+		condition := meta.FindStatusCondition(cluster.Status.Conditions, conditionType)
+		if condition == nil {
+			t.Fatalf("condition %s was not published", conditionType)
+		}
+		if len(condition.Message) > statusConditionMessageLimit {
+			t.Fatalf("condition %s duplicated an unbounded inventory (%d bytes)", conditionType, len(condition.Message))
+		}
+		if !strings.Contains(condition.Message, "256 total") || !strings.Contains(condition.Message, "251 more") {
+			t.Fatalf("condition %s does not expose a bounded count/examples summary: %q", conditionType, condition.Message)
+		}
+	}
+	if len(cluster.Status.LayoutDiagnosis) > statusConditionMessageLimit ||
+		!strings.Contains(cluster.Status.LayoutDiagnosis, "256 total") {
+		t.Fatalf("LayoutDiagnosis is not the bounded severe-condition summary: %q", cluster.Status.LayoutDiagnosis)
 	}
 }

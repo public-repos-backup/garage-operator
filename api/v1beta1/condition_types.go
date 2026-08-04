@@ -63,8 +63,9 @@ const (
 
 	// ConditionGatewayTombstones indicates stale gateway-tier layout entries
 	// were detected but could not be auto-removed (autoApply disabled). Surface to
-	// users so they know to clean up the layout, either by enabling autoApply or by
-	// setting the force-layout-apply annotation.
+	// users so they know to clean up the exact roles with the Garage CLI or enable
+	// autoApply. The legacy force-layout-apply bootstrap flag does not approve
+	// tombstones.
 	ConditionGatewayTombstones = "GatewayTombstones"
 
 	// ConditionLegacySTSMigrated indicates the one-time migration from the
@@ -109,10 +110,10 @@ const (
 	// gateway GarageNodes report status.inLayout == false. A gateway pod is
 	// supposed to hold a capacity:nil layout role so key_table/bucket_table are
 	// full-replicated locally and S3 sig-auth resolves keys via get_local()
-	// without a per-request quorum RPC to the storage tier (#209). When that role
-	// is missing the gateway silently degrades to quorum auth — slower and coupled
-	// to storage availability — with no other surfaced signal. The message names
-	// the affected GarageNode(s) so an operator can force a layout reconcile.
+	// without an RPC to the storage tier (#209). When that role is missing the
+	// local authentication record is absent and signed requests can fail with
+	// "No such key". The message names the affected GarageNode(s) so an operator
+	// can force a layout reconcile.
 	ConditionGatewayLayoutDegraded = "GatewayLayoutDegraded"
 
 	// ConditionManagementHandleReady is True when a management-handle cluster
@@ -124,15 +125,40 @@ const (
 	ConditionManagementHandleReady = "ManagementHandleReady"
 
 	// ConditionStorageScaleDownBlocked is True when an Auto-mode storage
-	// scale-down was refused because removing the over-range GarageNodes would
-	// drop the count of live, positive-capacity storage nodes below
-	// spec.replication.factor. Garage rejects a layout apply that would leave
-	// fewer roled nodes than the factor (IsReplicationConstraint), so the
-	// per-node finalizer cannot remove the layout role — deleting the CRs would
-	// orphan those roles. The operator keeps the excess GarageNodes in place
-	// and surfaces this until the user lowers replication.factor (or restores
-	// replicas). False/cleared once the scale-down is safe.
+	// scale-down is refused because too few positive-capacity roles would remain
+	// for spec.replication.factor. Transient topology progress is reported
+	// separately by StorageTopologyReady.
 	ConditionStorageScaleDownBlocked = "StorageScaleDownBlocked"
+
+	// ConditionStorageTopologyReady reports whether the operator-managed
+	// default StatefulSet/PVC group has reached its desired membership and Garage
+	// has no older layout version still draining. False is a transient
+	// progress/safety signal while members join, update, or drain.
+	// Replication-factor refusals remain additionally surfaced by
+	// StorageScaleDownBlocked.
+	ConditionStorageTopologyReady = "StorageTopologyReady"
+
+	// ConditionNodeLocalPoolsReady reports whether every additive node-local pool
+	// has converged to its desired Kubernetes Node membership.
+	// False means the operator is still adding replacement identities, draining
+	// retired identities, or is refusing an unsafe drain. The node-local lifecycle
+	// keeps the old pod online until its Garage layout role is removed.
+	ConditionNodeLocalPoolsReady = "NodeLocalPoolsReady"
+
+	// ConditionStorageRolloutReady reports whether every GarageNode-backed or
+	// node-local-pool identity is running the desired template revision. Those
+	// StatefulSets and DaemonSets use OnDelete; the parent replaces at most one
+	// pod, then proves its exact replacement UID and Garage layout health before
+	// selecting another. This applies equally to PVC, SMB, node-local, and
+	// unified gateway GarageNodes. Cluster-level edge gateway StatefulSets retain
+	// Kubernetes' ordered Ready-gated RollingUpdate behavior.
+	ConditionStorageRolloutReady = "StorageRolloutReady"
+
+	// ConditionStorageDrainReady reports the cluster-wide safety transaction
+	// used before a positive-capacity role's workload may stop. False names the
+	// exact actor and current repair/resync wait; True means either idle or that
+	// terminal evidence is complete and the actor is finishing its handoff.
+	ConditionStorageDrainReady = "StorageDrainReady"
 )
 
 // Condition reasons for the cluster-health surface.
@@ -155,12 +181,132 @@ const (
 	ReasonPeersUnreachable = "SustainedUnreachable"
 	// ReasonGatewayRolesPresent indicates every operator-owned gateway node holds its layout role.
 	ReasonGatewayRolesPresent = "GatewayRolesPresent"
-	// ReasonGatewayRoleMissing indicates one or more gateway nodes lack a layout role (degraded to quorum auth).
+	// ReasonGatewayRoleMissing indicates one or more gateway nodes lack the layout
+	// role required to replicate S3 authentication data locally.
 	ReasonGatewayRoleMissing = "GatewayRoleMissing"
 	// ReasonScaleDownWouldBreakQuorum indicates a refused storage scale-down.
 	ReasonScaleDownWouldBreakQuorum = "WouldDropBelowReplicationFactor"
 	// ReasonScaleDownSafe indicates no storage scale-down is currently blocked.
 	ReasonScaleDownSafe = "ScaleDownSafe"
+	// ReasonStorageTopologyConverged indicates the operator-managed default
+	// storage membership and Garage layout history are settled.
+	ReasonStorageTopologyConverged = "Converged"
+	// ReasonStorageTopologyWaitingForLayoutSync indicates another automatic or
+	// user-managed GarageNode/layout transition must finish before the default
+	// StatefulSet/PVC group can safely change.
+	ReasonStorageTopologyWaitingForLayoutSync = "WaitingForLayoutSync"
+	// ReasonStorageTopologyAdding indicates the operator created or updated a
+	// batch of default StatefulSet/PVC GarageNodes and is waiting for their layout
+	// roles.
+	ReasonStorageTopologyAdding = "AddingMembers"
+	// ReasonStorageTopologyDraining indicates one excess default StatefulSet/PVC
+	// GarageNode is being drained before another removal can start.
+	ReasonStorageTopologyDraining = "DrainingMember"
+	// ReasonNodeLocalPoolsConverged indicates every desired node-local member is
+	// connected and in the committed layout, Garage reports no draining layout
+	// version, and every retired member has been drained.
+	ReasonNodeLocalPoolsConverged = "Converged"
+	// ReasonNodeLocalPoolWaitingForReplacement indicates new node-local members
+	// must connect and enter the committed layout before an old member can be
+	// drained.
+	ReasonNodeLocalPoolWaitingForReplacement = "WaitingForReplacement"
+	// ReasonNodeLocalPoolWaitingForMembers indicates a selector matches no
+	// Kubernetes Nodes, or desired node-local Pods/connected Garage layout roles
+	// have not become ready yet.
+	ReasonNodeLocalPoolWaitingForMembers = "WaitingForMembers"
+	// ReasonNodeLocalPoolWaitingForLayoutSync indicates desired members have
+	// entered the current layout but Garage is still synchronizing an active
+	// version, another storage GarageNode is finalizing, or the Admin API could
+	// not prove that it is safe to start a removal.
+	ReasonNodeLocalPoolWaitingForLayoutSync = "WaitingForLayoutSync"
+	// ReasonNodeLocalPoolWaitingForDrainSafety means membership is otherwise ready,
+	// but deletion has not started because consistency, rollout, health, or the
+	// unverified-peer policy has not passed reversible preflight.
+	ReasonNodeLocalPoolWaitingForDrainSafety = "WaitingForDrainSafety"
+	// ReasonNodeLocalPoolMoveBlocked indicates one Kubernetes Node was moved
+	// directly between pools. It must first be unselected and fully drained so
+	// two DaemonSets never mount its node-local Garage directories together.
+	ReasonNodeLocalPoolMoveBlocked = "DirectNodeLocalPoolMoveBlocked"
+	// ReasonNodeLocalPoolWaitingForPreviousPod indicates a fully drained pool's
+	// old pod is still terminating on a Node before another pool may activate.
+	ReasonNodeLocalPoolWaitingForPreviousPod = "WaitingForPreviousNodeLocalPoolPod"
+	// ReasonNodeLocalPoolDraining indicates one retired member is leaving the
+	// committed layout while its DaemonSet pod remains online.
+	ReasonNodeLocalPoolDraining = "Draining"
+	// ReasonNodeLocalPoolReplicationUnsafe indicates draining the next retired
+	// member would leave fewer confirmed storage roles than the replication
+	// factor, so the operator keeps that member active.
+	ReasonNodeLocalPoolReplicationUnsafe = "ReplicationUnsafe"
+	// ReasonNodeLocalPoolIdentityCollision indicates two GarageNode CRs, at
+	// least one node-local-pool-backed, report the same durable Garage node ID. They
+	// are one layout identity and must not be counted as separate replicas.
+	ReasonNodeLocalPoolIdentityCollision = "IdentityCollision"
+	// ReasonNodeLocalPoolSelectorConflict indicates one Kubernetes Node currently
+	// matches more than one node-local-pool selector. No conflicting identity is
+	// activated until the selectors are made disjoint in live cluster state.
+	ReasonNodeLocalPoolSelectorConflict = "SelectorConflict"
+	// ReasonNodeLocalPoolHostPathConflict indicates another GarageCluster has a
+	// node-local pool selecting the same Kubernetes Node with an overlapping HostPath.
+	// Distinct paths on the same Node remain supported for independent clusters.
+	ReasonNodeLocalPoolHostPathConflict = "HostPathConflict"
+	// ReasonNodeLocalPoolUnsupportedKubernetesVersion means the API server is
+	// older than the Kubernetes 1.27 minimum for node-local pools.
+	ReasonNodeLocalPoolUnsupportedKubernetesVersion = "UnsupportedKubernetesVersion"
+	// ReasonNodeLocalPoolSchedulingGatesUnavailable means the Kubernetes API
+	// server rejected/removed the scheduling gate or kube-scheduler evaluated a
+	// still-gated Pod without reporting SchedulingGated.
+	ReasonNodeLocalPoolSchedulingGatesUnavailable = "SchedulingGatesUnavailable"
+	// ReasonNodeLocalPoolSchedulingGateCapabilityUnknown means discovery, API
+	// transport, scheduler observation, or probe cleanup was inconclusive, so the
+	// operator cannot safely infer end-to-end support.
+	ReasonNodeLocalPoolSchedulingGateCapabilityUnknown = "SchedulingGateCapabilityUnknown"
+	// ReasonNodeLocalPoolSchedulingGateProbePending means a harmless gated Pod
+	// is waiting for positive PodScheduled=False/SchedulingGated scheduler evidence.
+	ReasonNodeLocalPoolSchedulingGateProbePending = "SchedulingGateProbePending"
+	// ReasonNodeLocalPoolMemberLimitExceeded means live selectors exceed the
+	// supported per-GarageCluster node-local identity bound.
+	ReasonNodeLocalPoolMemberLimitExceeded = "MemberLimitExceeded"
+	// ReasonNodeLocalPoolGarageRoleLimitExceeded means the shared Garage layout
+	// has no safe positive-capacity role headroom for another identity.
+	ReasonNodeLocalPoolGarageRoleLimitExceeded = "GarageRoleLimitExceeded"
+	// ReasonStorageRolloutConverged indicates every managed identity-bearing pod
+	// is on the desired template revision.
+	ReasonStorageRolloutConverged = "Converged"
+	// ReasonStorageRolloutWaiting indicates rollout cannot safely select another
+	// pod yet because membership, readiness, health, or layout history is not
+	// settled.
+	ReasonStorageRolloutWaiting = "Waiting"
+	// ReasonStorageRolloutInitializing means managed identities are still being
+	// created or joining their first layout. Initial bootstrap layout writes must
+	// remain possible; unlike Waiting/RollingOut, this is not a config-transition
+	// exclusion boundary.
+	ReasonStorageRolloutInitializing = "Initializing"
+	// ReasonStorageRollingOut indicates the parent controller is replacing one
+	// managed pod and waiting for the exact replacement identity before another
+	// pod or layout mutation may proceed.
+	ReasonStorageRollingOut = "RollingOut"
+	// ReasonStorageDraining means the exact actor is still removing roles or
+	// proving object-block migration on every source and destination process.
+	ReasonStorageDraining = "Draining"
+	// ReasonStorageDrainCompleted means terminal upstream evidence is complete;
+	// the transaction remains active until its Kubernetes handoff finishes.
+	ReasonStorageDrainCompleted = "Completed"
+	// ReasonStorageDrainIdle means no positive-capacity removal owns the cluster.
+	ReasonStorageDrainIdle = "Idle"
+	// ReasonStorageDrainUnsupportedConsistency means Garage's configured mode
+	// cannot provide the upstream persisted table-migration barrier required for
+	// automatic positive-capacity removal.
+	ReasonStorageDrainUnsupportedConsistency = "UnsupportedConsistencyMode"
+	// ReasonStorageDrainWaitingForRollout means desired consistent mode is not
+	// yet proven to be running on every locally managed Garage process.
+	ReasonStorageDrainWaitingForRollout = "WaitingForStorageRollout"
+	// ReasonStorageDrainWaitingForHealth means managed configuration converged,
+	// but Garage is not yet fully healthy enough to begin a removal transaction.
+	ReasonStorageDrainWaitingForHealth = "WaitingForClusterHealth"
+	// ReasonStorageDrainUnverifiedPeers means at least one positive-capacity
+	// Garage process is outside this Kubernetes control plane and the safe
+	// default policy refuses to infer its running consistency mode.
+	ReasonStorageDrainUnverifiedPeers = "UnverifiedPeersBlocked"
 )
 
 // GarageBucket condition types
@@ -226,10 +372,19 @@ const (
 	// ConditionDraining indicates the node is being drained
 	ConditionDraining = "Draining"
 
+	// ConditionDrainPrepared is True only after garage.rajsingh.info/drain has
+	// removed this positive-capacity role while its process stayed live and the
+	// cluster-wide source-to-destination block proof completed. DELETE admission
+	// uses the exact parent transaction as authority; this condition is the
+	// user-facing per-node summary.
+	ConditionDrainPrepared = "DrainPrepared"
+
 	// ConditionCycling indicates a graceful node cycle (garage.rajsingh.info/cycle)
-	// is in progress: a sibling GarageNode has been provisioned and the operator is
-	// driving the add-before-remove swap. The message names the current cycle phase
-	// and the sibling node. Cleared when the cycle completes (this node is deleted).
+	// is in progress: a fresh-PVC sibling GarageNode has been provisioned and the
+	// operator is driving the add-before-remove swap through the same durable
+	// cluster-wide drain proof used by ordinary positive-capacity retirement. The
+	// message names the current phase and sibling. False means the request is
+	// blocked without mutating either identity.
 	ConditionCycling = "Cycling"
 )
 
@@ -240,9 +395,9 @@ const (
 	// created and is waiting for its node ID + StatefulSet to come up.
 	CyclePhaseProvisioning = "Provisioning"
 
-	// CyclePhaseSyncing indicates the sibling is in the layout and the operator is
-	// waiting for its sync tracker to reach the current layout version (all the
-	// partitions it owns are replicated to it).
+	// CyclePhaseSyncing indicates the sibling's exact current Pod is Ready,
+	// connected, and committed to a settled Garage layout. The subsequent ordinary
+	// drain transaction proves full replication before the source can be deleted.
 	CyclePhaseSyncing = "Syncing"
 
 	// CyclePhaseDraining indicates the sibling is fully synced and this node is being
@@ -258,6 +413,26 @@ const (
 	ReasonCycleSyncing = "SiblingSyncing"
 	// ReasonCycleDraining indicates this node is being drained and removed.
 	ReasonCycleDraining = "Draining"
+	// ReasonCycleBlocked means the cycle failed closed before provisioning or
+	// promotion because its storage source, actor identity, readiness, or durable
+	// drain proof is not eligible for automatic replacement.
+	ReasonCycleBlocked = "CycleBlocked"
+	// ReasonCycleCancellationBlocked means a pre-drain cancellation is waiting for
+	// the already-created sibling to be explicitly drained and removed first.
+	ReasonCycleCancellationBlocked = "CancellationBlocked"
+	// ReasonNodeDrainPreparing means the node remains live while its layout role
+	// and object blocks are being drained.
+	ReasonNodeDrainPreparing = "Preparing"
+	// ReasonNodeDrainPrepared means the exact parent storage-drain transaction is
+	// terminal and Kubernetes deletion is now safe.
+	ReasonNodeDrainPrepared = "PreparedForDeletion"
+	// ReasonNodeDrainPreparedNotInLayout means the annotated GarageNode has no
+	// live process/identity or its never-committed exact identity is absent from a
+	// settled Garage layout, so no block-migration transaction is necessary.
+	ReasonNodeDrainPreparedNotInLayout = "PreparedNotInLayout"
+	// ReasonNodeDrainBlocked means preparation failed closed while the GarageNode
+	// remains reversible and online.
+	ReasonNodeDrainBlocked = "PreparationBlocked"
 )
 
 // GarageAdminToken condition types
@@ -369,34 +544,89 @@ const (
 	// AnnotationForceLayoutApply forces applying staged layout changes when set to "true"
 	AnnotationForceLayoutApply = AnnotationPrefix + "force-layout-apply"
 
-	// AnnotationSkipDeadNodes skips unresponsive nodes during layout changes when set to "true"
+	// AnnotationSkipDeadNodes explicitly invokes Garage's cluster-wide recovery operation when set to "true".
+	// Garage may force-ACK every peer the serving node sees as down; this is not scoped to one target.
 	AnnotationSkipDeadNodes = AnnotationPrefix + "skip-dead-nodes"
 
 	// AnnotationAllowMissingData allows skipping nodes even if quorum is missing when set to "true"
 	// Use with caution - this can result in data loss
 	AnnotationAllowMissingData = AnnotationPrefix + "allow-missing-data"
 
+	// AnnotationForceDeleteUnrevokedOperatorTokens explicitly allows a deleting
+	// federated/edge site to abandon its internally generated Admin-token table
+	// rows when no surviving Admin endpoint can commit their tombstones. The
+	// local one-time Secrets are deleted, but any previously copied bearer may
+	// remain valid in the surviving Garage cluster. Use only after an outage
+	// makes ordinary revocation impossible.
+	AnnotationForceDeleteUnrevokedOperatorTokens = AnnotationPrefix + "force-delete-unrevoked-operator-tokens"
+
 	// AnnotationConnectNodes specifies nodes to connect to (format: "nodeId@addr:port,...")
 	AnnotationConnectNodes = AnnotationPrefix + "connect-nodes"
 
+	// AnnotationMigrateLegacyRPCSecret opts a released GarageCluster into the
+	// fail-closed migration from a user-supplied GARAGE_RPC_SECRET environment
+	// override to spec.network.rpcSecretRef. Keep the old environment entry until
+	// the controller reports that every exact managed workload, the referenced
+	// Secret, and the managed RPC snapshot contain identical credential bytes;
+	// then remove the environment entry. The operator never treats this
+	// acknowledgement as credential equality proof.
+	AnnotationMigrateLegacyRPCSecret = AnnotationPrefix + "migrate-legacy-rpc-secret"
+
+	// AnnotationAcknowledgeLegacyConfigMigration explicitly attests that released
+	// GARAGE_CONFIG_FILE or other non-RPC reserved environment overrides on the
+	// exact existing Pods are semantically compatible with the operator-rendered
+	// configuration. It is required after removing those fields while old Pods
+	// are still running. It cannot authorize an RPC credential change.
+	AnnotationAcknowledgeLegacyConfigMigration = AnnotationPrefix + "acknowledge-legacy-config-migration"
+
 	// GarageNode annotations
 
-	// AnnotationDrain drains data from a node before removal when set to "true"
+	// AnnotationDrain requests a reversible positive-capacity drain when set to
+	// "true". The GarageNode stays live and non-terminating until its role is
+	// absent and the parent status.storageDrain proof is complete. Delete it only
+	// after ConditionDrainPrepared=True.
 	AnnotationDrain = AnnotationPrefix + "drain"
+
+	// AnnotationAcknowledgeLostSource is the exact 64-hex Garage node ID whose
+	// local storage is permanently unavailable. It is a high-risk, explicit
+	// acknowledgement that freezes the exact GarageNode in drain mode while an
+	// administrator removes that dead role through Garage's own recovery
+	// workflow. The operator then verifies settled history plus clean Blocks
+	// repairs on every surviving destination; it can never prove or recover
+	// blocks whose only copy was on the lost source.
+	AnnotationAcknowledgeLostSource = AnnotationPrefix + "acknowledge-lost-source"
+
+	// AnnotationRecoverStorageRollout retries the exact managed Pod replacement
+	// recorded in status.storageRollout without changing its desired spec (for
+	// example after fixing a referenced Secret). Its value is an operator-chosen
+	// nonce; change it for each retry. Workload-only GarageCluster or exact-actor
+	// GarageNode spec edits use their atomic Kubernetes generation as the
+	// roll-forward request and do not require this annotation.
+	AnnotationRecoverStorageRollout = AnnotationPrefix + "recover-storage-rollout"
+
+	// AnnotationNodeLocalPoolRecoveryNodeID is an operator-owned identity pin on
+	// an internal node-local-pool GarageNode. It records the exact committed Garage
+	// role that caused a HostPath process to be started during cold recovery, so
+	// a missing or replaced disk cannot silently become a second storage role.
+	AnnotationNodeLocalPoolRecoveryNodeID = AnnotationPrefix + "node-local-pool-recovery-node-id"
 
 	// AnnotationSkipLayout excludes a node from the layout temporarily when set to "true"
 	AnnotationSkipLayout = AnnotationPrefix + "skip-layout"
 
-	// AnnotationCycle triggers a graceful add-before-remove node replacement when
-	// set to "true". The operator provisions a sibling GarageNode (fresh node ID +
-	// PVCs, same zone/capacity/tags), waits for the sibling's layout sync tracker
-	// to reach the current layout version (all partitions it owns are in sync),
-	// then drains and removes this node from the layout and deletes it. The cluster
-	// stays above quorum throughout — unlike a plain delete-then-recreate, which
-	// dips replication. Works for both Auto-owned and Manual GarageNodes. One-shot:
-	// progress is tracked on status.cyclePhase so the state machine resumes on
-	// requeue instead of re-provisioning the sibling. Cleared implicitly when the
-	// node is deleted at the end of the cycle.
+	// AnnotationCycle triggers a graceful add-before-remove replacement when set
+	// to "true" on an established positive-capacity StatefulSet-backed storage
+	// GarageNode. The operator creates a sibling with a fresh node ID and the same
+	// repeatable PVC-template or EmptyDir profile, waits for its exact Pod to be
+	// Ready, connected, and committed in a settled layout, then uses the ordinary
+	// cluster-wide drain and block-resync proof before promoting the sibling and
+	// deleting the source. ExistingClaim, identity-specific/shared fixed RPC
+	// endpoints, publicEndpoint, gateway, external, and node-local-pool members
+	// require an explicit distinct replacement and are rejected. A cycle
+	// never reuses, snapshots, clones, or deletes an existingClaim. Before source
+	// deletion, its volumeClaimTemplate PVCs are forced to Retain and detached
+	// from the exact old StatefulSet/Pod owners; cleanup remains explicit. The
+	// annotation is added only after creation; progress is resumable in
+	// status.cyclePhase.
 	AnnotationCycle = AnnotationPrefix + "cycle"
 
 	// GarageBucket annotations
@@ -463,8 +693,9 @@ const (
 	// at boot). DESTRUCTIVE and disruptive (full re-replication). Value is
 	// "factor=N" (must match spec.replication.factor), optionally ",force" to
 	// override the safety guards. The operator drives a multi-phase state machine
-	// recorded on status.factorMigration. Removed on success; retained (Failed
-	// phase) on a transient error so the next reconcile resumes.
+	// recorded on status.factorMigration. The request is consumed into status at
+	// the start; that durable status resumes after transient controller failures
+	// and prevents a lingering annotation from retriggering a completed purge.
 	AnnotationPurgeClusterLayout = AnnotationPrefix + "purge-cluster-layout"
 
 	// AnnotationPurgeClusterLayoutAbort aborts an in-flight purge: clears the

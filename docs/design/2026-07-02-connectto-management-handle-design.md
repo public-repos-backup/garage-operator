@@ -101,8 +101,10 @@ if cluster.IsManagementHandle() {
   requeue `RequeueAfterLong` (5m, matching healthy edge gateways).
 - Unreachable → `Status.Phase = Pending`, condition `False` with the error,
   requeue `RequeueAfterUnhealthy`.
-- Creates/reconciles no workload: no RPC secret, ConfigMap, Services, PDB,
-  layout, migration, or pod-derived health.
+- Creates/reconciles no workload: no ConfigMap, Services, PDB, layout,
+  migration, or pod-derived health. An Admin-only handle creates no RPC Secret;
+  when an explicit or inherited RPC source exists, it pins only an immutable
+  local credential snapshot for deterministic GarageKey derivation.
 
 `finalize` short-circuits for a management handle (no owned Garage state or K8s
 workload to tear down; bucket/key finalizers own their own remote cleanup).
@@ -115,12 +117,15 @@ Service.
 
 ### 6. `GarageKey` RPC-secret consideration
 
-`deriveKeyMaterial` needs `GetRPCSecret`, which falls back to
-`<cluster>-rpc-secret` (absent on a handle). Adoption path is `importKey`
-(supplied material) or operator-created keys via the Admin API. A `GarageKey`
-on a handle without `importKey` and without a resolvable RPC secret must surface
-a clear condition rather than an obscure error. Verify actual key-controller
-behavior during implementation; handle explicitly if needed.
+`deriveKeyMaterial` needs `GetRPCSecret`. A handle may supply that identity via
+`spec.network.rpcSecretRef`, `spec.connectTo.rpcSecretRef`, or inheritance from
+`spec.connectTo.clusterRef`; reconciliation copies it into the same immutable
+snapshot contract used by managed workloads before the handle becomes Ready.
+An Admin-only handle does not invent a meaningless RPC identity. Such a handle
+can still use `importKey`; requesting operator-derived key material surfaces an
+actionable error naming the supported references. The first source may be
+attached to an existing Admin-only handle, but its source and bytes are
+immutable after pinning.
 
 ## Testing
 
@@ -128,7 +133,9 @@ behavior during implementation; handle explicitly if needed.
   rejected; edge-gateway rule preserved; full cluster unaffected.
 - `GetGarageClient`: handle → connectTo endpoint/token, not `svcFQDN`.
 - Controller: handle reconcile sets `Running` on reachable admin API (mock),
-  `Pending` when unreachable; asserts no STS/ConfigMap/Service created.
+  `Pending` when unreachable; asserts no STS/ConfigMap/Service or generated RPC
+  Secret is created, and explicit RPC sources produce an immutable owned
+  snapshot.
 
 ## Docs
 

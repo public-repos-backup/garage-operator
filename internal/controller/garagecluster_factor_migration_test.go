@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -87,7 +88,7 @@ func fmScheme(t *testing.T) *runtime.Scheme {
 const (
 	fmNS              = "fm-test"
 	fmFactor2         = "factor=2"
-	fmGarageContainer = "garage"
+	fmGarageContainer = testGarageValue
 )
 
 func fmCluster(name string, mutators ...func(*garagev1beta2.GarageCluster)) *garagev1beta2.GarageCluster {
@@ -95,6 +96,7 @@ func fmCluster(name string, mutators ...func(*garagev1beta2.GarageCluster)) *gar
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
 			Namespace:   fmNS,
+			UID:         types.UID("cluster-" + name),
 			Annotations: map[string]string{},
 		},
 		Spec: garagev1beta2.GarageClusterSpec{
@@ -121,11 +123,16 @@ func fmStorageNode(cluster string, i int, nodeID string) *garagev1beta1.GarageNo
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: fmNS,
+			UID:       types.UID("node-" + name),
 			Labels: map[string]string{
 				labelCluster:      cluster,
 				labelTier:         tierStorage,
 				labelAppManagedBy: managedByOperatorValue,
 			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: garagev1beta2.GroupVersion.String(), Kind: kindGarageCluster,
+				Name: cluster, UID: types.UID("cluster-" + cluster), Controller: ptr.To(true),
+			}},
 		},
 		Spec: garagev1beta1.GarageNodeSpec{
 			ClusterRef: garagev1beta1.ClusterReference{Name: cluster},
@@ -134,6 +141,37 @@ func fmStorageNode(cluster string, i int, nodeID string) *garagev1beta1.GarageNo
 			Tags:       []string{testTierStorageTag},
 		},
 		Status: garagev1beta1.GarageNodeStatus{NodeID: nodeID},
+	}
+}
+
+func fmStorageStatefulSet(cluster string, i int, replicas int32, podSpec corev1.PodSpec) *appsv1.StatefulSet {
+	name := autoModeGarageNodeName(cluster, int32(i))
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: fmNS, UID: types.UID("sts-" + name),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: garagev1beta1.GroupVersion.String(), Kind: "GarageNode",
+				Name: name, UID: types.UID("node-" + name), Controller: ptr.To(true),
+			}},
+		},
+		Spec: appsv1.StatefulSetSpec{Replicas: ptr.To(replicas), Template: corev1.PodTemplateSpec{Spec: podSpec}},
+	}
+}
+
+func fmSharedConfigRevision(cluster *garagev1beta2.GarageCluster) *corev1.ConfigMap {
+	body := generateGarageConfig(cluster, &configContext{})
+	baseName := cluster.Name + "-config"
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: garageConfigRevisionName(baseName, garageConfigHash(body)), Namespace: cluster.Namespace,
+			Annotations: garageConfigRevisionAnnotations(baseName, nil),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: garagev1beta2.GroupVersion.String(), Kind: kindGarageCluster,
+				Name: cluster.Name, UID: cluster.UID, Controller: ptr.To(true),
+			}},
+		},
+		Immutable: ptr.To(true),
+		Data:      map[string]string{configFileName: body},
 	}
 }
 
@@ -208,7 +246,7 @@ func TestFactorMigration_ValidationGuards(t *testing.T) {
 			mutate: func(c *garagev1beta2.GarageCluster) {
 				c.Annotations[garagev1beta1.AnnotationPurgeClusterLayout] = fmFactor2
 				c.Spec.Replication.Factor = 2
-				c.Spec.Replication.ConsistencyMode = "dangerous"
+				c.Spec.Replication.ConsistencyMode = consistencyModeDangerous
 			},
 			wantMsg: "requires ,force",
 		},
@@ -358,10 +396,7 @@ func TestFactorMigration_ScaleDownSuspendsAndScales(t *testing.T) {
 	objs := []client.Object{c}
 	for i := 0; i < 3; i++ {
 		objs = append(objs, fmStorageNode("c3", i, "id"+string(rune('a'+i))))
-		objs = append(objs, &appsv1.StatefulSet{
-			ObjectMeta: metav1.ObjectMeta{Name: autoModeGarageNodeName("c3", int32(i)), Namespace: fmNS},
-			Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To(int32(1))},
-		})
+		objs = append(objs, fmStorageStatefulSet("c3", i, 1, corev1.PodSpec{}))
 	}
 	r := fmBuild(t, objs...)
 
@@ -398,10 +433,7 @@ func TestFactorMigration_ScaleDownWaitsWhilePodsExist(t *testing.T) {
 	}
 	objs := make([]client.Object, 0, 4)
 	objs = append(objs, c, fmStorageNode("c4", 0, "ida"))
-	objs = append(objs, &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: autoModeGarageNodeName("c4", 0), Namespace: fmNS},
-		Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To(int32(1))},
-	})
+	objs = append(objs, fmStorageStatefulSet("c4", 0, 1, corev1.PodSpec{}))
 	// A lingering storage pod must hold the migration in ScalingDown.
 	objs = append(objs, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -431,27 +463,31 @@ func TestFactorMigration_PurgePatchesInitContainerAndScalesUp(t *testing.T) {
 	c.Status.FactorMigration = &garagev1beta2.FactorMigrationStatus{
 		Phase: fmPhasePurging, ToFactor: 2, PurgeID: "p9", StartedAt: ptr.To(metav1.Now()),
 	}
-	objs := make([]client.Object, 0, 3)
-	objs = append(objs, c, fmStorageNode("c5", 0, "ida"))
-	objs = append(objs, &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: autoModeGarageNodeName("c5", 0), Namespace: fmNS},
-		Spec: appsv1.StatefulSetSpec{
-			Replicas: ptr.To(int32(0)),
-			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: fmGarageContainer}}}},
-		},
+	objs := make([]client.Object, 0, 4)
+	objs = append(objs, c, fmStorageNode("c5", 0, "ida"), fmSharedConfigRevision(c))
+	sts := fmStorageStatefulSet("c5", 0, 0, corev1.PodSpec{
+		Containers: []corev1.Container{{Name: fmGarageContainer}},
+		Volumes: []corev1.Volume{{
+			Name: configVolumeName,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "c5-config"},
+			}},
+		}},
 	})
+	sts.Spec.Template.Annotations = map[string]string{annotationConfigHash: "old"}
+	objs = append(objs, sts)
 	r := fmBuild(t, objs...)
 
 	if _, err := r.reconcileFactorMigration(ctx, c); err != nil {
 		t.Fatalf("reconcileFactorMigration: %v", err)
 	}
-	sts := &appsv1.StatefulSet{}
-	_ = r.Get(ctx, types.NamespacedName{Name: autoModeGarageNodeName("c5", 0), Namespace: fmNS}, sts)
-	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != 1 {
+	gotSTS := &appsv1.StatefulSet{}
+	_ = r.Get(ctx, types.NamespacedName{Name: autoModeGarageNodeName("c5", 0), Namespace: fmNS}, gotSTS)
+	if gotSTS.Spec.Replicas == nil || *gotSTS.Spec.Replicas != 1 {
 		t.Fatal("STS should be scaled back to 1 during Purging")
 	}
 	foundInit := false
-	for _, ic := range sts.Spec.Template.Spec.InitContainers {
+	for _, ic := range gotSTS.Spec.Template.Spec.InitContainers {
 		if ic.Name == fmPurgeInitContainerName {
 			foundInit = true
 			if !strings.Contains(ic.Command[2], "rm -f") || !strings.Contains(ic.Command[2], ".purged-p9") {
@@ -466,6 +502,76 @@ func TestFactorMigration_PurgePatchesInitContainerAndScalesUp(t *testing.T) {
 	_ = r.Get(ctx, types.NamespacedName{Name: "c5", Namespace: fmNS}, got)
 	if got.Status.FactorMigration.Phase != fmPhaseVerifying {
 		t.Fatalf("expected Verifying, got %s", got.Status.FactorMigration.Phase)
+	}
+}
+
+func TestFactorMigration_PurgeResumesAfterCrashDuringMultiNodeScaleUp(t *testing.T) {
+	ctx := context.Background()
+	c := fmCluster("crash-scale")
+	c.Status.FactorMigration = &garagev1beta2.FactorMigrationStatus{
+		Phase: fmPhasePurging, ToFactor: 2, PurgeID: "p-retry", StartedAt: ptr.To(metav1.Now()),
+	}
+	objects := []client.Object{c, fmSharedConfigRevision(c)}
+	for i := 0; i < 3; i++ {
+		objects = append(objects, fmStorageNode(c.Name, i, "id"+strconv.Itoa(i)))
+		sts := fmStorageStatefulSet(c.Name, i, 0, corev1.PodSpec{
+			Containers: []corev1.Container{{Name: fmGarageContainer}},
+			Volumes: []corev1.Volume{{
+				Name: configVolumeName,
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: c.Name + "-config"},
+				}},
+			}},
+		})
+		sts.Spec.Template.Annotations = map[string]string{annotationConfigHash: "old"}
+		objects = append(objects, sts)
+	}
+	r := fmBuild(t, objects...)
+	nodes, err := r.listAutoModeStorageNodes(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := sortedFactorMigrationNodeNames(nodes)
+	if got, want := strings.Join(names, ","), strings.Join([]string{
+		autoModeGarageNodeName(c.Name, 0), autoModeGarageNodeName(c.Name, 1), autoModeGarageNodeName(c.Name, 2),
+	}, ","); got != want {
+		t.Fatalf("factor-migration member order = %q, want %q", got, want)
+	}
+
+	// Model a manager crash after the all-member preparation barrier and the
+	// first scale-up write, before phase status could advance.
+	for _, name := range names {
+		if err := r.patchSTSConfigRevisionForFactorMigration(ctx, c, nodes[name]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range names {
+		if err := r.patchSTSPurgeInitContainerForNode(ctx, c, nodes[name], "p-retry", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.scaleStorageSTSForNode(ctx, c, nodes[names[0]], 1); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.fmPurge(ctx, c); err != nil {
+		t.Fatalf("retry after partial scale-up wedged: %v", err)
+	}
+	for _, name := range names {
+		sts := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: fmNS}, sts); err != nil {
+			t.Fatal(err)
+		}
+		if sts.Spec.Replicas == nil || *sts.Spec.Replicas != 1 {
+			t.Fatalf("StatefulSet %s was not resumed idempotently", name)
+		}
+	}
+	got := &garagev1beta2.GarageCluster{}
+	if err := r.Get(ctx, types.NamespacedName{Name: c.Name, Namespace: fmNS}, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.FactorMigration == nil || got.Status.FactorMigration.Phase != fmPhaseVerifying {
+		t.Fatalf("retry did not advance to Verifying: %+v", got.Status.FactorMigration)
 	}
 }
 
@@ -725,16 +831,10 @@ func TestFactorMigration_RebuildLayoutStuckGuard(t *testing.T) {
 	// failure must restore it (parity with TestFactorMigration_FailureRestoresTier).
 	node := fmStorageNode("rb1", 0, "ida")
 	node.Annotations = map[string]string{garagev1beta1.AnnotationOperatorSuspended: "p1"}
-	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: autoModeGarageNodeName("rb1", 0), Namespace: fmNS},
-		Spec: appsv1.StatefulSetSpec{
-			Replicas: ptr.To(int32(0)),
-			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-				InitContainers: []corev1.Container{{Name: fmPurgeInitContainerName}},
-				Containers:     []corev1.Container{{Name: fmGarageContainer}},
-			}},
-		},
-	}
+	sts := fmStorageStatefulSet("rb1", 0, 0, corev1.PodSpec{
+		InitContainers: []corev1.Container{{Name: fmPurgeInitContainerName}},
+		Containers:     []corev1.Container{{Name: fmGarageContainer}},
+	})
 	r := fmBuild(t, c, node, sts)
 
 	if _, err := r.fmRebuildLayout(ctx, c); err != nil {
@@ -772,16 +872,10 @@ func TestFactorMigration_FailureRestoresTier(t *testing.T) {
 	}
 	node := fmStorageNode("fail1", 0, "ida")
 	node.Annotations = map[string]string{garagev1beta1.AnnotationOperatorSuspended: "p1"}
-	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: autoModeGarageNodeName("fail1", 0), Namespace: fmNS},
-		Spec: appsv1.StatefulSetSpec{
-			Replicas: ptr.To(int32(0)),
-			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-				InitContainers: []corev1.Container{{Name: fmPurgeInitContainerName}},
-				Containers:     []corev1.Container{{Name: fmGarageContainer}},
-			}},
-		},
-	}
+	sts := fmStorageStatefulSet("fail1", 0, 0, corev1.PodSpec{
+		InitContainers: []corev1.Container{{Name: fmPurgeInitContainerName}},
+		Containers:     []corev1.Container{{Name: fmGarageContainer}},
+	})
 	r := fmBuild(t, c, node, sts)
 
 	if _, err := r.failFactorMigration(ctx, c, "boom"); err != nil {

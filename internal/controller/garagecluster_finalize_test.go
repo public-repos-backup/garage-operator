@@ -27,11 +27,10 @@ import (
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 )
 
-// Cluster-delete must not layout-evict user-owned (Manual) GarageNodes. They
-// have no controllerRef to the cluster (K8s GC never deletes them) and own their
-// own layout lifecycle, so the cluster finalizer's collectGarageNodeIDs must
-// only gather operator-managed node IDs.
-var _ = Describe("collectGarageNodeIDs excludes user-owned nodes", func() {
+// Manual GarageNodes are logical cluster dependents even though Kubernetes
+// ownerReferences are intentionally absent. Drain deletion must include their
+// IDs; Destroy deletion cascades their CRs/workloads without a layout apply.
+var _ = Describe("collectGarageNodeIDs includes every referencing node", func() {
 	const (
 		clusterName = "finalize-skip-cluster"
 		opNodeID    = "1111111111111111111111111111111111111111111111111111111111111111"
@@ -61,7 +60,7 @@ var _ = Describe("collectGarageNodeIDs excludes user-owned nodes", func() {
 		cleanup(clusterName, false)
 	})
 
-	It("collects operator-managed node IDs but skips user-owned ones", func() {
+	It("collects both operator-managed and user-authored Manual node IDs", func() {
 		r := &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		cluster := &garagev1beta2.GarageCluster{
 			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: testNamespace},
@@ -99,13 +98,13 @@ var _ = Describe("collectGarageNodeIDs excludes user-owned nodes", func() {
 
 		// envtest list is cache-backed via the same client; create is synchronous to the API.
 		Eventually(func(g Gomega) {
-			got := r.collectGarageNodeIDs(ctx, cluster)
+			got, err := r.collectGarageNodeIDs(ctx, cluster)
+			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(got).To(HaveKey(opNodeID), "operator-managed node must be collected for layout eviction")
-			g.Expect(got).NotTo(HaveKey(userNodeID), "user-owned node must NOT be layout-evicted on cluster delete")
+			g.Expect(got).To(HaveKey(userNodeID), "Manual SMB node must participate in explicit Drain retirement")
 		}).Should(Succeed())
 
-		// Sanity: deleting the cluster CR must not have been required; the guard is
-		// purely ownership-label based.
+		// Sanity: logical dependency is based on clusterRef, not an operator label.
 		fetched := &garagev1beta1.GarageNode{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "user-owned", Namespace: testNamespace}, fetched)).To(Succeed())
 		Expect(fetched.Labels).NotTo(HaveKey(labelAppManagedBy))

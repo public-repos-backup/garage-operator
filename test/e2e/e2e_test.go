@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -38,6 +39,10 @@ import (
 )
 
 // namespace where the project is deployed in
+// e2eGarageImage is the upstream Garage the suite runs. Kept at v2.3.0 to match
+// the operator's defaultGarageImage; the topology suites cover v2.2.0.
+const e2eGarageImage = "dxflrs/garage:v2.3.0"
+
 const namespace = "garage-operator-system"
 
 // serviceAccountName created for the project
@@ -48,6 +53,293 @@ const metricsServiceName = "garage-operator-controller-manager-metrics-service"
 
 // metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
 const metricsRoleBindingName = "garage-operator-metrics-binding"
+
+type garageClusterScaleSnapshot struct {
+	Spec struct {
+		Replicas int32 `json:"replicas"`
+	} `json:"spec"`
+	Status struct {
+		Replicas int32  `json:"replicas"`
+		Selector string `json:"selector"`
+	} `json:"status"`
+}
+
+// readGarageClusterScale reads the real scale subresource instead of inferring
+// its contract from the parent GarageCluster. This catches stale CRD paths and
+// selectors that accidentally include node-local or gateway Pods.
+func readGarageClusterScale(apiVersion, testNamespace, clusterName string) (garageClusterScaleSnapshot, error) {
+	GinkgoHelper()
+	path := fmt.Sprintf(
+		"/apis/garage.rajsingh.info/%s/namespaces/%s/garageclusters/%s/scale",
+		apiVersion, testNamespace, clusterName,
+	)
+	output, err := utils.Run(exec.Command("kubectl", "get", "--raw", path))
+	if err != nil {
+		return garageClusterScaleSnapshot{}, fmt.Errorf("GET %s: %w: %s", path, err, output)
+	}
+	// utils.Run returns combined output, and the v1beta1 CRD is served with a
+	// deprecation warning that kubectl prints ahead of the response body. Decode
+	// only the JSON.
+	output = stripKubectlWarnings(output)
+	var snapshot garageClusterScaleSnapshot
+	if err := json.Unmarshal([]byte(output), &snapshot); err != nil {
+		return garageClusterScaleSnapshot{}, fmt.Errorf("decode GET %s: %w: %s", path, err, output)
+	}
+	return snapshot, nil
+}
+
+// fixturePathsOverlap reports whether mutating either absolute path can affect
+// the other. It deliberately treats an ancestor mount (including /) as unsafe,
+// not only a volume nested below the fixture root.
+func fixturePathsOverlap(candidate, fixtureRoot string) bool {
+	candidate = strings.TrimSpace(candidate)
+	fixtureRoot = strings.TrimSpace(fixtureRoot)
+	if candidate == "" || fixtureRoot == "" {
+		return false
+	}
+	candidate = filepath.Clean(candidate)
+	fixtureRoot = filepath.Clean(fixtureRoot)
+	if !filepath.IsAbs(candidate) || !filepath.IsAbs(fixtureRoot) {
+		return false
+	}
+	contains := func(parent, child string) bool {
+		relative, err := filepath.Rel(parent, child)
+		return err == nil && relative != ".." &&
+			!strings.HasPrefix(relative, ".."+string(os.PathSeparator))
+	}
+	return contains(candidate, fixtureRoot) || contains(fixtureRoot, candidate)
+}
+
+func prepareNodeLocalPoolE2EFixtures(
+	testNamespace, hostPathBase, managedTopologyHostPathBase string,
+) []string {
+	GinkgoHelper()
+	By("proving the ephemeral HostPath reset targets the requested empty Kind cluster")
+	Expect(testNamespace).To(Equal("garage-ds-test"),
+		"refusing an unexpected node-local fixture namespace")
+	Expect(hostPathBase).To(Equal("/tmp/garage-e2e-ds"),
+		"refusing an unexpected node-local HostPath reset root")
+	Expect(managedTopologyHostPathBase).To(Equal("/tmp/garage-e2e-managed-mixed"),
+		"refusing an unexpected managed-topology HostPath reset root")
+	kindCluster := strings.TrimSpace(os.Getenv("KIND_CLUSTER"))
+	Expect(kindCluster).NotTo(BeEmpty(),
+		"node-local-pool E2E requires the explicit KIND_CLUSTER safety boundary")
+	kindBinary := strings.TrimSpace(os.Getenv("KIND"))
+	if kindBinary == "" {
+		kindBinary = "kind"
+	}
+	expectedContext := "kind-" + kindCluster
+	cmd := exec.Command("kubectl", "config", "current-context")
+	output, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to read the current Kubernetes context")
+	Expect(strings.TrimSpace(output)).To(Equal(expectedContext),
+		"refusing to mutate Nodes or reset HostPaths outside the requested Kind cluster; select context %s first",
+		expectedContext)
+
+	cmd = exec.Command(kindBinary, "get", "nodes", "--name", kindCluster)
+	output, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to list Nodes from Kind cluster %s", kindCluster)
+	kindNodeNames := strings.Fields(output)
+	Expect(kindNodeNames).To(HaveLen(3),
+		"the node-local-pool E2E requires one control-plane and two worker Nodes")
+
+	cmd = exec.Command("kubectl", "get", "nodes", "-o", "json")
+	output, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to inspect Kubernetes Nodes before fixture reset")
+	var nodeList struct {
+		Items []struct {
+			Metadata struct {
+				Name        string            `json:"name"`
+				Labels      map[string]string `json:"labels"`
+				Annotations map[string]string `json:"annotations"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	Expect(json.Unmarshal([]byte(output), &nodeList)).To(Succeed())
+	apiNodeNames := make([]string, 0, len(nodeList.Items))
+	k8sNodeNames := make([]string, 0, 2)
+	controlPlaneNodes := 0
+	for _, node := range nodeList.Items {
+		apiNodeNames = append(apiNodeNames, node.Metadata.Name)
+		if _, controlPlane := node.Metadata.Labels["node-role.kubernetes.io/control-plane"]; controlPlane {
+			controlPlaneNodes++
+			continue
+		}
+		k8sNodeNames = append(k8sNodeNames, node.Metadata.Name)
+	}
+	Expect(apiNodeNames).To(ConsistOf(kindNodeNames),
+		"Kind's Nodes and the current Kubernetes context must identify the same dedicated cluster")
+	Expect(controlPlaneNodes).To(Equal(1),
+		"the node-local-pool E2E topology must have exactly one control-plane Node")
+	Expect(k8sNodeNames).To(HaveLen(2),
+		"the node-local-pool E2E topology must have exactly two worker Nodes")
+	sort.Strings(k8sNodeNames)
+
+	retainedOwnershipRecords := make([]string, 0)
+	for _, node := range nodeList.Items {
+		for key := range node.Metadata.Labels {
+			if strings.HasPrefix(key, "garage.rajsingh.info/gc-") {
+				retainedOwnershipRecords = append(retainedOwnershipRecords,
+					fmt.Sprintf("%s:label:%s", node.Metadata.Name, key))
+			}
+		}
+		for key := range node.Metadata.Annotations {
+			if strings.HasPrefix(key, "garage.rajsingh.info/gc-") {
+				retainedOwnershipRecords = append(retainedOwnershipRecords,
+					fmt.Sprintf("%s:annotation:%s", node.Metadata.Name, key))
+			}
+		}
+	}
+	sort.Strings(retainedOwnershipRecords)
+	Expect(retainedOwnershipRecords).To(BeEmpty(),
+		"refusing to guess ownership or erase retained node-local identity records: %v; run `make cleanup-test-e2e KIND_CLUSTER=%s` and start with a fresh dedicated cluster",
+		retainedOwnershipRecords, kindCluster)
+
+	cmd = exec.Command("kubectl", "get", "namespace", testNamespace,
+		"--ignore-not-found", "-o", "name")
+	output, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to inspect the dedicated test namespace")
+	Expect(strings.TrimSpace(output)).To(BeEmpty(),
+		"refusing to erase retained HostPaths after an incomplete run: namespace %s still exists; run `make cleanup-test-e2e KIND_CLUSTER=%s` and start with a fresh dedicated cluster",
+		testNamespace, kindCluster)
+
+	cmd = exec.Command("kubectl", "api-resources", "--api-group=garage.rajsingh.info", "-o", "name")
+	output, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to discover existing Garage APIs before fixture reset")
+	availableGarageResources := make(map[string]bool)
+	for _, resourceName := range strings.Fields(output) {
+		availableGarageResources[resourceName] = true
+	}
+	for _, resourceName := range []string{
+		"garageclusters.garage.rajsingh.info",
+		"garagenodes.garage.rajsingh.info",
+	} {
+		if !availableGarageResources[resourceName] {
+			continue
+		}
+		cmd = exec.Command("kubectl", "get", resourceName, "--all-namespaces", "-o", "name")
+		output, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to inspect stale %s resources", resourceName)
+		Expect(strings.TrimSpace(output)).To(BeEmpty(),
+			"refusing to erase retained HostPaths while %s resources still exist: %s; run `make cleanup-test-e2e KIND_CLUSTER=%s` and start with a fresh dedicated cluster",
+			resourceName, output, kindCluster)
+	}
+
+	cmd = exec.Command("kubectl", "get",
+		"pods,daemonsets,statefulsets,deployments,replicasets,jobs,cronjobs",
+		"--all-namespaces", "-o", "json")
+	output, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to inspect live and templated HostPath mounts")
+	var workloadList struct {
+		Items []map[string]any `json:"items"`
+	}
+	Expect(json.Unmarshal([]byte(output), &workloadList)).To(Succeed())
+	fixtureRoots := []string{hostPathBase, managedTopologyHostPathBase}
+	unsafeMounts := make([]string, 0)
+	staleGarageWorkloads := make([]string, 0)
+	for _, item := range workloadList.Items {
+		kind, _ := item["kind"].(string)
+		metadata, _ := item["metadata"].(map[string]any)
+		name, _ := metadata["name"].(string)
+		ns, _ := metadata["namespace"].(string)
+		owner := strings.Trim(strings.Join([]string{kind, ns, name}, "/"), "/")
+		if workloadLabels, ok := metadata["labels"].(map[string]any); ok {
+			if _, managedCluster := workloadLabels["garage.rajsingh.info/cluster"]; managedCluster {
+				staleGarageWorkloads = append(staleGarageWorkloads, owner)
+			}
+		}
+		var inspectValue func(any)
+		inspectValue = func(value any) {
+			switch typed := value.(type) {
+			case map[string]any:
+				if hostPath, ok := typed["hostPath"].(map[string]any); ok {
+					if mountedPath, ok := hostPath["path"].(string); ok {
+						for _, fixtureRoot := range fixtureRoots {
+							if fixturePathsOverlap(mountedPath, fixtureRoot) {
+								unsafeMounts = append(unsafeMounts, owner+":"+mountedPath)
+							}
+						}
+					}
+				}
+				for _, child := range typed {
+					inspectValue(child)
+				}
+			case []any:
+				for _, child := range typed {
+					inspectValue(child)
+				}
+			}
+		}
+		inspectValue(item)
+	}
+	sort.Strings(unsafeMounts)
+	sort.Strings(staleGarageWorkloads)
+	Expect(staleGarageWorkloads).To(BeEmpty(),
+		"refusing to clear Node ownership records while Garage workload objects remain: %v; run `make cleanup-test-e2e KIND_CLUSTER=%s` and start with a fresh dedicated cluster",
+		staleGarageWorkloads, kindCluster)
+	Expect(unsafeMounts).To(BeEmpty(),
+		"refusing to erase a fixture root referenced by a live Pod or workload template: %v; run `make cleanup-test-e2e KIND_CLUSTER=%s` and start with a fresh dedicated cluster",
+		unsafeMounts, kindCluster)
+
+	cmd = exec.Command("kubectl", "get", "persistentvolumes", "-o", "json")
+	output, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to inspect persistent storage before fixture reset")
+	var persistentVolumeList struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				HostPath *struct {
+					Path string `json:"path"`
+				} `json:"hostPath"`
+				Local *struct {
+					Path string `json:"path"`
+				} `json:"local"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	Expect(json.Unmarshal([]byte(output), &persistentVolumeList)).To(Succeed())
+	unsafePersistentVolumes := make([]string, 0)
+	for _, volume := range persistentVolumeList.Items {
+		paths := make([]string, 0, 2)
+		if volume.Spec.HostPath != nil {
+			paths = append(paths, volume.Spec.HostPath.Path)
+		}
+		if volume.Spec.Local != nil {
+			paths = append(paths, volume.Spec.Local.Path)
+		}
+		for _, volumePath := range paths {
+			for _, fixtureRoot := range fixtureRoots {
+				if fixturePathsOverlap(volumePath, fixtureRoot) {
+					unsafePersistentVolumes = append(unsafePersistentVolumes,
+						volume.Metadata.Name+":"+volumePath)
+				}
+			}
+		}
+	}
+	sort.Strings(unsafePersistentVolumes)
+	Expect(unsafePersistentVolumes).To(BeEmpty(),
+		"refusing to erase a fixture root referenced by a hostPath or local PersistentVolume: %v; run `make cleanup-test-e2e KIND_CLUSTER=%s` and start with a fresh dedicated cluster",
+		unsafePersistentVolumes, kindCluster)
+
+	By("resetting only the proven-idle, ownership-record-free ephemeral HostPath fixtures")
+	for _, nodeName := range k8sNodeNames {
+		cmd = exec.Command("kubectl", "label", "node", nodeName,
+			"garage.rajsingh.info/e2e-storage-",
+			"garage.rajsingh.info/e2e-storage-profile-")
+		output, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to clear fixture selector labels on %s: %s", nodeName, output)
+
+		cmd = exec.Command("docker", "exec", nodeName, "sh", "-ec",
+			`rm -rf "$1" "$2" && mkdir -p "$1" "$2"`, "garage-e2e",
+			hostPathBase, managedTopologyHostPathBase)
+		output, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to reset HostPath fixture on %s: %s", nodeName, output)
+	}
+
+	return k8sNodeNames
+}
 
 var _ = Describe("Manager", Ordered, Label("manager"), func() {
 	var controllerPodName string
@@ -1227,40 +1519,12 @@ spec:
 				adminToken, storageClusterName, testNamespace, originalAccessKeyID,
 			)
 			Eventually(func(g Gomega) {
-				cleanupCmd := exec.Command("kubectl", "delete", "pod", "curl-drift-delete-key",
-					"-n", testNamespace, "--ignore-not-found", "--force", "--grace-period=0")
-				_, _ = utils.Run(cleanupCmd)
-
-				cmd := exec.Command("kubectl", "run", "curl-drift-delete-key", "--rm", "-i", "--restart=Never",
-					"-n", testNamespace,
-					"--image=docker.io/curlimages/curl:latest",
-					"--overrides", fmt.Sprintf(`{
-						"spec": {
-							"containers": [{
-								"name": "curl-drift-delete-key",
-								"image": "docker.io/curlimages/curl:latest",
-								"imagePullPolicy": "IfNotPresent",
-								"command": ["/bin/sh", "-c"],
-								"args": [%q],
-								"securityContext": {
-									"readOnlyRootFilesystem": true,
-									"allowPrivilegeEscalation": false,
-									"capabilities": {"drop": ["ALL"]},
-									"runAsNonRoot": true,
-									"runAsUser": 1000,
-									"seccompProfile": {"type": "RuntimeDefault"}
-								}
-							}]
-						}
-					}`, curlCmd))
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "curl pod failed: %s", output)
-				// kubectl run --rm appends "pod deleted" to output; extract just the HTTP status (first 3 chars)
-				// Accept 200 (we deleted it) or 404 (already gone — drift already occurred)
-				httpCode := strings.TrimSpace(output)
-				if len(httpCode) > 3 {
-					httpCode = httpCode[:3]
+				output := runCurlPod(g, testNamespace, "curl-drift-delete-key", curlCmd)
+				httpCode := ""
+				if match := regexp.MustCompile(`(?:^|[^0-9])(200|404)(?:[^0-9]|$)`).FindStringSubmatch(output); len(match) == 2 {
+					httpCode = match[1]
 				}
+				// Accept 200 (we deleted it) or 404 (already gone — drift already occurred).
 				g.Expect(httpCode).To(SatisfyAny(Equal("200"), Equal("404")),
 					"Expected HTTP 200 or 404 from DeleteKey, got: %s", output)
 			}, 1*time.Minute, 10*time.Second).Should(Succeed())
@@ -1312,18 +1576,9 @@ spec:
 			Expect(driftBucketID).NotTo(BeEmpty(), "driftBucketID not set — credential drift test must run first")
 
 			By("reading recovered credentials from the K8s secret")
-			cmd := exec.Command("kubectl", "get", "secret", driftKeyName,
-				"-n", testNamespace,
-				"-o", `go-template={{ index .data "access-key-id" | base64decode }}`)
-			accessKeyID, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
+			accessKeyID := readSecretValue(testNamespace, driftKeyName, "access-key-id")
 			Expect(accessKeyID).NotTo(BeEmpty(), "access-key-id not in secret")
-
-			cmd = exec.Command("kubectl", "get", "secret", driftKeyName,
-				"-n", testNamespace,
-				"-o", `go-template={{ index .data "secret-access-key" | base64decode }}`)
-			secretAccessKey, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
+			secretAccessKey := readSecretValue(testNamespace, driftKeyName, "secret-access-key")
 			Expect(secretAccessKey).NotTo(BeEmpty(), "secret-access-key not in secret")
 
 			By("running S3 PUT then GET via aws-cli to verify recovered credentials work")
@@ -1341,45 +1596,13 @@ spec:
 			)
 
 			Eventually(func(g Gomega) {
-				cleanupCmd := exec.Command("kubectl", "delete", "pod", "drift-s3-verify",
-					"-n", testNamespace, "--ignore-not-found", "--force", "--grace-period=0")
-				_, _ = utils.Run(cleanupCmd)
-
-				// readOnlyRootFilesystem omitted: aws-cli writes credential cache to /tmp
-				cmd := exec.Command("kubectl", "run", "drift-s3-verify", "--rm", "-i", "--restart=Never",
-					"-n", testNamespace,
-					"--image=docker.io/amazon/aws-cli:latest",
-					"--overrides", fmt.Sprintf(`{
-						"spec": {
-							"containers": [{
-								"name": "drift-s3-verify",
-								"image": "docker.io/amazon/aws-cli:latest",
-								"imagePullPolicy": "IfNotPresent",
-								"command": ["/bin/sh", "-c"],
-								"args": [%q],
-								"env": [
-									{"name": "AWS_ACCESS_KEY_ID", "value": %q},
-									{"name": "AWS_SECRET_ACCESS_KEY", "value": %q},
-									{"name": "HOME", "value": "/tmp"}
-								],
-								"securityContext": {
-									"allowPrivilegeEscalation": false,
-									"capabilities": {"drop": ["ALL"]},
-									"runAsNonRoot": true,
-									"runAsUser": 1000,
-									"seccompProfile": {"type": "RuntimeDefault"}
-								}
-							}]
-						}
-					}`, s3Cmd, accessKeyID, secretAccessKey))
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "aws-cli pod failed: %s", output)
+				output := runAWSCLI(g, testNamespace, "drift-s3-verify", s3Cmd, driftKeyName, true)
 				g.Expect(output).To(ContainSubstring(testPayload),
 					"GET output should contain PUT payload. Full output: %s", output)
 			}, 3*time.Minute, 30*time.Second).Should(Succeed())
 
 			By("cleaning up drift test resources")
-			cmd = exec.Command("kubectl", "delete", "garagekey", driftKeyName,
+			cmd := exec.Command("kubectl", "delete", "garagekey", driftKeyName,
 				"-n", testNamespace, "--ignore-not-found")
 			_, _ = utils.Run(cmd)
 			cmd = exec.Command("kubectl", "delete", "garagebucket", "drift-test-bucket",
@@ -1399,30 +1622,7 @@ spec:
 			verifyGatewayPresent := func(g Gomega) {
 				curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterLayout",
 					adminToken, storageClusterName, testNamespace)
-				cmd := exec.Command("kubectl", "run", "curl-layout-check", "--rm", "-i", "--restart=Never",
-					"-n", testNamespace,
-					"--image=docker.io/curlimages/curl:latest",
-					"--overrides", fmt.Sprintf(`{
-						"spec": {
-							"containers": [{
-								"name": "curl-layout-check",
-								"image": "docker.io/curlimages/curl:latest",
-								"imagePullPolicy": "IfNotPresent",
-								"command": ["/bin/sh", "-c"],
-								"args": [%q],
-								"securityContext": {
-									"readOnlyRootFilesystem": true,
-									"allowPrivilegeEscalation": false,
-									"capabilities": {"drop": ["ALL"]},
-									"runAsNonRoot": true,
-									"runAsUser": 1000,
-									"seccompProfile": {"type": "RuntimeDefault"}
-								}
-							}]
-						}
-					}`, curlCmd))
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to query layout: %s", output)
+				output := runCurlPod(g, testNamespace, "curl-layout-check", curlCmd)
 
 				var layout struct {
 					Roles []struct {
@@ -1481,30 +1681,7 @@ spec:
 			getGatewayNodeID := func(g Gomega) {
 				curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterStatus",
 					adminToken, storageClusterName, testNamespace)
-				cmd := exec.Command("kubectl", "run", "curl-get-node-id", "--rm", "-i", "--restart=Never",
-					"-n", testNamespace,
-					"--image=docker.io/curlimages/curl:latest",
-					"--overrides", fmt.Sprintf(`{
-						"spec": {
-							"containers": [{
-								"name": "curl-get-node-id",
-								"image": "docker.io/curlimages/curl:latest",
-								"imagePullPolicy": "IfNotPresent",
-								"command": ["/bin/sh", "-c"],
-								"args": [%q],
-								"securityContext": {
-									"readOnlyRootFilesystem": true,
-									"allowPrivilegeEscalation": false,
-									"capabilities": {"drop": ["ALL"]},
-									"runAsNonRoot": true,
-									"runAsUser": 1000,
-									"seccompProfile": {"type": "RuntimeDefault"}
-								}
-							}]
-						}
-					}`, curlCmd))
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to query cluster status: %s", output)
+				output := runCurlPod(g, testNamespace, "curl-get-node-id", curlCmd)
 
 				var status struct {
 					Nodes []struct {
@@ -1566,30 +1743,7 @@ spec:
 			verifyNodeIDPreserved := func(g Gomega) {
 				curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterStatus",
 					adminToken, storageClusterName, testNamespace)
-				cmd := exec.Command("kubectl", "run", "curl-check-node-id", "--rm", "-i", "--restart=Never",
-					"-n", testNamespace,
-					"--image=docker.io/curlimages/curl:latest",
-					"--overrides", fmt.Sprintf(`{
-						"spec": {
-							"containers": [{
-								"name": "curl-check-node-id",
-								"image": "docker.io/curlimages/curl:latest",
-								"imagePullPolicy": "IfNotPresent",
-								"command": ["/bin/sh", "-c"],
-								"args": [%q],
-								"securityContext": {
-									"readOnlyRootFilesystem": true,
-									"allowPrivilegeEscalation": false,
-									"capabilities": {"drop": ["ALL"]},
-									"runAsNonRoot": true,
-									"runAsUser": 1000,
-									"seccompProfile": {"type": "RuntimeDefault"}
-								}
-							}]
-						}
-					}`, curlCmd))
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to query cluster status: %s", output)
+				output := runCurlPod(g, testNamespace, "curl-check-node-id", curlCmd)
 
 				var status struct {
 					Nodes []struct {
@@ -1630,30 +1784,7 @@ spec:
 			verifyLayoutClean := func(g Gomega) {
 				curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterLayout",
 					adminToken, storageClusterName, testNamespace)
-				cmd := exec.Command("kubectl", "run", "curl-layout-final", "--rm", "-i", "--restart=Never",
-					"-n", testNamespace,
-					"--image=docker.io/curlimages/curl:latest",
-					"--overrides", fmt.Sprintf(`{
-						"spec": {
-							"containers": [{
-								"name": "curl-layout-final",
-								"image": "docker.io/curlimages/curl:latest",
-								"imagePullPolicy": "IfNotPresent",
-								"command": ["/bin/sh", "-c"],
-								"args": [%q],
-								"securityContext": {
-									"readOnlyRootFilesystem": true,
-									"allowPrivilegeEscalation": false,
-									"capabilities": {"drop": ["ALL"]},
-									"runAsNonRoot": true,
-									"runAsUser": 1000,
-									"seccompProfile": {"type": "RuntimeDefault"}
-								}
-							}]
-						}
-					}`, curlCmd))
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to query cluster layout: %s", output)
+				output := runCurlPod(g, testNamespace, "curl-layout-final", curlCmd)
 
 				var layout struct {
 					Roles []struct {
@@ -1702,30 +1833,7 @@ spec:
 			verifyLayoutRoles := func(g Gomega) {
 				curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterLayout",
 					adminToken, storageClusterName, testNamespace)
-				cmd := exec.Command("kubectl", "run", "curl-layout-roles", "--rm", "-i", "--restart=Never",
-					"-n", testNamespace,
-					"--image=docker.io/curlimages/curl:latest",
-					"--overrides", fmt.Sprintf(`{
-						"spec": {
-							"containers": [{
-								"name": "curl-layout-roles",
-								"image": "docker.io/curlimages/curl:latest",
-								"imagePullPolicy": "IfNotPresent",
-								"command": ["/bin/sh", "-c"],
-								"args": [%q],
-								"securityContext": {
-									"readOnlyRootFilesystem": true,
-									"allowPrivilegeEscalation": false,
-									"capabilities": {"drop": ["ALL"]},
-									"runAsNonRoot": true,
-									"runAsUser": 1000,
-									"seccompProfile": {"type": "RuntimeDefault"}
-								}
-							}]
-						}
-					}`, curlCmd))
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to query layout: %s", output)
+				output := runCurlPod(g, testNamespace, "curl-layout-roles", curlCmd)
 
 				// Parse the layout JSON
 				var layout struct {
@@ -1755,52 +1863,24 @@ spec:
 		It("should remove gateway node from layout when gateway cluster is deleted", func() {
 			By("deleting the gateway cluster")
 			cmd := exec.Command("kubectl", "delete", "garagecluster", gatewayClusterName,
-				"-n", testNamespace, "--wait=true", "--timeout=60s")
+				"-n", testNamespace, "--wait=false")
 			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to delete gateway cluster: %s", output)
 
-			By("waiting for gateway cluster deletion to complete")
+			By("waiting for Garage metadata sync and gateway cluster deletion to complete")
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "garagecluster", gatewayClusterName,
 					"-n", testNamespace)
 				_, err := utils.Run(cmd)
 				g.Expect(err).To(HaveOccurred(), "Gateway cluster should be deleted")
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+			}, 10*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("verifying gateway node removed from storage cluster layout")
 			adminToken := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 			verifyGatewayRemoved := func(g Gomega) {
-				// Force-delete any existing curl pod from previous retry attempts
-				cleanupCmd := exec.Command("kubectl", "delete", "pod", "curl-layout-cleanup",
-					"-n", testNamespace, "--ignore-not-found", "--force", "--grace-period=0")
-				_, _ = utils.Run(cleanupCmd)
-
 				curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterLayout",
 					adminToken, storageClusterName, testNamespace)
-				cmd := exec.Command("kubectl", "run", "curl-layout-cleanup", "--rm", "-i", "--restart=Never",
-					"-n", testNamespace,
-					"--image=docker.io/curlimages/curl:latest",
-					"--overrides", fmt.Sprintf(`{
-						"spec": {
-							"containers": [{
-								"name": "curl-layout-cleanup",
-								"image": "docker.io/curlimages/curl:latest",
-								"imagePullPolicy": "IfNotPresent",
-								"command": ["/bin/sh", "-c"],
-								"args": [%q],
-								"securityContext": {
-									"readOnlyRootFilesystem": true,
-									"allowPrivilegeEscalation": false,
-									"capabilities": {"drop": ["ALL"]},
-									"runAsNonRoot": true,
-									"runAsUser": 1000,
-									"seccompProfile": {"type": "RuntimeDefault"}
-								}
-							}]
-						}
-					}`, curlCmd))
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to query layout: %s", output)
+				output := runCurlPod(g, testNamespace, "curl-layout-cleanup", curlCmd)
 
 				var layout struct {
 					Roles []struct {
@@ -1843,36 +1923,29 @@ spec:
 		})
 
 		It("should support scale subresource", func() {
-			By("verifying status.selector is populated")
-			verifySelectorPopulated := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "garagecluster", storageClusterName,
-					"-n", testNamespace, "-o", "jsonpath={.status.selector}")
-				output, err := utils.Run(cmd)
+			By("verifying the real Scale endpoint reports the exact default-group workload")
+			Eventually(func(g Gomega) {
+				scale, err := readGarageClusterScale("v1beta2", testNamespace, storageClusterName)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).NotTo(BeEmpty(), "status.selector should be populated")
-				// Post-#190: per-node pods carry labelCluster (storage tier is N×GarageNodes).
-				// The cluster-wide selector now keys on garage.rajsingh.info/cluster.
-				g.Expect(output).To(ContainSubstring("garage.rajsingh.info/cluster=" + storageClusterName))
-			}
-			Eventually(verifySelectorPopulated, 30*time.Second, 2*time.Second).Should(Succeed())
-
-			By("verifying status.replicas matches spec.replicas")
-			cmd := exec.Command("kubectl", "get", "garagecluster", storageClusterName,
-				"-n", testNamespace, "-o", "jsonpath={.status.replicas}")
-			output, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(Equal("1"), "status.replicas should match spec")
+				g.Expect(scale.Spec.Replicas).To(Equal(int32(1)))
+				g.Expect(scale.Status.Replicas).To(Equal(int32(1)))
+				g.Expect(scale.Status.Selector).To(Equal(
+					"garage.rajsingh.info/cluster=" + storageClusterName +
+						",garage.rajsingh.info/storage-group=default" +
+						",garage.rajsingh.info/tier=storage",
+				))
+			}, 30*time.Second, 2*time.Second).Should(Succeed())
 
 			By("scaling up via kubectl scale")
-			cmd = exec.Command("kubectl", "scale", "garagecluster", storageClusterName,
+			cmd := exec.Command("kubectl", "scale", "garagecluster", storageClusterName,
 				"-n", testNamespace, "--replicas=2")
-			_, err = utils.Run(cmd)
+			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "kubectl scale should succeed")
 
 			By("verifying spec.storage.replicas was updated by scale subresource")
 			cmd = exec.Command("kubectl", "get", "garagecluster", storageClusterName,
 				"-n", testNamespace, "-o", "jsonpath={.spec.storage.replicas}")
-			output, err = utils.Run(cmd)
+			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(Equal("2"), "spec.storage.replicas should be updated to 2")
 
@@ -1886,23 +1959,69 @@ spec:
 			}
 			Eventually(verifyScaledReady, 3*time.Minute, 5*time.Second).Should(Succeed())
 
+			By("waiting for the exact scale-up identity and its parent rollout generation to converge")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "garagenode", storageClusterName+"-storage-1",
+					"-n", testNamespace,
+					"-o", "jsonpath={.metadata.generation}/{.status.observedGeneration}/{.status.nodeId}/{.status.connected}/{.status.inLayout}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				parts := strings.Split(output, "/")
+				g.Expect(parts).To(HaveLen(5))
+				g.Expect(parts[1]).To(Equal(parts[0]), "GarageNode has not observed its current generation: %q", output)
+				g.Expect(parts[2]).NotTo(BeEmpty(), "GarageNode has not discovered its durable identity: %q", output)
+				g.Expect(parts[3:]).To(Equal([]string{"true", "true"}), "GarageNode has not entered the committed layout: %q", output)
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "garagecluster", storageClusterName,
+					"-n", testNamespace,
+					"-o", `jsonpath={.metadata.generation}/{.status.conditions[?(@.type=="StorageRolloutReady")].observedGeneration}/{.status.conditions[?(@.type=="StorageRolloutReady")].status}/{.status.conditions[?(@.type=="StorageRolloutReady")].reason}`)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				parts := strings.Split(output, "/")
+				g.Expect(parts).To(HaveLen(4))
+				g.Expect(parts[1]).To(Equal(parts[0]), "storage rollout condition is stale: %q", output)
+				g.Expect(parts[2:]).To(Equal([]string{"True", "Converged"}), "storage rollout is not converged: %q", output)
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
 			By("scaling back down to 1")
 			cmd = exec.Command("kubectl", "scale", "garagecluster", storageClusterName,
 				"-n", testNamespace, "--replicas=1")
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("waiting for scale down")
+			By("proving scale-down starts a reversible drain while the source remains live")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "garagenode", storageClusterName+"-storage-1",
+					"-n", testNamespace,
+					"-o", `go-template={{ index .metadata.annotations "garage.rajsingh.info/drain" }}|{{ .metadata.deletionTimestamp }}`)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("true|<no value>"),
+					"the parent must complete reversible drain preparation before issuing DELETE")
+
+				cmd = exec.Command("kubectl", "get", "pod", storageClusterName+"-storage-1-0",
+					"-n", testNamespace,
+					"-o", `jsonpath={.status.phase}/{.status.conditions[?(@.type=="Ready")].status}`)
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("Running/True"),
+					"the retiring source Pod must remain Ready throughout block-resync proof")
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("waiting for the full clean drain proof and serialized scale down")
+			// Garage v2.3 schedules block GC after 610 seconds. This bound covers
+			// that exact proof plus reconciliation; it is not a generic rollout wait.
 			verifyScaledDown := func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "pods", "-n", testNamespace,
 					"-l", fmt.Sprintf("app.kubernetes.io/instance=%s", storageClusterName),
-					"--no-headers")
+					"-o", "name")
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				lines := strings.Split(strings.TrimSpace(output), "\n")
-				g.Expect(len(lines)).To(Equal(1), "expected 1 pod, got %d", len(lines))
+				pods := strings.Fields(output)
+				g.Expect(pods).To(HaveLen(1), "expected 1 pod, got %d: %q", len(pods), output)
 			}
-			Eventually(verifyScaledDown, 2*time.Minute, 5*time.Second).Should(Succeed())
+			Eventually(verifyScaledDown, 20*time.Minute, 5*time.Second).Should(Succeed())
 		})
 	})
 })
@@ -2199,11 +2318,39 @@ var _ = Describe("Factor Migration", Ordered, Label("factor-migration"), func() 
 	})
 
 	AfterAll(func() {
-		cmd := exec.Command("kubectl", "delete", "garagecluster", clusterName, "-n", testNamespace, "--ignore-not-found")
-		_, _ = utils.Run(cmd)
+		// Bounded on purpose. This cluster's finalizer is fail-closed: if the
+		// migration left the layout in a state it cannot prove safe to release,
+		// the delete blocks indefinitely. Unbounded, that silently consumed the
+		// whole shard's remaining budget (~23 min observed) and every later spec
+		// died with no attribution. Time-box it and say so, so a stuck finalizer
+		// is reported as itself instead of a shard-wide timeout.
+		cmd := exec.Command("kubectl", "delete", "garagecluster", clusterName,
+			"-n", testNamespace, "--ignore-not-found", "--timeout=3m")
+		if out, err := utils.Run(cmd); err != nil {
+			AddReportEntry("factor-migration cleanup: GarageCluster delete did not complete within 3m",
+				fmt.Sprintf("error=%v output=%s", err, out))
+			_, _ = utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+				"-n", testNamespace, "-o", "jsonpath={.status.factorMigration}{\"\\n\"}{.status.conditions}"))
+			// Drop the finalizer so teardown is deterministic. Everything after
+			// this point blocks on it: the namespace cannot finish Terminating,
+			// and `make uninstall` deletes the CRD, which waits on the CR. Undeploy
+			// removes the operator, so nothing would ever clear it on its own.
+			// Reported above, so a stuck finalizer still fails the spec loudly
+			// instead of being absorbed by whatever times out first.
+			_, _ = utils.Run(exec.Command("kubectl", "patch", "garagecluster", clusterName,
+				"-n", testNamespace, "--type=merge", "-p", `{"metadata":{"finalizers":null}}`))
+		}
 		time.Sleep(10 * time.Second)
-		cmd = exec.Command("kubectl", "delete", "ns", testNamespace, "--ignore-not-found")
-		_, _ = utils.Run(cmd)
+		// Also bounded, and for a sharper reason than tidiness: a namespace cannot
+		// finish Terminating while a GarageCluster in it still holds its finalizer,
+		// so an unbounded delete here inherits the stuck finalizer above and blocks
+		// forever. That is what converted a single spec failure into a whole-shard
+		// Go timeout, which reports as "40m elapsed" and attributes nothing.
+		cmd = exec.Command("kubectl", "delete", "ns", testNamespace, "--ignore-not-found", "--timeout=2m")
+		if out, err := utils.Run(cmd); err != nil {
+			AddReportEntry("factor-migration cleanup: namespace delete did not complete within 2m",
+				fmt.Sprintf("error=%v output=%s", err, out))
+		}
 		cmd = exec.Command("make", "undeploy")
 		_, _ = utils.Run(cmd)
 		cmd = exec.Command("make", "uninstall")
@@ -2258,10 +2405,10 @@ spec:
 	})
 
 	It("reduces the replication factor from 2 to 1 via purge-cluster-layout", func() {
-		By("patching spec.replication.factor=1")
+		By("atomically patching spec.replication.factor=1 and requesting the coordinated purge")
 		patchFactor := func(g Gomega) {
 			c := exec.Command("kubectl", "patch", "garagecluster", clusterName, "-n", testNamespace,
-				"--type=merge", "-p", `{"spec":{"replication":{"factor":1}}}`)
+				"--type=merge", "-p", `{"metadata":{"annotations":{"garage.rajsingh.info/purge-cluster-layout":"factor=1"}},"spec":{"replication":{"factor":1}}}`)
 			out, err := utils.Run(c)
 			g.Expect(err).NotTo(HaveOccurred(), "patch factor: %s", out)
 		}
@@ -2277,12 +2424,6 @@ spec:
 		}
 		Eventually(verifyFactor, time.Minute, 5*time.Second).Should(Succeed())
 
-		By("setting the purge-cluster-layout annotation")
-		cmd := exec.Command("kubectl", "annotate", "garagecluster", clusterName, "-n", testNamespace,
-			"garage.rajsingh.info/purge-cluster-layout=factor=1", "--overwrite")
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred())
-
 		By("waiting for the migration to reach Completed (fail fast with the message on Failed)")
 		verifyCompleted := func(g Gomega) {
 			cmd := exec.Command("kubectl", "get", "garagecluster", clusterName, "-n", testNamespace,
@@ -2295,7 +2436,12 @@ spec:
 			}
 			g.Expect(phase).To(Equal("Completed"), "factorMigration=%s", out)
 		}
-		Eventually(verifyCompleted, 12*time.Minute, 10*time.Second).Should(Succeed())
+		// Must outlast fmStuckTimeout (15m), which is what makes the Failed branch
+		// above reachable: the operator aborts a wedged phase itself and says which
+		// precondition went unmet. Giving up first replaces that with a bare
+		// timeout. Costs nothing when the migration converges — this returns as
+		// soon as the phase reads Completed, typically in about a minute.
+		Eventually(verifyCompleted, 16*time.Minute, 10*time.Second).Should(Succeed())
 	})
 
 	It("returns to Running with both storage nodes still present (identity + data preserved)", func() {
@@ -2793,6 +2939,11 @@ var _ = Describe("Manual Mode with GarageNodes", Ordered, Label("manual-mode"), 
 	const clusterName = "manual-cluster"
 	const node1Name = "garage-node-1"
 	const node2Name = "garage-node-2"
+	const netNodeName = "garage-node-net"
+	const existingClaimNodeName = "garage-node-existing-claim"
+	const staticSelectorNodeName = "garage-node-static-selector"
+	const staticMetadataPVName = "garage-manual-static-metadata"
+	const staticDataPVName = "garage-manual-static-data"
 
 	BeforeAll(func() {
 		By("creating manager namespace")
@@ -2846,18 +2997,28 @@ var _ = Describe("Manual Mode with GarageNodes", Ordered, Label("manual-mode"), 
 
 	AfterAll(func() {
 		By("cleaning up test resources")
-		cmd := exec.Command("kubectl", "delete", "garagekey", "--all", "-n", testNamespace, "--ignore-not-found")
+		cmd := exec.Command("kubectl", "delete", "garagekey", "--all", "-n", testNamespace,
+			"--ignore-not-found", "--timeout=2m")
 		_, _ = utils.Run(cmd)
-		cmd = exec.Command("kubectl", "delete", "garagebucket", "--all", "-n", testNamespace, "--ignore-not-found")
+		cmd = exec.Command("kubectl", "delete", "garagebucket", "--all", "-n", testNamespace,
+			"--ignore-not-found", "--timeout=2m")
 		_, _ = utils.Run(cmd)
-		cmd = exec.Command("kubectl", "delete", "garagenode", node1Name, "-n", testNamespace, "--ignore-not-found")
+
+		// This is whole-store teardown, not a scale-down. Deleting either of the
+		// final two factor-2 storage nodes individually is intentionally held by
+		// its finalizer. Mark the parent deleting first so Manual GarageNodes can
+		// release their finalizers without attempting overlapping layout writes.
+		cmd = exec.Command("kubectl", "delete", "garagecluster", clusterName, "-n", testNamespace,
+			"--ignore-not-found", "--timeout=2m")
 		_, _ = utils.Run(cmd)
-		cmd = exec.Command("kubectl", "delete", "garagenode", node2Name, "-n", testNamespace, "--ignore-not-found")
+		cmd = exec.Command("kubectl", "delete", "garagenode", "--all", "-n", testNamespace,
+			"--ignore-not-found", "--timeout=2m")
 		_, _ = utils.Run(cmd)
-		cmd = exec.Command("kubectl", "delete", "garagecluster", clusterName, "-n", testNamespace, "--ignore-not-found")
+		cmd = exec.Command("kubectl", "delete", "ns", testNamespace,
+			"--ignore-not-found", "--timeout=2m")
 		_, _ = utils.Run(cmd)
-		time.Sleep(10 * time.Second) // Wait for cleanup
-		cmd = exec.Command("kubectl", "delete", "ns", testNamespace, "--ignore-not-found")
+		cmd = exec.Command("kubectl", "delete", "pv", staticMetadataPVName, staticDataPVName,
+			"--ignore-not-found", "--timeout=2m")
 		_, _ = utils.Run(cmd)
 
 		By("undeploying the controller-manager")
@@ -3089,14 +3250,308 @@ spec:
 			Eventually(verifyNodesConnected, 3*time.Minute, 10*time.Second).Should(Succeed())
 		})
 
-		It("should have cluster healthy with 2 connected nodes", func() {
+		It("should bind metadata and data selectors to distinct static PVs without retargeting retained claims", func() {
+			const staticClass = "garage-manual-static"
+			const staticBase = "/tmp/garage-e2e-manual-static"
+			const metadataClaim = "metadata-" + staticSelectorNodeName + "-0"
+			const dataClaim = "data-" + staticSelectorNodeName + "-0"
+
+			By("provisioning explicit writable directories on the dedicated Kind node")
+			cmd := exec.Command("kubectl", "get", "nodes", "-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			nodeNames := strings.Fields(output)
+			Expect(nodeNames).To(HaveLen(1), "the static-PV fixture expects the shard's one-node Kind cluster")
+			cmd = exec.Command("docker", "exec", nodeNames[0], "sh", "-ec",
+				`mkdir -p "$1/metadata" "$1/data" && chown -R 1000:1000 "$1" && chmod -R 0770 "$1"`,
+				"garage-static-fixture", staticBase)
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to provision static-PV directories: %s", output)
+
+			By("creating two labeled pre-provisioned PersistentVolumes")
+			volumesYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: %s
+  labels:
+    garage.rajsingh.info/e2e-static-volume: metadata
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: %s
+  hostPath:
+    path: %s/metadata
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: %s
+  labels:
+    garage.rajsingh.info/e2e-static-volume: data
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: %s
+  hostPath:
+    path: %s/data
+    type: Directory
+`, staticMetadataPVName, staticClass, staticBase, staticDataPVName, staticClass, staticBase)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(volumesYAML)
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create static PersistentVolumes: %s", output)
+
+			By("creating a GarageNode whose new claim templates select those exact PV profiles")
+			nodeYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta1
+kind: GarageNode
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+  zone: zone-static
+  capacity: 2Gi
+  storage:
+    metadata:
+      size: 100Mi
+      storageClassName: %s
+      selector:
+        matchLabels:
+          garage.rajsingh.info/e2e-static-volume: metadata
+    data:
+      size: 1Gi
+      storageClassName: %s
+      selector:
+        matchLabels:
+          garage.rajsingh.info/e2e-static-volume: data
+  resources:
+    limits:
+      memory: 256Mi
+    requests:
+      memory: 128Mi
+`, staticSelectorNodeName, testNamespace, clusterName, staticClass, staticClass)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(nodeYAML)
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create selector-backed GarageNode: %s", output)
+
+			Eventually(func(g Gomega) {
+				for claimName, wantPV := range map[string]string{
+					metadataClaim: staticMetadataPVName,
+					dataClaim:     staticDataPVName,
+				} {
+					cmd := exec.Command("kubectl", "get", "pvc", claimName, "-n", testNamespace,
+						"-o", "jsonpath={.status.phase}/{.spec.volumeName}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).To(Equal("Bound/" + wantPV))
+				}
+				cmd := exec.Command("kubectl", "get", "garagenode", staticSelectorNodeName,
+					"-n", testNamespace, "-o", "jsonpath={.status.nodeId}/{.status.connected}/{.status.inLayout}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				parts := strings.Split(output, "/")
+				g.Expect(parts).To(HaveLen(3))
+				g.Expect(parts[0]).To(MatchRegexp(`^[0-9a-f]{64}$`))
+				g.Expect(parts[1:]).To(Equal([]string{"true", "true"}))
+			}, 4*time.Minute, 10*time.Second).Should(Succeed())
+
+			uidFor := func(kind, name string) string {
+				cmd := exec.Command("kubectl", "get", kind, name, "-n", testNamespace,
+					"-o", "jsonpath={.metadata.uid}")
+				output, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(output).NotTo(BeEmpty())
+				return output
+			}
+			metadataUID := uidFor("pvc", metadataClaim)
+			dataUID := uidFor("pvc", dataClaim)
+			podUID := uidFor("pod", staticSelectorNodeName+"-0")
+			cmd = exec.Command("kubectl", "get", "garagenode", staticSelectorNodeName,
+				"-n", testNamespace, "-o", "jsonpath={.status.nodeId}")
+			originalNodeID, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("rejecting a live selector retarget before it can rewrite an immutable claim template")
+			selectorPatch := `[{"op":"replace","path":"/spec/storage/metadata/selector/matchLabels/garage.rajsingh.info~1e2e-static-volume","value":"wrong"}]`
+			cmd = exec.Command("kubectl", "patch", "garagenode", staticSelectorNodeName,
+				"-n", testNamespace, "--type=json", "-p", selectorPatch)
+			output, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "live selector retarget unexpectedly succeeded: %s", output)
+			Expect(output).To(ContainSubstring("immutable"))
+
+			By("replacing the Pod while retaining the exact bound claims and Garage identity")
+			cmd = exec.Command("kubectl", "delete", "pod", staticSelectorNodeName+"-0", "-n", testNamespace)
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to replace selector-backed Pod: %s", output)
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pod", staticSelectorNodeName+"-0",
+					"-n", testNamespace,
+					"-o", "jsonpath={.metadata.uid}/{.status.conditions[?(@.type=='Ready')].status}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				podParts := strings.Split(output, "/")
+				g.Expect(podParts).To(HaveLen(2))
+				g.Expect(podParts[0]).NotTo(BeEmpty())
+				g.Expect(podParts[0]).NotTo(Equal(podUID))
+				g.Expect(podParts[1]).To(Equal("True"))
+				for claimName, wantUID := range map[string]string{
+					metadataClaim: metadataUID,
+					dataClaim:     dataUID,
+				} {
+					cmd = exec.Command("kubectl", "get", "pvc", claimName, "-n", testNamespace,
+						"-o", "jsonpath={.metadata.uid}")
+					output, err = utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).To(Equal(wantUID))
+				}
+				cmd = exec.Command("kubectl", "get", "garagenode", staticSelectorNodeName,
+					"-n", testNamespace,
+					"-o", "jsonpath={.status.nodeId}/{.status.observedPodUid}/{.status.connected}/{.status.inLayout}")
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal(originalNodeID + "/" + podParts[0] + "/true/true"))
+			}, 4*time.Minute, 10*time.Second).Should(Succeed())
+		})
+
+		It("should reject an existingClaim cycle without changing the live Pod or claims", func() {
+			const metadataClaim = existingClaimNodeName + "-metadata"
+			const dataClaim = existingClaimNodeName + "-data"
+			By("creating user-managed metadata and data claims")
+			claimsYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+`, metadataClaim, testNamespace, dataClaim, testNamespace)
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(claimsYAML)
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create existingClaim fixtures: %s", output)
+
+			By("creating and fully establishing an ordinary existingClaim GarageNode")
+			nodeYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta1
+kind: GarageNode
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+  zone: zone-c
+  capacity: 1Gi
+  storage:
+    metadata:
+      existingClaim: %s
+    data:
+      existingClaim: %s
+  resources:
+    limits:
+      memory: 256Mi
+    requests:
+      memory: 128Mi
+`, existingClaimNodeName, testNamespace, clusterName, metadataClaim, dataClaim)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(nodeYAML)
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create existingClaim GarageNode: %s", output)
+
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "garagenode", existingClaimNodeName,
+					"-n", testNamespace,
+					"-o", "jsonpath={.status.nodeId}/{.status.observedPodUid}/{.status.connected}/{.status.inLayout}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				parts := strings.Split(output, "/")
+				g.Expect(parts).To(HaveLen(4))
+				g.Expect(parts[0]).To(MatchRegexp(`^[0-9a-f]{64}$`))
+				g.Expect(parts[1]).NotTo(BeEmpty())
+				g.Expect(parts[2:]).To(Equal([]string{"true", "true"}))
+
+				cmd = exec.Command("kubectl", "get", "pod", existingClaimNodeName+"-0",
+					"-n", testNamespace, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("True"))
+
+				for _, claimName := range []string{metadataClaim, dataClaim} {
+					cmd = exec.Command("kubectl", "get", "pvc", claimName, "-n", testNamespace,
+						"-o", "jsonpath={.status.phase}")
+					output, err = utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).To(Equal("Bound"))
+				}
+			}, 4*time.Minute, 10*time.Second).Should(Succeed())
+
+			uidFor := func(kind, name string) string {
+				cmd := exec.Command("kubectl", "get", kind, name, "-n", testNamespace,
+					"-o", "jsonpath={.metadata.uid}")
+				output, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(output).NotTo(BeEmpty())
+				return output
+			}
+			podUID := uidFor("pod", existingClaimNodeName+"-0")
+			metadataPVCUID := uidFor("pvc", metadataClaim)
+			dataPVCUID := uidFor("pvc", dataClaim)
+
+			By("requesting the forbidden automatic cycle through the real validating webhook")
+			cmd = exec.Command("kubectl", "annotate", "garagenode", existingClaimNodeName,
+				"-n", testNamespace, "garage.rajsingh.info/cycle=true")
+			output, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "existingClaim cycle unexpectedly succeeded: %s", output)
+			Expect(output).To(ContainSubstring("existingClaim"))
+
+			By("proving admission left the exact source actors untouched and created no sibling")
+			Expect(uidFor("pod", existingClaimNodeName+"-0")).To(Equal(podUID))
+			Expect(uidFor("pvc", metadataClaim)).To(Equal(metadataPVCUID))
+			Expect(uidFor("pvc", dataClaim)).To(Equal(dataPVCUID))
+			cmd = exec.Command("kubectl", "get", "garagenode", existingClaimNodeName+"-cycle",
+				"-n", testNamespace, "--ignore-not-found", "-o", "name")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(output)).To(BeEmpty())
+			cmd = exec.Command("kubectl", "get", "garagenode", existingClaimNodeName,
+				"-n", testNamespace, "-o", "jsonpath={.metadata.annotations}")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).NotTo(ContainSubstring("garage.rajsingh.info/cycle"))
+		})
+
+		It("should have the cluster healthy with all 4 established storage nodes", func() {
 			By("verifying cluster health")
 			verifyClusterHealth := func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "garagecluster", clusterName,
 					"-n", testNamespace, "-o", "jsonpath={.status.health.connectedNodes}")
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("2"), "Expected 2 connected nodes, got %s", output)
+				g.Expect(output).To(Equal("4"), "Expected 4 connected nodes, got %s", output)
 			}
 			Eventually(verifyClusterHealth, 3*time.Minute, 10*time.Second).Should(Succeed())
 		})
@@ -3274,46 +3729,67 @@ spec:
 			_, _ = utils.Run(cmd)
 		})
 
-		It("should delete nodes and remove from layout", func() {
-			By("deleting GarageNode 2")
-			cmd := exec.Command("kubectl", "delete", "garagenode", node2Name, "-n", testNamespace)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to delete GarageNode 2")
+		It("should reject an unprepared unsafe individual node deletion", func() {
+			By("requesting deletion of GarageNode 2 without first preparing its drain")
+			cmd := exec.Command("kubectl", "delete", "garagenode", node2Name,
+				"-n", testNamespace, "--wait=false")
+			output, err := utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "unprepared positive-capacity deletion must be rejected")
+			Expect(output).To(ContainSubstring("prepared operation"),
+				"admission should explain the drain-first contract: %s", output)
 
-			By("waiting for node 2 to be removed")
-			verifyNodeDeleted := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "garagenode", node2Name, "-n", testNamespace)
-				_, err := utils.Run(cmd)
-				g.Expect(err).To(HaveOccurred(), "GarageNode 2 should be deleted")
-			}
-			Eventually(verifyNodeDeleted, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("verifying StatefulSet 2 is also deleted")
-			verifyStatefulSetDeleted := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "statefulset", node2Name, "-n", testNamespace)
-				_, err := utils.Run(cmd)
-				g.Expect(err).To(HaveOccurred(), "StatefulSet 2 should be deleted")
-			}
-			Eventually(verifyStatefulSetDeleted, 2*time.Minute, 5*time.Second).Should(Succeed())
+			By("verifying rejected admission left the GarageNode and StatefulSet online")
+			cmd = exec.Command("kubectl", "get", "garagenode", node2Name,
+				"-n", testNamespace, "-o", "jsonpath={.metadata.deletionTimestamp}")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(BeEmpty(), "rejected deletion must not set deletionTimestamp")
+			cmd = exec.Command("kubectl", "get", "statefulset", node2Name,
+				"-n", testNamespace, "-o", "jsonpath={.status.readyReplicas}")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "unsafe deletion must not reap the storage workload")
+			Expect(output).To(Equal("1"), "GarageNode StatefulSet should remain Ready")
 		})
 	})
 
 	Context("Per-node networking features", Ordered, func() {
-		const netNodeName = "garage-node-net"
+		var initialConfigName string
 
-		AfterAll(func() {
-			cmd := exec.Command("kubectl", "delete", "garagenode", netNodeName,
-				"-n", testNamespace, "--ignore-not-found")
-			_, _ = utils.Run(cmd)
-			cmd = exec.Command("kubectl", "delete", "service", netNodeName+"-rpc",
-				"-n", testNamespace, "--ignore-not-found")
-			_, _ = utils.Run(cmd)
-			cmd = exec.Command("kubectl", "delete", "configmap", netNodeName+"-config",
-				"-n", testNamespace, "--ignore-not-found")
-			_, _ = utils.Run(cmd)
-		})
+		mountedNodeConfig := func(g Gomega) (string, string) {
+			cmd := exec.Command("kubectl", "get", "statefulset", netNodeName,
+				"-n", testNamespace,
+				"-o", "jsonpath={.spec.template.spec.volumes[?(@.name=='config')].configMap.name}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred(), "GarageNode StatefulSet not found")
+			if err != nil {
+				return "", ""
+			}
+			configName := strings.TrimSpace(output)
+			g.Expect(configName).To(HavePrefix(clusterName+"-nodecfg-"+netNodeName+"-"),
+				"StatefulSet should mount an exact content-addressed per-node ConfigMap, got: %s", configName)
+			if configName == "" {
+				return "", ""
+			}
 
-		It("should create a per-node ConfigMap with rpc_public_addr when spec.network.rpcPublicAddr is set", func() {
+			cmd = exec.Command("kubectl", "get", "configmap", configName,
+				"-n", testNamespace, "-o", "jsonpath={.immutable}{'\\n'}{.data.garage\\.toml}")
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred(),
+				"StatefulSet-mounted per-node ConfigMap %q not found", configName)
+			if err != nil {
+				return configName, ""
+			}
+			parts := strings.SplitN(output, "\n", 2)
+			g.Expect(parts).To(HaveLen(2), "mounted ConfigMap should expose immutability and garage.toml")
+			if len(parts) != 2 {
+				return configName, ""
+			}
+			g.Expect(parts[0]).To(Equal("true"),
+				"per-node Garage config revision must be immutable")
+			return configName, parts[1]
+		}
+
+		It("should mount an immutable per-node ConfigMap revision with rpc_public_addr when spec.network.rpcPublicAddr is set", func() {
 			const staticAddr = "203.0.113.10:3901"
 
 			By("creating GarageNode with spec.network.rpcPublicAddr")
@@ -3347,28 +3823,19 @@ spec:
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create GarageNode with rpcPublicAddr")
 
-			By("waiting for per-node ConfigMap to be created")
+			By("waiting for the StatefulSet to mount its exact per-node ConfigMap revision")
 			verifyConfigMap := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "configmap", netNodeName+"-config",
-					"-n", testNamespace, "-o", "jsonpath={.data.garage\\.toml}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "per-node ConfigMap not found")
-				g.Expect(output).To(ContainSubstring(`rpc_public_addr = "`+staticAddr+`"`),
-					"garage.toml should contain rpc_public_addr = %q, got: %s", staticAddr, output)
+				configName, configBody := mountedNodeConfig(g)
+				g.Expect(configBody).To(ContainSubstring(`rpc_public_addr = "`+staticAddr+`"`),
+					"garage.toml in %s should contain rpc_public_addr = %q, got: %s",
+					configName, staticAddr, configBody)
+				initialConfigName = configName
 			}
 			Eventually(verifyConfigMap, 2*time.Minute, 5*time.Second).Should(Succeed())
 
-			By("verifying the StatefulSet uses the per-node ConfigMap (not cluster ConfigMap)")
-			verifyVolume := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "statefulset", netNodeName,
-					"-n", testNamespace,
-					"-o", "jsonpath={.spec.template.spec.volumes[?(@.name=='config')].configMap.name}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal(netNodeName+"-config"),
-					"StatefulSet should mount per-node ConfigMap, got: %s", output)
-			}
-			Eventually(verifyVolume, 2*time.Minute, 5*time.Second).Should(Succeed())
+			Expect(initialConfigName).NotTo(BeEmpty())
+			Expect(initialConfigName).NotTo(Equal(netNodeName+"-config"),
+				"the retired mutable fixed-name ConfigMap contract must not return")
 		})
 
 		It("should create a per-node NodePort service when spec.publicEndpoint.type is NodePort", func() {
@@ -3431,7 +3898,7 @@ spec:
 			Eventually(verifyPort, 1*time.Minute, 5*time.Second).Should(Succeed())
 		})
 
-		It("should patch the per-node ConfigMap when spec.storage fsync overrides are set", func() {
+		It("should publish a new per-node ConfigMap revision when spec.storage fsync overrides are set", func() {
 			By("patching GarageNode to add metadataFsync override")
 			patchYAML := fmt.Sprintf(`
 apiVersion: garage.rajsingh.info/v1beta1
@@ -3470,14 +3937,14 @@ spec:
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to patch GarageNode with metadataFsync")
 
-			By("verifying per-node ConfigMap contains metadata_fsync = true")
+			By("verifying the StatefulSet mounts a new immutable revision containing metadata_fsync = true")
 			verifyFsync := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "configmap", netNodeName+"-config",
-					"-n", testNamespace, "-o", "jsonpath={.data.garage\\.toml}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("metadata_fsync = true"),
-					"garage.toml should contain metadata_fsync = true, got: %s", output)
+				configName, configBody := mountedNodeConfig(g)
+				g.Expect(configName).NotTo(Equal(initialConfigName),
+					"a config change must publish and mount a new content-addressed revision")
+				g.Expect(configBody).To(ContainSubstring("metadata_fsync = true"),
+					"garage.toml in %s should contain metadata_fsync = true, got: %s",
+					configName, configBody)
 			}
 			Eventually(verifyFsync, 2*time.Minute, 5*time.Second).Should(Succeed())
 		})
@@ -3534,6 +4001,161 @@ spec:
 			}
 			Eventually(verifyPullPolicy, 2*time.Minute, 5*time.Second).Should(Succeed())
 		})
+	})
+
+	It("should prepare and complete deletion after replacement capacity joins", func() {
+		By("waiting for the replacement Manual node to join the layout")
+		verifyReplacementInLayout := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenode", "garage-node-net",
+				"-n", testNamespace, "-o", "jsonpath={.status.inLayout}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("true"), "replacement GarageNode is not in the layout")
+		}
+		Eventually(verifyReplacementInLayout, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("waiting for the preceding GarageNode config rollout to reach its exact final Pod revision")
+		verifyConfigRolloutConverged := func(g Gomega) {
+			assertParentTransactionsIdle := func() {
+				cmd := exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", testNamespace,
+					"-o", `jsonpath={.metadata.generation}|{.status.observedGeneration}|{.status.storageRollout}|{.status.storageDrain}`)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				clusterParts := strings.Split(output, "|")
+				g.Expect(clusterParts).To(HaveLen(4), "unexpected GarageCluster rollout projection: %q", output)
+				if len(clusterParts) != 4 {
+					return
+				}
+				g.Expect(clusterParts[1]).To(Equal(clusterParts[0]),
+					"GarageCluster status has not observed its current generation: %q", output)
+				g.Expect(clusterParts[2:]).To(Equal([]string{"", ""}),
+					"storage rollout or drain transaction remains active: %q", output)
+			}
+			assertParentTransactionsIdle()
+
+			cmd := exec.Command("kubectl", "get", "statefulset", netNodeName,
+				"-n", testNamespace,
+				"-o", `jsonpath={.metadata.uid}|{.metadata.generation}|{.status.observedGeneration}|{.status.replicas}|{.status.readyReplicas}|{.status.updatedReplicas}|{.status.updateRevision}|{.spec.template.spec.volumes[?(@.name=="config")].configMap.name}|{.spec.template.spec.containers[0].imagePullPolicy}`)
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			statefulSetParts := strings.Split(output, "|")
+			g.Expect(statefulSetParts).To(HaveLen(9), "unexpected StatefulSet rollout projection: %q", output)
+			if len(statefulSetParts) != 9 {
+				return
+			}
+			g.Expect(statefulSetParts[0]).NotTo(BeEmpty())
+			g.Expect(statefulSetParts[2]).To(Equal(statefulSetParts[1]),
+				"StatefulSet controller has not observed its current generation: %q", output)
+			g.Expect(statefulSetParts[3:6]).To(Equal([]string{"1", "1", "1"}),
+				"StatefulSet must have exactly one updated and Ready replica: %q", output)
+			g.Expect(statefulSetParts[6]).NotTo(BeEmpty())
+			g.Expect(statefulSetParts[7]).NotTo(BeEmpty())
+			g.Expect(statefulSetParts[8]).To(Equal("IfNotPresent"))
+
+			cmd = exec.Command("kubectl", "get", "pod", netNodeName+"-0",
+				"-n", testNamespace,
+				"-o", `jsonpath={.metadata.uid}|{.metadata.ownerReferences[?(@.controller==true)].uid}|{.metadata.deletionTimestamp}|{.metadata.labels.controller-revision-hash}|{.status.conditions[?(@.type=="Ready")].status}|{.spec.volumes[?(@.name=="config")].configMap.name}|{.spec.containers[0].imagePullPolicy}`)
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			podParts := strings.Split(output, "|")
+			g.Expect(podParts).To(HaveLen(7), "unexpected Pod rollout projection: %q", output)
+			if len(podParts) != 7 {
+				return
+			}
+			g.Expect(podParts[0]).NotTo(BeEmpty())
+			g.Expect(podParts[1]).To(Equal(statefulSetParts[0]),
+				"current Pod is not controller-owned by the exact StatefulSet UID")
+			g.Expect(podParts[2]).To(BeEmpty(), "current Pod is already deleting")
+			g.Expect(podParts[3]).To(Equal(statefulSetParts[6]),
+				"current Pod is not on the StatefulSet's exact update revision")
+			g.Expect(podParts[4]).To(Equal("True"))
+			g.Expect(podParts[5]).To(Equal(statefulSetParts[7]),
+				"current Pod does not mount the StatefulSet's final config revision")
+			g.Expect(podParts[6]).To(Equal("IfNotPresent"))
+
+			cmd = exec.Command("kubectl", "get", "garagenode", netNodeName,
+				"-n", testNamespace,
+				"-o", `jsonpath={.metadata.generation}|{.status.observedGeneration}|{.status.observedPodUid}|{.status.connected}|{.status.inLayout}|{.status.conditions[?(@.type=="Ready")].observedGeneration}|{.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].reason}`)
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			nodeParts := strings.Split(output, "|")
+			g.Expect(nodeParts).To(HaveLen(8), "unexpected GarageNode rollout projection: %q", output)
+			if len(nodeParts) != 8 {
+				return
+			}
+			g.Expect(nodeParts[1]).To(Equal(nodeParts[0]), "GarageNode status is stale: %q", output)
+			g.Expect(nodeParts[2]).To(Equal(podParts[0]),
+				"GarageNode has not observed the exact final Pod UID")
+			g.Expect(nodeParts[3:5]).To(Equal([]string{"true", "true"}))
+			g.Expect(nodeParts[5]).To(Equal(nodeParts[0]), "GarageNode Ready condition is stale: %q", output)
+			g.Expect(nodeParts[6:]).To(Equal([]string{"True", "NodeReady"}))
+
+			// Close the cross-read window after proving the exact workload revision.
+			// Admission remains the authoritative fail-closed serialization boundary.
+			assertParentTransactionsIdle()
+		}
+		// A positive-capacity OnDelete rollout uses the same cluster-wide safety
+		// coordinator as drain. Wait for the exact workload/config handoff and
+		// the completed storage-rollout transaction before requesting a drain.
+		Eventually(verifyConfigRolloutConverged, 20*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("requesting the documented reversible drain preparation")
+		cmd := exec.Command("kubectl", "annotate", "garagenode", node2Name,
+			"-n", testNamespace, "garage.rajsingh.info/drain=true", "--overwrite")
+		output, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to request GarageNode drain preparation: %s", output)
+
+		By("waiting for the current GarageNode generation to hold an exact terminal drain proof")
+		verifyDrainPrepared := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenode", node2Name,
+				"-n", testNamespace,
+				"-o", `jsonpath={.metadata.generation}|{.status.conditions[?(@.type=="DrainPrepared")].observedGeneration}|{.status.conditions[?(@.type=="DrainPrepared")].status}|{.status.conditions[?(@.type=="DrainPrepared")].reason}`)
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			parts := strings.Split(output, "|")
+			g.Expect(parts).To(HaveLen(4), "unexpected DrainPrepared projection: %q", output)
+			if len(parts) != 4 {
+				return
+			}
+			g.Expect(parts[1]).To(Equal(parts[0]), "DrainPrepared condition is stale: %q", output)
+			g.Expect(parts[2:]).To(Equal([]string{"True", "PreparedForDeletion"}),
+				"GarageNode drain has not completed its exact block/layout proof: %q", output)
+		}
+		// The production proof includes Garage's 610-second delayed-block-GC
+		// interval plus a clean observation window; this timeout is scoped to
+		// that safety transaction rather than ordinary workload readiness.
+		Eventually(verifyDrainPrepared, 20*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("deleting the now-prepared GarageNode through admission's exact terminal-proof check")
+		cmd = exec.Command("kubectl", "delete", "garagenode", node2Name,
+			"-n", testNamespace, "--wait=false")
+		output, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Prepared GarageNode deletion was rejected: %s", output)
+
+		By("waiting for GarageNode 2 and its StatefulSet to drain and delete")
+		verifyNodeAndStatefulSetDeleted := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenode", node2Name, "-n", testNamespace,
+				"--ignore-not-found", "-o", "name")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred(), "GarageNode deletion check must reach the API server")
+			g.Expect(strings.TrimSpace(output)).To(BeEmpty(),
+				"GarageNode 2 should be deleted after replacement")
+
+			cmd = exec.Command("kubectl", "get", "statefulset", node2Name, "-n", testNamespace,
+				"--ignore-not-found", "-o", "name")
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred(), "StatefulSet deletion check must reach the API server")
+			g.Expect(strings.TrimSpace(output)).To(BeEmpty(),
+				"StatefulSet 2 should be deleted after layout drain")
+
+			cmd = exec.Command("kubectl", "get", "garagecluster", clusterName,
+				"-n", testNamespace, "-o", "jsonpath={.status.storageDrain}")
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(BeEmpty(), "consumed GarageNode drain transaction should be cleared")
+		}
+		Eventually(verifyNodeAndStatefulSetDeleted, 5*time.Minute, 5*time.Second).Should(Succeed())
 	})
 })
 
@@ -3833,7 +4455,7 @@ var _ = Describe("Auto Mode per-node GarageNodes", Ordered, Label("auto-mode-per
 	})
 
 	AfterAll(func() {
-		cleanupAuto190(testNamespace, clusterName, []string{node0Name, node1Name, node2Name})
+		cleanupAuto190(testNamespace, []string{node0Name, node1Name, node2Name})
 	})
 
 	It("should deploy Auto cluster with replicas=2 and generate per-node GarageNodes", func() {
@@ -4007,6 +4629,30 @@ spec:
 			g.Expect(output).To(Equal(node2Name))
 		}
 		Eventually(verifyNode2, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		// Wait for the new member to actually join, not merely to exist as a CR.
+		// Removing a node that holds positive capacity is a drain, and admission
+		// requires StorageRolloutReady=True at the current generation before one
+		// starts — so a scale-down issued while this node is still joining is
+		// refused, correctly: partitions are already being assigned to it. Any
+		// operator reversing a scale-up has to wait for the same signal.
+		By("waiting for the new member to converge before the next topology change")
+		verifyNode2Converged := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenode", node2Name, "-n", testNamespace,
+				"-o", "jsonpath={.status.connected}|{.status.inLayout}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(stripKubectlWarnings(output)).To(Equal("true|true"),
+				"GarageNode %s has not joined the layout: %q", node2Name, output)
+
+			cmd = exec.Command("kubectl", "get", "garagecluster", clusterName, "-n", testNamespace,
+				"-o", "jsonpath={.status.conditions[?(@.type=='StorageRolloutReady')].status}")
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(stripKubectlWarnings(output)).To(Equal("True"),
+				"StorageRolloutReady is not converged: %q", output)
+		}
+		Eventually(verifyNode2Converged, 5*time.Minute, 10*time.Second).Should(Succeed())
 	})
 
 	It("should scale down to replicas=2 and remove auto-cluster-storage-2", func() {
@@ -4024,7 +4670,15 @@ spec:
 			_, err := utils.Run(cmd)
 			g.Expect(err).To(HaveOccurred(), "GarageNode %s still exists", node2Name)
 		}
-		Eventually(verifyNode2Gone, 5*time.Minute, 5*time.Second).Should(Succeed())
+		// Removing a member that holds positive capacity is a drain, and the drain
+		// barrier deliberately outlasts Garage's delayed-resync window before it
+		// concludes no block is coming back: upstream re-queues a block whose
+		// refcount hit zero at BLOCK_GC_DELAY + 10s (600+10s, src/block/manager.rs),
+		// which effectiveBlockResyncQuietPeriod mirrors as 610s plus one short
+		// requeue — about 11m10s. Anything under that times out on correct
+		// behaviour; the previous 5m budget was measuring the barrier, not the
+		// removal.
+		Eventually(verifyNode2Gone, 14*time.Minute, 10*time.Second).Should(Succeed())
 	})
 
 	It("should pause reconciliation when GarageNode spec.maintenance.suspended=true", func() {
@@ -4157,7 +4811,7 @@ var _ = Describe("Auto Mode EmptyDir (ephemeral)", Ordered, Label("auto-mode-eph
 	})
 
 	AfterAll(func() {
-		cleanupAuto190(testNamespace, clusterName, []string{nodeName})
+		cleanupAuto190(testNamespace, []string{nodeName})
 	})
 
 	It("should boot a sizeless EmptyDir Auto cluster with an EmptyDir-backed pod and no PVCs", func() {
@@ -4297,6 +4951,10 @@ var _ = Describe("Auto Mode EmptyDir migration", Ordered, Label("auto-mode-ephem
 	const testNamespace = "garage-auto-migration-test"
 	const clusterName = "mig-ephem-cluster"
 	const nodeName = "mig-ephem-cluster-storage-0"
+	// Shared by the seeded Garage's config and the Secret the GarageCluster
+	// references, so the operator's probe of the legacy Pod authenticates.
+	const legacyAdminToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	const legacyRPCSecret = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
 	BeforeAll(func() {
 		By("creating manager namespace")
@@ -4331,12 +4989,63 @@ var _ = Describe("Auto Mode EmptyDir migration", Ordered, Label("auto-mode-ephem
 	})
 
 	AfterAll(func() {
-		cleanupAuto190(testNamespace, clusterName, []string{nodeName})
+		cleanupAuto190(testNamespace, []string{nodeName})
 	})
 
 	It("migrates a legacy EmptyDir StatefulSet (no PVCs) to a fresh EmptyDir per-node GarageNode", func() {
+		// The admin token Secret must exist before the legacy StatefulSet, because
+		// the seeded Pod mounts it exactly as the pre-#190 operator did — and its
+		// value has to match the admin_token the seeded Garage boots with, or the
+		// operator's probe of that Pod is refused on a 401 rather than proving
+		// anything about the migration.
+		By("creating admin token secret")
+		adminTokenSecret := fmt.Sprintf(`
+apiVersion: v1
+kind: Secret
+metadata:
+  name: garage-admin-token
+  namespace: %s
+type: Opaque
+stringData:
+  admin-token: %q
+`, testNamespace, legacyAdminToken)
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(adminTokenSecret)
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create admin token secret")
+
+		// A real Garage, not a placeholder process. Taking the first static
+		// credential snapshot probes every existing Pod's Admin API with the source
+		// token and refuses the snapshot if one does not answer — correctly, since
+		// that is how the operator proves which live processes already trust the
+		// credential. A sleeping container can never satisfy that, so seeding one
+		// tested nothing a real upgrade does. Still EmptyDir with no
+		// volumeClaimTemplates, which is what this spec is about.
 		By("seeding a legacy EmptyDir cluster-level StatefulSet (no volumeClaimTemplates)")
 		legacySTS := fmt.Sprintf(`
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: %[1]s-legacy-config
+  namespace: %[2]s
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "lmdb"
+    replication_factor = 1
+    rpc_bind_addr = "[::]:3901"
+    rpc_secret = "%[4]s"
+
+    [s3_api]
+    s3_region = "garage"
+    api_bind_addr = "[::]:3900"
+    root_domain = ".s3.garage"
+
+    [admin]
+    api_bind_addr = "[::]:3903"
+    admin_token = "%[3]s"
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -4361,12 +5070,27 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
+        # EmptyDir mounts are root-owned without this, so a non-root Garage
+        # cannot create its lmdb and the Pod never becomes Ready.
+        fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: garage
-          image: busybox:1.36
-          command: ["sh", "-c", "sleep 100000"]
+          image: %[5]s
+          command: ["/garage", "server"]
+          ports:
+            - {name: s3, containerPort: 3900}
+            - {name: rpc, containerPort: 3901}
+            - {name: admin, containerPort: 3903}
+          readinessProbe:
+            tcpSocket:
+              port: 3903
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: {memory: 128Mi}
+            limits: {memory: 512Mi}
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
@@ -4380,32 +5104,36 @@ spec:
               mountPath: /var/lib/garage/meta
             - name: data
               mountPath: /var/lib/garage/data
+            - name: admin-token
+              mountPath: /secrets/admin
+              readOnly: true
+            - {name: config, mountPath: /etc/garage.toml, subPath: garage.toml}
       volumes:
         - name: metadata
           emptyDir: {}
         - name: data
           emptyDir: {}
-`, clusterName, testNamespace)
-		cmd := exec.Command("kubectl", "apply", "-f", "-")
-		cmd.Stdin = strings.NewReader(legacySTS)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create legacy STS")
-
-		By("creating admin token secret")
-		adminTokenSecret := fmt.Sprintf(`
-apiVersion: v1
-kind: Secret
-metadata:
-  name: garage-admin-token
-  namespace: %s
-type: Opaque
-stringData:
-  admin-token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-`, testNamespace)
+        # Exactly how the pre-#190 operator supplied the startup bearer: a Secret
+        # volume named admin-token, not the SecretKeyRef env var used since. The
+        # operator has to recognise this form to migrate a real legacy cluster —
+        # proving the exact managed Pod set is a precondition of the first static
+        # credential snapshot, which the migration runs behind. Omitting it here
+        # made the seeded Pod something no released operator ever produced.
+        - name: admin-token
+          secret:
+            secretName: garage-admin-token
+            defaultMode: 0600
+            items:
+              - key: admin-token
+                path: admin-token
+        - name: config
+          configMap:
+            name: %[1]s-legacy-config
+`, clusterName, testNamespace, legacyAdminToken, legacyRPCSecret, e2eGarageImage)
 		cmd = exec.Command("kubectl", "apply", "-f", "-")
-		cmd.Stdin = strings.NewReader(adminTokenSecret)
+		cmd.Stdin = strings.NewReader(legacySTS)
 		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create admin token secret")
+		Expect(err).NotTo(HaveOccurred(), "Failed to create legacy STS")
 
 		By("creating the ephemeral GarageCluster over the legacy STS")
 		clusterYAML := fmt.Sprintf(`
@@ -4557,7 +5285,7 @@ var _ = Describe("LayoutPolicy webhook", Ordered, Label("layout-policy-webhook")
 	})
 
 	AfterAll(func() {
-		cleanupAuto190(testNamespace, clusterName, nil)
+		cleanupAuto190(testNamespace, nil)
 	})
 
 	It("should reject Manual→Auto transition with a clear error message", func() {
@@ -5144,8 +5872,6 @@ spec:
 
 		It("should round-trip an object with the generated credentials", func() {
 			Expect(bucketID).NotTo(BeEmpty(), "bucket test must run first")
-			accessKeyID := readSecretValue(testNamespace, keyName, "access-key-id")
-			secretAccessKey := readSecretValue(testNamespace, keyName, "secret-access-key")
 
 			const payload = "adopted-handle-round-trip"
 			script := fmt.Sprintf(
@@ -5156,7 +5882,7 @@ spec:
 				payload, s3Endpoint, bucketName, s3Endpoint, bucketName)
 
 			Eventually(func(g Gomega) {
-				out := runAWSCLI(g, testNamespace, "handle-s3-verify", script, accessKeyID, secretAccessKey, true)
+				out := runAWSCLI(g, testNamespace, "handle-s3-verify", script, keyName, true)
 				g.Expect(out).To(ContainSubstring(payload), "GET did not return the PUT payload: %s", out)
 			}, 3*time.Minute, 30*time.Second).Should(Succeed())
 		})
@@ -5188,16 +5914,13 @@ spec:
 				g.Expect(o).NotTo(BeEmpty())
 			}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-			accessKeyID := readSecretValue(testNamespace, deniedKeyName, "access-key-id")
-			secretAccessKey := readSecretValue(testNamespace, deniedKeyName, "secret-access-key")
-
 			By("verifying a GET with the unpermitted key is refused")
 			script := fmt.Sprintf(
 				`aws s3api get-object --endpoint-url %s --region garage --bucket %s --key obj /tmp/out.txt`,
 				s3Endpoint, bucketName)
 			Eventually(func(g Gomega) {
 				// expectSuccess=false: the aws-cli pod is supposed to fail here.
-				out := runAWSCLI(g, testNamespace, "handle-s3-denied", script, accessKeyID, secretAccessKey, false)
+				out := runAWSCLI(g, testNamespace, "handle-s3-denied", script, deniedKeyName, false)
 				g.Expect(out).To(Or(
 					ContainSubstring("AccessDenied"),
 					ContainSubstring("Forbidden"),
@@ -5433,6 +6156,52 @@ func runCurlPod(g Gomega, ns, podName, script string) string {
 	return out
 }
 
+type garageLayoutSnapshot struct {
+	Version uint64 `json:"version"`
+	Roles   []struct {
+		ID string `json:"id"`
+	} `json:"roles"`
+	StagedRoleChanges []json.RawMessage `json:"stagedRoleChanges"`
+}
+
+type garageLayoutHistorySnapshot struct {
+	CurrentVersion uint64 `json:"currentVersion"`
+	MinAck         uint64 `json:"minAck"`
+	Versions       []struct {
+		Version      uint64 `json:"version"`
+		Status       string `json:"status"`
+		GatewayNodes int    `json:"gatewayNodes"`
+	} `json:"versions"`
+}
+
+// readGarageLayoutSnapshot samples layout and history in one in-cluster probe
+// and rejects a transition-window pair that does not describe one version.
+func readGarageLayoutSnapshot(
+	g Gomega, ns, podName, clusterName, adminToken string,
+) (garageLayoutSnapshot, garageLayoutHistorySnapshot) {
+	const separator = "\n---GARAGE-LAYOUT-HISTORY---\n"
+	adminHeader := shellQuote("Authorization: Bearer " + adminToken)
+	baseURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:3903/v2/", clusterName, ns)
+	script := fmt.Sprintf(
+		"set -eu\ncurl -fsS -H %s %s\nprintf '\\n---GARAGE-LAYOUT-HISTORY---\\n'\ncurl -fsS -H %s %s",
+		adminHeader, shellQuote(baseURL+"GetClusterLayout"),
+		adminHeader, shellQuote(baseURL+"GetClusterLayoutHistory"),
+	)
+	output := runCurlPod(g, ns, podName, script)
+	parts := strings.SplitN(output, separator, 2)
+	g.Expect(parts).To(HaveLen(2), "layout snapshot is missing its history separator: %s", output)
+
+	layout := garageLayoutSnapshot{}
+	history := garageLayoutHistorySnapshot{}
+	g.Expect(json.Unmarshal([]byte(strings.TrimSpace(parts[0])), &layout)).To(Succeed(),
+		"failed to parse Garage layout: %s", parts[0])
+	g.Expect(json.Unmarshal([]byte(strings.TrimSpace(parts[1])), &history)).To(Succeed(),
+		"failed to parse Garage layout history: %s", parts[1])
+	g.Expect(history.CurrentVersion).To(Equal(layout.Version),
+		"layout and history were sampled across a Garage version transition")
+	return layout, history
+}
+
 // readSecretValue reads and base64-decodes one key out of a Secret.
 func readSecretValue(ns, name, key string) string {
 	cmd := exec.Command("kubectl", "get", "secret", name, "-n", ns,
@@ -5442,16 +6211,22 @@ func readSecretValue(ns, name, key string) string {
 	return out
 }
 
-// runAWSCLI runs an aws-cli one-liner in the cluster and returns its combined
-// output. When expectSuccess is false the pod is expected to exit non-zero
-// (used to assert an access denial), so the error is folded into the output
-// instead of failing the assertion.
-func runAWSCLI(g Gomega, ns, podName, script, accessKeyID, secretAccessKey string, expectSuccess bool) string {
-	_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", podName,
-		"-n", ns, "--ignore-not-found", "--force", "--grace-period=0"))
+// runAWSCLI runs an aws-cli one-liner in the cluster with credentials sourced
+// directly from credentialSecretName and returns its combined output. Keeping
+// Secret values out of the kubectl arguments prevents the E2E command tracer
+// and CI logs from exposing them. When expectSuccess is false the pod is
+// expected to reach Failed (used to assert an access denial); its durable logs
+// remain available for the caller's exact error assertion.
+func runAWSCLI(g Gomega, ns, podName, script, credentialSecretName string, expectSuccess bool) string {
+	deletePod := func() {
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", podName,
+			"-n", ns, "--ignore-not-found", "--force", "--grace-period=0"))
+	}
+	deletePod()
+	defer deletePod()
 
 	// readOnlyRootFilesystem is omitted: aws-cli writes its credential cache to /tmp.
-	cmd := exec.Command("kubectl", "run", podName, "--rm", "-i", "--restart=Never",
+	cmd := exec.Command("kubectl", "run", podName, "--restart=Never", "--attach=false",
 		"-n", ns, "--image=docker.io/amazon/aws-cli:latest",
 		"--overrides", fmt.Sprintf(`{
 			"spec": {
@@ -5462,8 +6237,14 @@ func runAWSCLI(g Gomega, ns, podName, script, accessKeyID, secretAccessKey strin
 					"command": ["/bin/sh", "-c"],
 					"args": [%q],
 					"env": [
-						{"name": "AWS_ACCESS_KEY_ID", "value": %q},
-						{"name": "AWS_SECRET_ACCESS_KEY", "value": %q},
+						{
+							"name": "AWS_ACCESS_KEY_ID",
+							"valueFrom": {"secretKeyRef": {"name": %q, "key": "access-key-id"}}
+						},
+						{
+							"name": "AWS_SECRET_ACCESS_KEY",
+							"valueFrom": {"secretKeyRef": {"name": %q, "key": "secret-access-key"}}
+						},
 						{"name": "HOME", "value": "/tmp"}
 					],
 					"securityContext": {
@@ -5475,17 +6256,1733 @@ func runAWSCLI(g Gomega, ns, podName, script, accessKeyID, secretAccessKey strin
 					}
 				}]
 			}
-		}`, podName, script, accessKeyID, secretAccessKey))
+		}`, podName, script, credentialSecretName, credentialSecretName))
 	out, err := utils.Run(cmd)
+	g.Expect(err).NotTo(HaveOccurred(), "failed to start aws-cli pod: %s", out)
+
+	expectedPhase := "Failed"
 	if expectSuccess {
-		g.Expect(err).NotTo(HaveOccurred(), "aws-cli pod failed: %s", out)
-		return out
+		expectedPhase = "Succeeded"
 	}
-	if err != nil {
-		return out + "\n" + err.Error()
-	}
+	out, err = utils.Run(exec.Command("kubectl", "wait",
+		"--for=jsonpath={.status.phase}="+expectedPhase, "pod/"+podName,
+		"-n", ns, "--timeout=180s"))
+	g.Expect(err).NotTo(HaveOccurred(), "aws-cli pod did not reach expected phase %s: %s", expectedPhase, out)
+
+	out, err = utils.Run(exec.Command("kubectl", "logs", "pod/"+podName, "-n", ns))
+	g.Expect(err).NotTo(HaveOccurred(), "reading aws-cli pod logs: %s", out)
 	return out
 }
+
+// Additive node-local pool (one Garage storage pod per matching
+// Kubernetes Node, alongside a Manual StatefulSet/PVC GarageNode). CI runs
+// this label in its own Kind cluster from test/e2e/kind-node-local-pools.yaml: two
+// selected workers in different zones.
+//
+// hostPath volumes are rejected by the "restricted" and "baseline" Pod
+// Security Standards, so — unlike the other Ordered blocks in this file —
+// the test namespace here is deliberately left unlabeled (no PSA
+// enforcement).
+var _ = Describe("Node-local pools", Ordered, Label("node-local-pools"), func() {
+	const testNamespace = "garage-ds-test"
+	const clusterName = "ds-cluster"
+	const nodeLocalPoolName = "local"
+	const manualNodeName = "ds-manual-node"
+	const hostPathBase = "/tmp/garage-e2e-ds"
+	const managedTopologyClusterName = "managed-mixed-cluster"
+	const managedTopologyHostPathBase = "/tmp/garage-e2e-managed-mixed"
+
+	var k8sNodeNames []string
+	var garageNodeNames []string
+	var originalNodeIDs map[string]string
+	var originalNodeUIDs map[string]string
+	var storageProfileNodes map[string]string
+
+	assertPVCBackedGarageNode := func(g Gomega, ownerCluster, ownerNode string) {
+		output, err := utils.Run(exec.Command("kubectl", "get", "pvc", "-n", testNamespace,
+			"-l", "garage.rajsingh.info/cluster="+ownerCluster+
+				",garage.rajsingh.info/node="+ownerNode,
+			"-o", "json"))
+		g.Expect(err).NotTo(HaveOccurred())
+		var claims struct {
+			Items []struct {
+				Metadata struct {
+					Name string `json:"name"`
+				} `json:"metadata"`
+				Spec struct {
+					VolumeName string `json:"volumeName"`
+				} `json:"spec"`
+				Status struct {
+					Phase string `json:"phase"`
+				} `json:"status"`
+			} `json:"items"`
+		}
+		g.Expect(json.Unmarshal([]byte(output), &claims)).To(Succeed())
+		g.Expect(claims.Items).To(HaveLen(2),
+			"GarageNode %s must own exactly one metadata and one data PVC", ownerNode)
+		claimNames := make([]string, 0, len(claims.Items))
+		for _, claim := range claims.Items {
+			claimNames = append(claimNames, claim.Metadata.Name)
+			g.Expect(claim.Status.Phase).To(Equal("Bound"), "PVC %s is not Bound", claim.Metadata.Name)
+			g.Expect(claim.Spec.VolumeName).NotTo(BeEmpty(), "PVC %s has no bound PV", claim.Metadata.Name)
+		}
+		g.Expect(claimNames).To(ConsistOf(
+			"metadata-"+ownerNode+"-0",
+			"data-"+ownerNode+"-0",
+		))
+	}
+
+	BeforeAll(func() {
+		k8sNodeNames = prepareNodeLocalPoolE2EFixtures(
+			testNamespace, hostPathBase, managedTopologyHostPathBase,
+		)
+
+		By("creating manager namespace")
+		cmd := exec.Command("kubectl", "create", "ns", namespace)
+		_, _ = utils.Run(cmd) // Ignore error if already exists
+
+		By("labeling the manager namespace to enforce the restricted security policy")
+		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
+			"pod-security.kubernetes.io/enforce=restricted")
+		_, _ = utils.Run(cmd)
+
+		By("installing CRDs")
+		cmd = exec.Command("make", "install")
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+
+		By("waiting for Garage CRDs to be Established")
+		Expect(utils.WaitCRDsEstablished()).To(Succeed())
+
+		By("deploying the controller-manager")
+		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+
+		By("waiting for controller-manager pod to be Ready (webhook server started)")
+		verifyControllerUp := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "pods", "-l", "control-plane=controller-manager",
+				"-n", namespace,
+				"-o", "jsonpath={.items[0].status.conditions[?(@.type=='Ready')].status}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("True"), "Controller not Ready: %s", output)
+		}
+		Eventually(verifyControllerUp, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("creating test namespace (left unlabeled: hostPath needs the privileged PSA level)")
+		cmd = exec.Command("kubectl", "create", "ns", testNamespace)
+		_, _ = utils.Run(cmd) // Ignore error if already exists
+
+		By("publishing the durable membership label on every proven Kind worker")
+		for _, nodeName := range k8sNodeNames {
+			cmd = exec.Command("kubectl", "label", "--overwrite", "node", nodeName,
+				"garage.rajsingh.info/e2e-storage=true")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		By("assigning disjoint storage profiles for the multiple-pool topology")
+		storageProfileNodes = make(map[string]string, len(k8sNodeNames))
+		for i, nodeName := range k8sNodeNames {
+			profile := []string{"fast", "archive"}[i]
+			cmd = exec.Command("kubectl", "label", "--overwrite", "node", nodeName,
+				"garage.rajsingh.info/e2e-storage-profile="+profile)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			storageProfileNodes[profile] = nodeName
+		}
+
+		By("creating one stable identity-specific RPC Service per selected worker")
+		for _, nodeName := range k8sNodeNames {
+			serviceYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/instance: %s
+    garage.rajsingh.info/node-local-pool: %s
+    garage.rajsingh.info/kubernetes-node: %s
+  ports:
+    - name: rpc
+      port: 3901
+      targetPort: rpc
+`, nodeName, testNamespace, clusterName, nodeLocalPoolName, nodeName)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(serviceYAML)
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create identity-specific RPC Service for %s: %s", nodeName, output)
+		}
+		originalNodeIDs = map[string]string{}
+		originalNodeUIDs = map[string]string{}
+	})
+
+	AfterAll(func() {
+		By("restoring durable membership labels after selector scale-down tests")
+		cmd := exec.Command("kubectl", "get", "nodes",
+			"-l", "!node-role.kubernetes.io/control-plane",
+			"-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}")
+		output, _ := utils.Run(cmd)
+		for _, nodeName := range strings.Fields(output) {
+			cmd = exec.Command("kubectl", "label", "--overwrite", "node", nodeName,
+				"garage.rajsingh.info/e2e-storage=true")
+			_, _ = utils.Run(cmd)
+		}
+
+		By("discovering any GarageNodes left to clear finalizers on")
+		cmd = exec.Command("kubectl", "get", "garagenodes", "-n", testNamespace,
+			"-o", "jsonpath={.items[*].metadata.name}")
+		output, _ = utils.Run(cmd)
+		nodeNames := strings.Fields(output)
+
+		cleanupAuto190(testNamespace, nodeNames)
+	})
+
+	It("should bootstrap a node-local-only site with one identity per selected worker", func() {
+		By("creating an admin token secret")
+		adminTokenSecret := fmt.Sprintf(`
+apiVersion: v1
+kind: Secret
+metadata:
+  name: garage-admin-token
+  namespace: %s
+type: Opaque
+stringData:
+  admin-token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+`, testNamespace)
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(adminTokenSecret)
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create admin token secret")
+
+		By("creating a node-local-only GarageCluster with no default PVC templates")
+		clusterYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta2
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  layoutPolicy: Auto
+  zone: us-test
+  zoneFrom:
+    nodeLabel: topology.kubernetes.io/zone
+  replication:
+    factor: 1
+  storage:
+    layoutPolicy: Manual
+    replicas: 0
+    nodeLocalPools:
+      - name: %s
+        capacity: 2Gi
+        selector:
+          matchLabels:
+            garage.rajsingh.info/e2e-storage: "true"
+        metadata:
+          hostPath: %s/meta
+          hostPathType: DirectoryOrCreate
+        dataPaths:
+          - path: /data/fast
+            hostPath: %s/fast
+            hostPathType: DirectoryOrCreate
+            capacity: 1Gi
+          - path: /data/bulk
+            hostPath: %s/bulk
+            hostPathType: DirectoryOrCreate
+            capacity: 1Gi
+        network:
+          rpcPublicAddrTemplate: "{nodeName}.%s.svc.cluster.local:3901"
+        podTemplate:
+          resources:
+            limits:
+              memory: 256Mi
+            requests:
+              memory: 128Mi
+  admin:
+    adminTokenSecretRef:
+      name: garage-admin-token
+      key: admin-token
+  security:
+    allowInsecureSecretPermissions: true
+`, clusterName, testNamespace, nodeLocalPoolName, hostPathBase, hostPathBase, hostPathBase, testNamespace)
+
+		By("creating the site with its node-local membership generator (retry until admission webhook is up)")
+		Eventually(func(g Gomega) {
+			c := exec.Command("kubectl", "apply", "-f", "-")
+			c.Stdin = strings.NewReader(clusterYAML)
+			out, err := utils.Run(c)
+			g.Expect(err).NotTo(HaveOccurred(), "Failed to create GarageCluster: %s", out)
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying the pool DaemonSet has two pods scheduled and ready")
+		verifyDaemonSet := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "daemonset", clusterName+"-storage-"+nodeLocalPoolName, "-n", testNamespace,
+				"-o", "jsonpath={.status.desiredNumberScheduled}/{.status.numberReady}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("2/2"), "DaemonSet not fully ready: %s", output)
+		}
+		Eventually(verifyDaemonSet, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("discovering exactly one generated GarageNode for each selected Kubernetes Node")
+		discoveredGarageNodeNames := make([]string, len(k8sNodeNames))
+		for i, nodeName := range k8sNodeNames {
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "garagenodes", "-n", testNamespace,
+					"-l", "garage.rajsingh.info/cluster="+clusterName+
+						",garage.rajsingh.info/node-local-pool="+nodeLocalPoolName+
+						",garage.rajsingh.info/kubernetes-node="+nodeName,
+					"-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				names := strings.Fields(output)
+				g.Expect(names).To(HaveLen(1), "expected exactly one generated GarageNode for Kubernetes Node %s", nodeName)
+				discoveredGarageNodeNames[i] = names[0]
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+		}
+		garageNodeNames = discoveredGarageNodeNames
+
+		By("verifying no unexpected GarageNodes were generated for the pool")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenodes", "-n", testNamespace,
+				"-l", "garage.rajsingh.info/cluster="+clusterName+",garage.rajsingh.info/node-local-pool="+nodeLocalPoolName,
+				"-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(strings.Fields(output)).To(ConsistOf(garageNodeNames))
+		}, 1*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying both hostPath disks are mounted into the DaemonSet")
+		cmd = exec.Command("kubectl", "get", "daemonset", clusterName+"-storage-"+nodeLocalPoolName, "-n", testNamespace,
+			"-o", "jsonpath={range .spec.template.spec.containers[0].volumeMounts[*]}{.mountPath}{'\\n'}{end}")
+		output, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.Fields(output)).To(ContainElements("/data/fast", "/data/bulk"))
+
+		By("verifying pool pods carry stable Kubernetes Node routing labels")
+		for _, nodeName := range k8sNodeNames {
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pods", "-n", testNamespace,
+					"-l", "garage.rajsingh.info/node-local-pool="+nodeLocalPoolName+
+						",garage.rajsingh.info/kubernetes-node="+nodeName,
+					"-o", "jsonpath={.items[0].spec.nodeName}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal(nodeName))
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+		}
+
+		By("proving the node-local-only layout converges without placeholder PVC fields")
+		Eventually(func(g Gomega) {
+			for _, garageNodeName := range garageNodeNames {
+				cmd := exec.Command("kubectl", "get", "garagenode", garageNodeName, "-n", testNamespace,
+					"-o", "jsonpath={.status.nodeId}/{.status.connected}/{.status.inLayout}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				parts := strings.Split(output, "/")
+				g.Expect(parts).To(HaveLen(3))
+				g.Expect(parts[0]).NotTo(BeEmpty())
+				g.Expect(parts[1:]).To(Equal([]string{"true", "true"}))
+			}
+			cmd := exec.Command("kubectl", "get", "garagecluster", clusterName, "-n", testNamespace,
+				"-o", `jsonpath={.status.conditions[?(@.type=="NodeLocalPoolsReady")].status}/{.status.conditions[?(@.type=="NodeLocalPoolsReady")].reason}/{.status.health.storageNodes}`)
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("True/Converged/2"))
+		}, 8*time.Minute, 5*time.Second).Should(Succeed())
+
+		cmd = exec.Command("kubectl", "get", "statefulsets", "-n", testNamespace,
+			"-l", "garage.rajsingh.info/cluster="+clusterName,
+			"-o", "name")
+		output, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.TrimSpace(output)).To(BeEmpty(),
+			"replicas: 0 with omitted metadata/data unexpectedly created a default StatefulSet/PVC group")
+
+		By("proving the node-local-only site has no hidden default identity or PVC claims")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenodes", "-n", testNamespace,
+				"-l", "garage.rajsingh.info/cluster="+clusterName,
+				"-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(strings.Fields(output)).To(ConsistOf(garageNodeNames))
+
+			cmd = exec.Command("kubectl", "get", "pvc", "-n", testNamespace,
+				"-l", "garage.rajsingh.info/cluster="+clusterName, "-o", "name")
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(strings.TrimSpace(output)).To(BeEmpty(),
+				"node-local-only site unexpectedly owns PVCs: %s", output)
+		}, time.Minute, 5*time.Second).Should(Succeed())
+
+		By("proving Scale reports 0/0 with a no-match Manual selector, not 0/2 for node-local members")
+		Eventually(func(g Gomega) {
+			scale, err := readGarageClusterScale("v1beta2", testNamespace, clusterName)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(scale.Spec.Replicas).To(BeZero())
+			g.Expect(scale.Status.Replicas).To(BeZero())
+			g.Expect(scale.Status.Selector).To(Equal(
+				"garage.rajsingh.info/cluster=" + clusterName +
+					",garage.rajsingh.info/scale-target=disabled",
+			))
+
+			cmd := exec.Command("kubectl", "get", "garagecluster", clusterName, "-n", testNamespace,
+				"-o", "jsonpath={.status.storageReplicas}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("2"),
+				"aggregate storage status must still report both node-local identities")
+		}, time.Minute, 5*time.Second).Should(Succeed())
+	})
+
+	It("should propagate pool capacity and converge both storage ownership models", func() {
+		By("adding one ordinary PVC-backed GarageNode beside the converged node-local-only site")
+		manualNodeYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta1
+kind: GarageNode
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+  zone: us-test
+  capacity: 1Gi
+  storage:
+    metadata:
+      size: 100Mi
+    data:
+      size: 1Gi
+  resources:
+    limits:
+      memory: 256Mi
+    requests:
+      memory: 128Mi
+`, manualNodeName, testNamespace, clusterName)
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(manualNodeYAML)
+		output, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create ordinary GarageNode: %s", output)
+
+		By("verifying both GarageNodes use the configured capacity and distinct topology zones")
+		for i, garageNodeName := range garageNodeNames {
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "garagenode", garageNodeName, "-n", testNamespace,
+					"-o", "jsonpath={.spec.nodeLocalPoolName}/{.spec.capacity}/{.status.zone}/{.spec.kubernetesNodeName}/{.spec.network.rpcPublicAddr}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				parts := strings.Split(output, "/")
+				g.Expect(parts).To(HaveLen(5))
+				g.Expect(parts[:2]).To(Equal([]string{"local", "2Gi"}))
+				g.Expect(parts[2]).To(MatchRegexp(`^zone-[ab]$`))
+				g.Expect(parts[3]).To(Equal(k8sNodeNames[i]))
+				g.Expect(parts[4]).To(Equal(k8sNodeNames[i]+"."+testNamespace+".svc.cluster.local:3901"),
+					"node-local identity must advertise its dedicated stable Service, not a shared or ephemeral Pod address")
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+		}
+
+		By("waiting for both nodes to be Connected and InLayout")
+		verifyNodeReady := func(g Gomega) {
+			for _, garageNodeName := range garageNodeNames {
+				cmd := exec.Command("kubectl", "get", "garagenode", garageNodeName, "-n", testNamespace,
+					"-o", "jsonpath={.status.connected}/{.status.inLayout}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("true/true"), "GarageNode %s not ready: %q", garageNodeName, output)
+			}
+		}
+		Eventually(verifyNodeReady, 5*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("verifying the Manual GarageNode has its independent StatefulSet and layout role")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "statefulset", manualNodeName, "-n", testNamespace,
+				"-o", "jsonpath={.status.readyReplicas}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("1"))
+			cmd = exec.Command("kubectl", "get", "garagenode", manualNodeName, "-n", testNamespace,
+				"-o", "jsonpath={.status.connected}/{.status.inLayout}")
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("true/true"))
+			assertPVCBackedGarageNode(g, clusterName, manualNodeName)
+		}, 5*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("verifying the pool lifecycle condition is converged")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagecluster", clusterName, "-n", testNamespace,
+				"-o", `jsonpath={.status.conditions[?(@.type=="NodeLocalPoolsReady")].status}/{.status.conditions[?(@.type=="NodeLocalPoolsReady")].reason}`)
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("True/Converged"))
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		for _, garageNodeName := range garageNodeNames {
+			cmd := exec.Command("kubectl", "get", "garagenode", garageNodeName, "-n", testNamespace,
+				"-o", "jsonpath={.status.nodeId}/{.metadata.uid}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			parts := strings.SplitN(output, "/", 2)
+			Expect(parts).To(HaveLen(2))
+			Expect(parts[0]).NotTo(BeEmpty())
+			originalNodeIDs[garageNodeName] = parts[0]
+			originalNodeUIDs[garageNodeName] = parts[1]
+		}
+	})
+
+	It("should converge the default PVC group with multiple node-local pools", func() {
+		clusterYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta2
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  deletionPolicy: Destroy
+  layoutPolicy: Auto
+  zone: managed-site
+  replication:
+    factor: 1
+  storage:
+    replicas: 1
+    metadata:
+      size: 100Mi
+    data:
+      size: 1Gi
+    nodeLocalPools:
+      - name: fast
+        capacity: 1Gi
+        selector:
+          matchLabels:
+            garage.rajsingh.info/e2e-storage-profile: fast
+        metadata:
+          hostPath: %s/fast/meta
+          hostPathType: DirectoryOrCreate
+        data:
+          hostPath: %s/fast/data
+          hostPathType: DirectoryOrCreate
+        podTemplate:
+          resources:
+            limits:
+              memory: 256Mi
+            requests:
+              memory: 128Mi
+      - name: archive
+        capacity: 1Gi
+        selector:
+          matchLabels:
+            garage.rajsingh.info/e2e-storage-profile: archive
+        metadata:
+          hostPath: %s/archive/meta
+          hostPathType: DirectoryOrCreate
+        data:
+          hostPath: %s/archive/data
+          hostPathType: DirectoryOrCreate
+        podTemplate:
+          resources:
+            limits:
+              memory: 256Mi
+            requests:
+              memory: 128Mi
+  admin:
+    adminTokenSecretRef:
+      name: garage-admin-token
+      key: admin-token
+  security:
+    allowInsecureSecretPermissions: true
+`, managedTopologyClusterName, testNamespace,
+			managedTopologyHostPathBase, managedTopologyHostPathBase,
+			managedTopologyHostPathBase, managedTopologyHostPathBase)
+
+		By("creating a second site with the existing managed PVC group and two local-disk profiles")
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(clusterYAML)
+		output, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create mixed managed GarageCluster: %s", output)
+
+		By("proving each pool owns one DaemonSet on its exact selected Kubernetes Node and HostPaths")
+		for _, poolName := range []string{"fast", "archive"} {
+			Eventually(func(g Gomega) {
+				expectedNode := storageProfileNodes[poolName]
+				g.Expect(expectedNode).NotTo(BeEmpty())
+				cmd := exec.Command("kubectl", "get", "daemonset",
+					managedTopologyClusterName+"-storage-"+poolName, "-n", testNamespace,
+					"-o", "jsonpath={.status.desiredNumberScheduled}/{.status.numberReady}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("1/1"), "pool %s did not select exactly one Ready member", poolName)
+
+				cmd = exec.Command("kubectl", "get", "pods", "-n", testNamespace,
+					"-l", "garage.rajsingh.info/cluster="+managedTopologyClusterName+
+						",garage.rajsingh.info/node-local-pool="+poolName,
+					"-o", "jsonpath={range .items[*]}{.spec.nodeName}{'\\n'}{end}")
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.Fields(output)).To(Equal([]string{expectedNode}),
+					"pool %s Pod did not follow its membership selector", poolName)
+
+				cmd = exec.Command("kubectl", "get", "garagenodes", "-n", testNamespace,
+					"-l", "garage.rajsingh.info/cluster="+managedTopologyClusterName+
+						",garage.rajsingh.info/node-local-pool="+poolName,
+					"-o", "jsonpath={range .items[*]}{.spec.kubernetesNodeName}{'\\n'}{end}")
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.Fields(output)).To(Equal([]string{expectedNode}),
+					"pool %s generated identity did not bind to its selected Node", poolName)
+
+				cmd = exec.Command("kubectl", "get", "daemonset",
+					managedTopologyClusterName+"-storage-"+poolName, "-n", testNamespace,
+					"-o", `jsonpath={range .spec.template.spec.volumes[*]}{.hostPath.path}{"\n"}{end}`)
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.Fields(output)).To(ConsistOf(
+					filepath.Join(managedTopologyHostPathBase, poolName, "meta"),
+					filepath.Join(managedTopologyHostPathBase, poolName, "data"),
+				), "pool %s DaemonSet mounted another profile's HostPaths", poolName)
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+		}
+
+		By("proving the default group independently owns its PVC-backed GarageNode and StatefulSet")
+		defaultNodeName := managedTopologyClusterName + "-storage-0"
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "statefulset", defaultNodeName, "-n", testNamespace,
+				"-o", "jsonpath={.status.readyReplicas}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("1"))
+			assertPVCBackedGarageNode(g, managedTopologyClusterName, defaultNodeName)
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("proving all three independent Garage identities share the global layout")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenodes", "-n", testNamespace,
+				"-l", "garage.rajsingh.info/cluster="+managedTopologyClusterName, "-o", "json")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			var nodes struct {
+				Items []struct {
+					Metadata struct {
+						Name string `json:"name"`
+					} `json:"metadata"`
+					Spec struct {
+						NodeLocalPoolName string `json:"nodeLocalPoolName"`
+					} `json:"spec"`
+					Status struct {
+						Connected bool   `json:"connected"`
+						InLayout  bool   `json:"inLayout"`
+						NodeID    string `json:"nodeId"`
+						Zone      string `json:"zone"`
+					} `json:"status"`
+				} `json:"items"`
+			}
+			g.Expect(json.Unmarshal([]byte(output), &nodes)).To(Succeed())
+			g.Expect(nodes.Items).To(HaveLen(3))
+			backings := map[string]string{}
+			for _, node := range nodes.Items {
+				g.Expect(node.Status.NodeID).NotTo(BeEmpty())
+				g.Expect(node.Status.Connected).To(BeTrue())
+				g.Expect(node.Status.InLayout).To(BeTrue())
+				g.Expect(node.Status.Zone).To(Equal("managed-site"),
+					"pool names must not become Garage failure-domain zones")
+				backings[node.Metadata.Name] = node.Spec.NodeLocalPoolName
+			}
+			g.Expect(backings[defaultNodeName]).To(BeEmpty())
+			delete(backings, defaultNodeName)
+			poolNames := make([]string, 0, len(backings))
+			for _, poolName := range backings {
+				poolNames = append(poolNames, poolName)
+			}
+			g.Expect(poolNames).To(ConsistOf("fast", "archive"))
+		}, 8*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("proving both independently managed topology conditions converge")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagecluster", managedTopologyClusterName,
+				"-n", testNamespace,
+				"-o", `jsonpath={.status.conditions[?(@.type=="StorageTopologyReady")].status}/{.status.conditions[?(@.type=="StorageTopologyReady")].reason}/{.status.conditions[?(@.type=="NodeLocalPoolsReady")].status}/{.status.conditions[?(@.type=="NodeLocalPoolsReady")].reason}/{.status.health.storageNodes}`)
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("True/Converged/True/Converged/3"))
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("proving Scale targets only the one-member default group in the mixed 1+2 topology")
+		Eventually(func(g Gomega) {
+			scale, err := readGarageClusterScale("v1beta2", testNamespace, managedTopologyClusterName)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(scale.Spec.Replicas).To(Equal(int32(1)))
+			g.Expect(scale.Status.Replicas).To(Equal(int32(1)))
+			g.Expect(scale.Status.Selector).To(Equal(
+				"garage.rajsingh.info/cluster=" + managedTopologyClusterName +
+					",garage.rajsingh.info/storage-group=default" +
+					",garage.rajsingh.info/tier=storage",
+			))
+
+			cmd := exec.Command("kubectl", "get", "garagecluster", managedTopologyClusterName,
+				"-n", testNamespace, "-o", "jsonpath={.status.storageReplicas}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("3"),
+				"aggregate storage status must retain default and node-local membership")
+		}, time.Minute, 5*time.Second).Should(Succeed())
+
+		By("destroying only the temporary mixed-managed site before later rollout assertions")
+		cmd = exec.Command("kubectl", "delete", "garagecluster", managedTopologyClusterName,
+			"-n", testNamespace, "--wait=false")
+		output, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to request temporary site teardown: %s", output)
+		Eventually(func() (bool, error) {
+			output, err := utils.Run(exec.Command("kubectl", "get", "garagecluster",
+				managedTopologyClusterName, "-n", testNamespace,
+				"--ignore-not-found", "-o", "name"))
+			if err != nil {
+				return false, err
+			}
+			return strings.TrimSpace(output) == "", nil
+		}, 5*time.Minute, 5*time.Second).Should(BeTrue())
+		Eventually(func(g Gomega) {
+			for _, resource := range []string{"garagenodes", "statefulsets", "daemonsets", "pods"} {
+				cmd := exec.Command("kubectl", "get", resource, "-n", testNamespace,
+					"-l", "garage.rajsingh.info/cluster="+managedTopologyClusterName, "-o", "name")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.TrimSpace(output)).To(BeEmpty(),
+					"temporary site still owns %s: %s", resource, output)
+			}
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("removing only the temporary site's retained test PVCs after all of its pods are gone")
+		cmd = exec.Command("kubectl", "delete", "pvc", "-n", testNamespace,
+			"-l", "garage.rajsingh.info/cluster="+managedTopologyClusterName,
+			"--ignore-not-found", "--timeout=2m")
+		output, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to remove temporary site PVCs: %s", output)
+	})
+
+	It("should enforce production HostPath markers and preserve provisioned contents", func() {
+		const markerName = ".garage-volume-id"
+		const sentinelName = "operator-must-not-delete"
+		fixtureDirectories := []string{"meta", "fast", "bulk"}
+		runOnKindNode := func(nodeName, script string, args ...string) (string, error) {
+			commandArgs := []string{"exec", nodeName, "sh", "-ec", script, "garage-e2e"}
+			commandArgs = append(commandArgs, args...)
+			return utils.Run(exec.Command("docker", commandArgs...))
+		}
+
+		By("proving DirectoryOrCreate startup did not create production markers")
+		for _, nodeName := range k8sNodeNames {
+			for _, directory := range fixtureDirectories {
+				path := filepath.Join(hostPathBase, directory)
+				output, err := runOnKindNode(nodeName,
+					`test -d "$1" && test ! -e "$1/$2"`, path, markerName)
+				Expect(err).NotTo(HaveOccurred(),
+					"operator unexpectedly created %s on %s before explicit provisioning: %s", markerName, nodeName, output)
+			}
+		}
+
+		By("provisioning metadata and data markers on each actual Kind worker filesystem")
+		for _, nodeName := range k8sNodeNames {
+			for _, directory := range fixtureDirectories {
+				path := filepath.Join(hostPathBase, directory)
+				output, err := runOnKindNode(nodeName,
+					`touch "$1/$2" "$1/$3"`, path, sentinelName, markerName)
+				Expect(err).NotTo(HaveOccurred(), "Failed to provision marker on %s:%s: %s", nodeName, path, output)
+			}
+		}
+
+		By("tightening every metadata and data HostPath from DirectoryOrCreate to Directory")
+		productionPatch := `[
+  {"op":"replace","path":"/spec/storage/nodeLocalPools/0/metadata/hostPathType","value":"Directory"},
+  {"op":"replace","path":"/spec/storage/nodeLocalPools/0/dataPaths/0/hostPathType","value":"Directory"},
+  {"op":"replace","path":"/spec/storage/nodeLocalPools/0/dataPaths/1/hostPathType","value":"Directory"}
+]`
+		cmd := exec.Command("kubectl", "patch", "garagecluster", clusterName, "-n", testNamespace,
+			"--type=json", "-p", productionPatch)
+		output, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to tighten production HostPath types: %s", output)
+
+		By("waiting for the marker-enforcing template rollout to converge")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "daemonset", clusterName+"-storage-"+nodeLocalPoolName,
+				"-n", testNamespace,
+				"-o", "jsonpath={.metadata.generation}/{.status.observedGeneration}/{.status.desiredNumberScheduled}/{.status.updatedNumberScheduled}/{.status.numberReady}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			parts := strings.Split(output, "/")
+			g.Expect(parts).To(HaveLen(5))
+			g.Expect(parts[1]).To(Equal(parts[0]), "DaemonSet status is stale: %s", output)
+			g.Expect(parts[2:]).To(Equal([]string{"2", "2", "2"}),
+				"production-marker DaemonSet rollout is not current and Ready: %s", output)
+			cmd = exec.Command("kubectl", "get", "garagecluster", clusterName, "-n", testNamespace,
+				"-o", `jsonpath={.metadata.generation}/{.status.conditions[?(@.type=="StorageRolloutReady")].observedGeneration}/{.status.conditions[?(@.type=="StorageRolloutReady")].status}/{.status.conditions[?(@.type=="StorageRolloutReady")].reason}`)
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			parts = strings.Split(output, "/")
+			g.Expect(parts).To(HaveLen(4))
+			g.Expect(parts[1]).To(Equal(parts[0]), "storage rollout condition is stale: %s", output)
+			g.Expect(parts[2:]).To(Equal([]string{"True", "Converged"}),
+				"production-marker rollout did not converge: %s", output)
+		}, 10*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying the DaemonSet checks metadata and every data marker")
+		cmd = exec.Command("kubectl", "get", "daemonset", clusterName+"-storage-"+nodeLocalPoolName,
+			"-n", testNamespace,
+			"-o", `jsonpath={range .spec.template.spec.volumes[*]}{.hostPath.path}{"\n"}{end}`)
+		output, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to inspect marker volumes: %s", output)
+		var markerPaths []string
+		for _, path := range strings.Fields(output) {
+			if strings.HasSuffix(path, "/"+markerName) {
+				markerPaths = append(markerPaths, path)
+			}
+		}
+		Expect(markerPaths).To(ConsistOf(
+			filepath.Join(hostPathBase, "meta", markerName),
+			filepath.Join(hostPathBase, "fast", markerName),
+			filepath.Join(hostPathBase, "bulk", markerName),
+		))
+
+		type markerPoolPod struct {
+			Metadata struct {
+				Name              string  `json:"name"`
+				UID               string  `json:"uid"`
+				DeletionTimestamp *string `json:"deletionTimestamp"`
+			} `json:"metadata"`
+			Spec struct {
+				NodeName        string `json:"nodeName"`
+				SchedulingGates []struct {
+					Name string `json:"name"`
+				} `json:"schedulingGates"`
+			} `json:"spec"`
+			Status struct {
+				Phase      string `json:"phase"`
+				Conditions []struct {
+					Type   string `json:"type"`
+					Status string `json:"status"`
+				} `json:"conditions"`
+				ContainerStatuses []struct {
+					State struct {
+						Running *struct{} `json:"running"`
+					} `json:"state"`
+				} `json:"containerStatuses"`
+			} `json:"status"`
+		}
+		type markerPoolPodList struct {
+			Items []markerPoolPod `json:"items"`
+		}
+		readPoolPods := func() ([]markerPoolPod, error) {
+			output, err := utils.Run(exec.Command("kubectl", "get", "pods", "-n", testNamespace,
+				"-l", "garage.rajsingh.info/cluster="+clusterName+",garage.rajsingh.info/node-local-pool="+nodeLocalPoolName,
+				"-o", "json"))
+			if err != nil {
+				return nil, fmt.Errorf("listing node-local pool Pods: %w: %s", err, output)
+			}
+			var list markerPoolPodList
+			if err := json.Unmarshal([]byte(output), &list); err != nil {
+				return nil, fmt.Errorf("decoding node-local pool Pods: %w", err)
+			}
+			return list.Items, nil
+		}
+		podReady := func(pod markerPoolPod) bool {
+			for _, condition := range pod.Status.Conditions {
+				if condition.Type == "Ready" && condition.Status == "True" {
+					return true
+				}
+			}
+			return false
+		}
+
+		exerciseMissingMarker := func(directory string) {
+			targetNode := k8sNodeNames[0]
+			targetGarageNode := garageNodeNames[0]
+			markerPath := filepath.Join(hostPathBase, directory, markerName)
+			sentinelPath := filepath.Join(hostPathBase, directory, sentinelName)
+			pods, err := readPoolPods()
+			Expect(err).NotTo(HaveOccurred())
+			priorUIDs := make(map[string]bool, len(pods))
+			oldPodName := ""
+			for _, pod := range pods {
+				if pod.Metadata.DeletionTimestamp == nil {
+					priorUIDs[pod.Metadata.UID] = true
+					if pod.Spec.NodeName == targetNode {
+						oldPodName = pod.Metadata.Name
+					}
+				}
+			}
+			Expect(oldPodName).NotTo(BeEmpty(), "missing current pool Pod on %s", targetNode)
+
+			By("removing only the " + directory + " marker from one worker")
+			output, err := runOnKindNode(targetNode,
+				`rm -f "$1" && test -f "$2"`, markerPath, sentinelPath)
+			Expect(err).NotTo(HaveOccurred(), "Failed to remove marker fixture: %s", output)
+
+			By("forcing a replacement Pod while the mounted filesystem lacks its marker")
+			output, err = utils.Run(exec.Command("kubectl", "delete", "pod", oldPodName,
+				"-n", testNamespace, "--wait=true", "--timeout=120s"))
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete pool Pod %s: %s", oldPodName, output)
+
+			var replacement markerPoolPod
+			Eventually(func(g Gomega) {
+				pods, err := readPoolPods()
+				g.Expect(err).NotTo(HaveOccurred())
+				found := false
+				for _, pod := range pods {
+					if pod.Metadata.DeletionTimestamp == nil && !priorUIDs[pod.Metadata.UID] &&
+						pod.Spec.NodeName == targetNode {
+						replacement = pod
+						found = true
+						break
+					}
+				}
+				g.Expect(found).To(BeTrue(), "DaemonSet has not created a replacement Pod")
+				g.Expect(replacement.Spec.NodeName).To(Equal(targetNode))
+				g.Expect(replacement.Spec.SchedulingGates).To(BeEmpty(),
+					"replacement must reach kubelet volume validation, not remain scheduler-gated")
+				g.Expect(replacement.Status.Phase).To(Equal("Pending"))
+				g.Expect(podReady(replacement)).To(BeFalse())
+			}, 3*time.Minute, 3*time.Second).Should(Succeed())
+
+			Consistently(func(g Gomega) {
+				pods, err := readPoolPods()
+				g.Expect(err).NotTo(HaveOccurred())
+				found := false
+				for _, pod := range pods {
+					if pod.Metadata.UID != replacement.Metadata.UID {
+						continue
+					}
+					found = true
+					g.Expect(podReady(pod)).To(BeFalse(), "Pod became Ready without %s", markerPath)
+					for _, container := range pod.Status.ContainerStatuses {
+						g.Expect(container.State.Running).To(BeNil(), "Garage started without %s", markerPath)
+					}
+				}
+				g.Expect(found).To(BeTrue(), "replacement Pod disappeared instead of remaining safely Pending")
+			}, 20*time.Second, 2*time.Second).Should(Succeed())
+
+			By("observing the kubelet marker failure on the actual replacement Pod")
+			Eventually(func(g Gomega) {
+				output, err := utils.Run(exec.Command("kubectl", "describe", "pod", replacement.Metadata.Name,
+					"-n", testNamespace))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(ContainSubstring("FailedMount"))
+				g.Expect(output).To(ContainSubstring(markerPath))
+			}, 2*time.Minute, 3*time.Second).Should(Succeed())
+			output, err = runOnKindNode(targetNode,
+				`test ! -e "$1" && test -f "$2"`, markerPath, sentinelPath)
+			Expect(err).NotTo(HaveOccurred(),
+				"operator created the missing marker or removed adjacent contents: %s", output)
+
+			By("restoring the marker on the mounted filesystem and allowing the same Pod to start")
+			output, err = runOnKindNode(targetNode, `touch "$1"`, markerPath)
+			Expect(err).NotTo(HaveOccurred(), "Failed to restore marker: %s", output)
+			Eventually(func(g Gomega) {
+				pods, err := readPoolPods()
+				g.Expect(err).NotTo(HaveOccurred())
+				found := false
+				for _, pod := range pods {
+					if pod.Metadata.UID == replacement.Metadata.UID {
+						found = true
+						g.Expect(podReady(pod)).To(BeTrue())
+					}
+				}
+				g.Expect(found).To(BeTrue())
+
+				output, err := utils.Run(exec.Command("kubectl", "get", "garagenode", targetGarageNode,
+					"-n", testNamespace,
+					"-o", "jsonpath={.status.nodeId}/{.status.observedPodUid}/{.status.connected}/{.status.inLayout}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal(originalNodeIDs[targetGarageNode] + "/" + replacement.Metadata.UID + "/true/true"))
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+			output, err = runOnKindNode(targetNode,
+				`test -f "$1" && test -f "$2"`, markerPath, sentinelPath)
+			Expect(err).NotTo(HaveOccurred(), "marker or adjacent contents disappeared after startup: %s", output)
+		}
+
+		By("proving the metadata identity marker is required")
+		exerciseMissingMarker("meta")
+		By("proving a data-disk marker is independently required")
+		exerciseMissingMarker("fast")
+
+		By("verifying every provisioned marker and adjacent sentinel survived all rollouts")
+		for _, nodeName := range k8sNodeNames {
+			for _, directory := range fixtureDirectories {
+				path := filepath.Join(hostPathBase, directory)
+				output, err := runOnKindNode(nodeName,
+					`test -f "$1/$2" && test -f "$1/$3"`, path, markerName, sentinelName)
+				Expect(err).NotTo(HaveOccurred(), "HostPath contents did not survive on %s:%s: %s", nodeName, path, output)
+			}
+		}
+	})
+
+	It("should roll every managed storage model one at a time and preserve Garage identities", func() {
+		type rolloutSnapshot struct {
+			podUIDs             map[string]string
+			podReady            map[string]bool
+			podCreated          map[string]time.Time
+			podReadyAt          map[string]time.Time
+			observedPodUIDs     map[string]string
+			nodeIDs             map[string]string
+			garageNodeUIDs      map[string]string
+			connected           map[string]bool
+			inLayout            map[string]bool
+			activeActor         string
+			rolloutStatusStable bool
+			conditionStatus     string
+			conditionReason     string
+			poolsStatus         string
+			poolsReason         string
+			safetyViolations    []string
+		}
+		type podList struct {
+			Items []struct {
+				Metadata struct {
+					Name              string            `json:"name"`
+					UID               string            `json:"uid"`
+					DeletionTimestamp string            `json:"deletionTimestamp"`
+					CreationTimestamp string            `json:"creationTimestamp"`
+					Labels            map[string]string `json:"labels"`
+				} `json:"metadata"`
+				Spec struct {
+					NodeName string `json:"nodeName"`
+				} `json:"spec"`
+				Status struct {
+					Conditions []struct {
+						Type               string `json:"type"`
+						Status             string `json:"status"`
+						LastTransitionTime string `json:"lastTransitionTime"`
+					} `json:"conditions"`
+				} `json:"status"`
+			} `json:"items"`
+		}
+		type garageNodeList struct {
+			Items []struct {
+				Metadata struct {
+					Name string `json:"name"`
+					UID  string `json:"uid"`
+				} `json:"metadata"`
+				Status struct {
+					NodeID         string `json:"nodeId"`
+					ObservedPodUID string `json:"observedPodUid"`
+					Connected      bool   `json:"connected"`
+					InLayout       bool   `json:"inLayout"`
+				} `json:"status"`
+			} `json:"items"`
+		}
+		type clusterStatus struct {
+			Metadata struct {
+				ResourceVersion string `json:"resourceVersion"`
+			} `json:"metadata"`
+			Status struct {
+				StorageRollout *struct {
+					GarageNodeName     string `json:"garageNodeName"`
+					NodeLocalPoolName  string `json:"nodeLocalPoolName"`
+					KubernetesNodeName string `json:"kubernetesNodeName"`
+				} `json:"storageRollout"`
+				Conditions []struct {
+					Type   string `json:"type"`
+					Status string `json:"status"`
+					Reason string `json:"reason"`
+				} `json:"conditions"`
+			} `json:"status"`
+		}
+
+		managedActors := append([]string{manualNodeName}, garageNodeNames...)
+		poolActorByKubernetesNode := make(map[string]string, len(k8sNodeNames))
+		for i, nodeName := range k8sNodeNames {
+			poolActorByKubernetesNode[nodeName] = garageNodeNames[i]
+		}
+		readClusterStatus := func() (clusterStatus, error) {
+			var status clusterStatus
+			output, err := utils.Run(exec.Command("kubectl", "get", "garagecluster",
+				clusterName, "-n", testNamespace, "-o", "json"))
+			if err != nil {
+				return status, fmt.Errorf("reading GarageCluster rollout status: %w: %s", err, output)
+			}
+			if err := json.Unmarshal([]byte(output), &status); err != nil {
+				return status, fmt.Errorf("decoding GarageCluster rollout status: %w", err)
+			}
+			return status, nil
+		}
+		readSnapshot := func() (rolloutSnapshot, error) {
+			snapshot := rolloutSnapshot{
+				podUIDs:         make(map[string]string, len(managedActors)),
+				podReady:        make(map[string]bool, len(managedActors)),
+				podCreated:      make(map[string]time.Time, len(managedActors)),
+				podReadyAt:      make(map[string]time.Time, len(managedActors)),
+				observedPodUIDs: make(map[string]string, len(managedActors)),
+				nodeIDs:         make(map[string]string, len(managedActors)),
+				garageNodeUIDs:  make(map[string]string, len(managedActors)),
+				connected:       make(map[string]bool, len(managedActors)),
+				inLayout:        make(map[string]bool, len(managedActors)),
+			}
+			for _, actor := range managedActors {
+				snapshot.podUIDs[actor] = ""
+			}
+			statusBefore, err := readClusterStatus()
+			if err != nil {
+				return snapshot, err
+			}
+
+			output, err := utils.Run(exec.Command("kubectl", "get", "pods", "-n", testNamespace, "-o", "json"))
+			if err != nil {
+				return snapshot, fmt.Errorf("listing managed pods: %w: %s", err, output)
+			}
+			var pods podList
+			if err := json.Unmarshal([]byte(output), &pods); err != nil {
+				return snapshot, fmt.Errorf("decoding managed pods: %w", err)
+			}
+			for i := range pods.Items {
+				pod := &pods.Items[i]
+				actor := ""
+				if pod.Metadata.Name == manualNodeName+"-0" {
+					actor = manualNodeName
+				} else if pod.Metadata.Labels["garage.rajsingh.info/cluster"] == clusterName &&
+					pod.Metadata.Labels["garage.rajsingh.info/node-local-pool"] == nodeLocalPoolName {
+					actor = poolActorByKubernetesNode[pod.Spec.NodeName]
+				}
+				if actor == "" || pod.Metadata.DeletionTimestamp != "" {
+					continue
+				}
+				if previous := snapshot.podUIDs[actor]; previous != "" && previous != pod.Metadata.UID {
+					snapshot.safetyViolations = append(snapshot.safetyViolations,
+						fmt.Sprintf("actor %s has two non-terminating pods (%s and %s)", actor, previous, pod.Metadata.UID))
+					continue
+				}
+				snapshot.podUIDs[actor] = pod.Metadata.UID
+				created, err := time.Parse(time.RFC3339, pod.Metadata.CreationTimestamp)
+				if err != nil {
+					return snapshot, fmt.Errorf("decoding creation time for pod %s: %w", pod.Metadata.Name, err)
+				}
+				snapshot.podCreated[actor] = created
+				for _, condition := range pod.Status.Conditions {
+					if condition.Type == "Ready" && condition.Status == "True" {
+						snapshot.podReady[actor] = true
+						readyAt, err := time.Parse(time.RFC3339, condition.LastTransitionTime)
+						if err != nil {
+							return snapshot, fmt.Errorf("decoding Ready transition time for pod %s: %w", pod.Metadata.Name, err)
+						}
+						snapshot.podReadyAt[actor] = readyAt
+					}
+				}
+			}
+
+			output, err = utils.Run(exec.Command("kubectl", "get", "garagenodes", "-n", testNamespace, "-o", "json"))
+			if err != nil {
+				return snapshot, fmt.Errorf("listing GarageNodes: %w: %s", err, output)
+			}
+			var nodes garageNodeList
+			if err := json.Unmarshal([]byte(output), &nodes); err != nil {
+				return snapshot, fmt.Errorf("decoding GarageNodes: %w", err)
+			}
+			for i := range nodes.Items {
+				node := &nodes.Items[i]
+				snapshot.observedPodUIDs[node.Metadata.Name] = node.Status.ObservedPodUID
+				snapshot.nodeIDs[node.Metadata.Name] = node.Status.NodeID
+				snapshot.garageNodeUIDs[node.Metadata.Name] = node.Metadata.UID
+				snapshot.connected[node.Metadata.Name] = node.Status.Connected
+				snapshot.inLayout[node.Metadata.Name] = node.Status.InLayout
+			}
+
+			status, err := readClusterStatus()
+			if err != nil {
+				return snapshot, err
+			}
+			snapshot.rolloutStatusStable = statusBefore.Metadata.ResourceVersion == status.Metadata.ResourceVersion
+			if record := status.Status.StorageRollout; record != nil {
+				if record.GarageNodeName != "" {
+					snapshot.activeActor = record.GarageNodeName
+				} else if record.NodeLocalPoolName == nodeLocalPoolName {
+					actor, found := poolActorByKubernetesNode[record.KubernetesNodeName]
+					if !found {
+						snapshot.safetyViolations = append(snapshot.safetyViolations,
+							fmt.Sprintf("persisted rollout actor names unknown Kubernetes Node %s", record.KubernetesNodeName))
+					} else {
+						snapshot.activeActor = actor
+					}
+				}
+			}
+			for _, condition := range status.Status.Conditions {
+				switch condition.Type {
+				case "StorageRolloutReady":
+					snapshot.conditionStatus = condition.Status
+					snapshot.conditionReason = condition.Reason
+				case "NodeLocalPoolsReady":
+					snapshot.poolsStatus = condition.Status
+					snapshot.poolsReason = condition.Reason
+				}
+			}
+			return snapshot, nil
+		}
+
+		By("capturing all Manual/PVC and node-local pod and Garage identities")
+		initial, err := readSnapshot()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(initial.safetyViolations).To(BeEmpty())
+		baselinePodUIDs := make(map[string]string, len(managedActors))
+		for _, actor := range managedActors {
+			Expect(initial.podUIDs[actor]).NotTo(BeEmpty(), "missing initial pod for %s", actor)
+			Expect(initial.podReady[actor]).To(BeTrue(), "initial pod for %s is not Ready", actor)
+			Expect(initial.observedPodUIDs[actor]).To(Equal(initial.podUIDs[actor]))
+			Expect(initial.nodeIDs[actor]).NotTo(BeEmpty())
+			Expect(initial.garageNodeUIDs[actor]).NotTo(BeEmpty())
+			originalNodeIDs[actor] = initial.nodeIDs[actor]
+			originalNodeUIDs[actor] = initial.garageNodeUIDs[actor]
+			baselinePodUIDs[actor] = initial.podUIDs[actor]
+		}
+
+		By("changing a shared pod-template input instead of deleting workload pods directly")
+		cmd := exec.Command("kubectl", "patch", "garagecluster", clusterName, "-n", testNamespace,
+			"--type=merge", "-p", `{"spec":{"logging":{"level":"garage=debug"}}}`)
+		output, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to trigger declarative storage rollout: %s", output)
+
+		By("observing one durable rollout actor at a time across both workload implementations")
+		sawRollingCondition := false
+		var converged rolloutSnapshot
+		Eventually(func() (bool, error) {
+			snapshot, err := readSnapshot()
+			if err != nil {
+				return false, err
+			}
+			if len(snapshot.safetyViolations) > 0 {
+				StopTrying("storage rollout safety invariant violated: " + strings.Join(snapshot.safetyViolations, "; ")).Now()
+			}
+			if snapshot.conditionStatus == "False" && snapshot.conditionReason == "RollingOut" {
+				sawRollingCondition = true
+			}
+
+			unsettledActors := make([]string, 0, len(managedActors))
+			for _, actor := range managedActors {
+				if snapshot.nodeIDs[actor] != originalNodeIDs[actor] {
+					StopTrying(fmt.Sprintf("Garage node ID changed for %s: got %q, want %q",
+						actor, snapshot.nodeIDs[actor], originalNodeIDs[actor])).Now()
+				}
+				if snapshot.garageNodeUIDs[actor] != originalNodeUIDs[actor] {
+					StopTrying(fmt.Sprintf("GarageNode CR changed for %s: got %q, want %q",
+						actor, snapshot.garageNodeUIDs[actor], originalNodeUIDs[actor])).Now()
+				}
+				if snapshot.podUIDs[actor] == baselinePodUIDs[actor] {
+					continue
+				}
+				newUID := snapshot.podUIDs[actor]
+				if newUID != "" && snapshot.podReady[actor] &&
+					snapshot.observedPodUIDs[actor] == newUID && snapshot.connected[actor] && snapshot.inLayout[actor] {
+					// A complete actor may begin and finish between two one-second
+					// observations. Advance the live baseline from durable Ready and
+					// identity evidence; the post-rollout timestamps below prove that
+					// any missed complete intervals still did not overlap.
+					baselinePodUIDs[actor] = newUID
+					continue
+				}
+				unsettledActors = append(unsettledActors, actor)
+			}
+			if len(unsettledActors) > 1 {
+				StopTrying(fmt.Sprintf("more than one managed Garage Pod was unproven at once: %v", unsettledActors)).Now()
+			}
+			if len(unsettledActors) == 1 {
+				actor := unsettledActors[0]
+				if snapshot.rolloutStatusStable && snapshot.activeActor != "" && snapshot.activeActor != actor {
+					StopTrying(fmt.Sprintf("persisted rollout actor %s does not match the only changing Pod %s",
+						snapshot.activeActor, actor)).Now()
+				}
+			}
+
+			for _, actor := range managedActors {
+				if snapshot.podUIDs[actor] == "" || snapshot.podUIDs[actor] == initial.podUIDs[actor] ||
+					!snapshot.podReady[actor] || snapshot.observedPodUIDs[actor] != snapshot.podUIDs[actor] ||
+					!snapshot.connected[actor] || !snapshot.inLayout[actor] {
+					return false, nil
+				}
+			}
+			if snapshot.activeActor != "" || snapshot.conditionStatus != "True" ||
+				snapshot.conditionReason != "Converged" || snapshot.poolsStatus != "True" ||
+				snapshot.poolsReason != "Converged" {
+				return false, nil
+			}
+			converged = snapshot
+			return true, nil
+		}, 10*time.Minute, time.Second).Should(BeTrue())
+		Expect(sawRollingCondition).To(BeTrue(), "StorageRolloutReady never exposed the durable RollingOut boundary")
+
+		By("proving each next replacement was created only after the prior actor became Ready")
+		type replacementInterval struct {
+			actor   string
+			created time.Time
+			readyAt time.Time
+		}
+		intervals := make([]replacementInterval, 0, len(managedActors))
+		for _, actor := range managedActors {
+			Expect(converged.podCreated[actor]).NotTo(BeZero(), "replacement creation time missing for %s", actor)
+			Expect(converged.podReadyAt[actor]).NotTo(BeZero(), "replacement Ready transition missing for %s", actor)
+			Expect(converged.podReadyAt[actor].Before(converged.podCreated[actor])).To(BeFalse(),
+				"replacement %s became Ready before it was created", actor)
+			intervals = append(intervals, replacementInterval{
+				actor: actor, created: converged.podCreated[actor], readyAt: converged.podReadyAt[actor],
+			})
+		}
+		sort.Slice(intervals, func(i, j int) bool { return intervals[i].created.Before(intervals[j].created) })
+		for i := 1; i < len(intervals); i++ {
+			Expect(intervals[i].created.Before(intervals[i-1].readyAt)).To(BeFalse(),
+				"replacement %s was created at %s before prior actor %s became Ready at %s",
+				intervals[i].actor, intervals[i].created, intervals[i-1].actor, intervals[i-1].readyAt)
+		}
+	})
+
+	It("should round-trip an object through a stable per-node-local pool endpoint", func() {
+		const bucketName = "ds-test-bucket"
+		const keyName = "ds-test-key"
+		const serviceName = "ds-node-s3"
+		bucketYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta1
+kind: GarageBucket
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+  globalAlias: %s
+`, bucketName, testNamespace, clusterName, bucketName)
+
+		By("creating a GarageBucket against the node-local-pool-backed cluster")
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(bucketYAML)
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create test bucket")
+
+		By("waiting for the bucket to reach Ready")
+		verifyBucketReady := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagebucket", bucketName, "-n", testNamespace,
+				"-o", "jsonpath={.status.phase}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("Ready"), "Bucket not ready: phase=%s", output)
+		}
+		Eventually(verifyBucketReady, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("creating credentials scoped to the bucket")
+		keyYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta1
+kind: GarageKey
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+  bucketPermissions:
+    - bucketRef:
+        name: %s
+      read: true
+      write: true
+`, keyName, testNamespace, clusterName, bucketName)
+		cmd = exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(keyYAML)
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create GarageKey")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "secret", keyName, "-n", testNamespace,
+				"-o", `go-template={{ index .data "access-key-id" | base64decode }}`)
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).NotTo(BeEmpty())
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("creating an S3 Service pinned to one stable Kubernetes Node label")
+		serviceYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  selector:
+    garage.rajsingh.info/cluster: %s
+    garage.rajsingh.info/node-local-pool: %s
+    garage.rajsingh.info/kubernetes-node: %s
+  ports:
+    - name: s3
+      port: 3900
+      targetPort: s3
+`, serviceName, testNamespace, clusterName, nodeLocalPoolName, k8sNodeNames[0])
+		cmd = exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(serviceYAML)
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create per-node S3 Service")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "endpoints", serviceName, "-n", testNamespace,
+				"-o", "jsonpath={.subsets[0].addresses[0].targetRef.name}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(ContainSubstring(clusterName + "-storage-" + nodeLocalPoolName))
+		}, 1*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("putting, reading, and deleting an object through that exact DaemonSet identity")
+		endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:3900", serviceName, testNamespace)
+		const payload = "node-local-pool-round-trip"
+		script := fmt.Sprintf(
+			`printf '%s' > /tmp/payload.txt && `+
+				`aws s3api put-object --endpoint-url %s --region garage --bucket %s --key obj --body /tmp/payload.txt && `+
+				`aws s3api get-object --endpoint-url %s --region garage --bucket %s --key obj /tmp/out.txt && `+
+				`cat /tmp/out.txt && `+
+				`aws s3api delete-object --endpoint-url %s --region garage --bucket %s --key obj`,
+			payload, endpoint, bucketName, endpoint, bucketName, endpoint, bucketName,
+		)
+		Eventually(func(g Gomega) {
+			output := runAWSCLI(g, testNamespace, "ds-s3-verify", script, keyName, true)
+			g.Expect(output).To(ContainSubstring(payload), "GET did not return the PUT payload: %s", output)
+		}, 3*time.Minute, 30*time.Second).Should(Succeed())
+
+		By("cleaning up the test credentials, bucket, and per-node Service")
+		cmd = exec.Command("kubectl", "delete", "garagekey", keyName, "-n", testNamespace,
+			"--ignore-not-found", "--timeout=60s")
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "delete", "garagebucket", bucketName, "-n", testNamespace,
+			"--ignore-not-found", "--timeout=60s")
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "delete", "service", serviceName, "-n", testNamespace,
+			"--ignore-not-found")
+		_, _ = utils.Run(cmd)
+	})
+
+	It("should drain selector-based scale-down and rejoin with the hostPath identity", func() {
+		removedK8sNode := k8sNodeNames[1]
+		removedGarageNode := garageNodeNames[1]
+		sourcePodUID := ""
+
+		By("capturing the exact live source Pod before changing desired membership")
+		Eventually(func(g Gomega) {
+			output, err := utils.Run(exec.Command("kubectl", "get", "pods", "-n", testNamespace,
+				"-l", "garage.rajsingh.info/node-local-pool="+nodeLocalPoolName+
+					",garage.rajsingh.info/kubernetes-node="+removedK8sNode,
+				"-o", `jsonpath={range .items[*]}{.metadata.uid}{"|"}{.status.phase}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}`))
+			g.Expect(err).NotTo(HaveOccurred())
+			podLines := strings.Fields(output)
+			g.Expect(podLines).To(HaveLen(1), "expected exactly one source Pod before selector removal: %q", output)
+			podParts := strings.Split(podLines[0], "|")
+			g.Expect(podParts).To(HaveLen(3))
+			g.Expect(podParts[0]).NotTo(BeEmpty())
+			g.Expect(podParts[1:]).To(Equal([]string{"Running", "True"}))
+			sourcePodUID = podParts[0]
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+		Expect(sourcePodUID).NotTo(BeEmpty())
+
+		By("removing one worker from the durable membership selector")
+		cmd := exec.Command("kubectl", "label", "node", removedK8sNode,
+			"garage.rajsingh.info/e2e-storage-")
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("proving drain preparation starts while the source Garage process is still live")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenode", removedGarageNode, "-n", testNamespace,
+				"-o", `go-template={{ index .metadata.annotations "garage.rajsingh.info/drain" }}|{{ .metadata.deletionTimestamp }}`)
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("true|<no value>"),
+				"the parent must request reversible preparation before issuing DELETE")
+
+			cmd = exec.Command("kubectl", "get", "pods", "-n", testNamespace,
+				"-l", "garage.rajsingh.info/node-local-pool="+nodeLocalPoolName+
+					",garage.rajsingh.info/kubernetes-node="+removedK8sNode,
+				"-o", `jsonpath={range .items[*]}{.metadata.uid}{"|"}{.status.phase}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}`)
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			podLines := strings.Fields(output)
+			g.Expect(podLines).To(HaveLen(1), "expected exactly one source Pod: %q", output)
+			podParts := strings.Split(podLines[0], "|")
+			g.Expect(podParts).To(HaveLen(3))
+			g.Expect(podParts[0]).To(Equal(sourcePodUID),
+				"the exact pre-removal source Pod must remain live during drain preparation")
+			g.Expect(podParts[1:]).To(Equal([]string{"Running", "True"}))
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("waiting for its pod to terminate and GarageNode finalizer to drain the role")
+		// Garage v2.3 schedules block GC after 610 seconds. This bound covers
+		// that exact proof plus reconciliation; it is not a generic rollout wait.
+		Eventually(func() (bool, error) {
+			output, err := utils.Run(exec.Command("kubectl", "get", "garagenode", removedGarageNode,
+				"-n", testNamespace, "--ignore-not-found", "-o", "name"))
+			if err != nil {
+				return false, err
+			}
+			if strings.TrimSpace(output) != "" {
+				output, err = utils.Run(exec.Command("kubectl", "get", "pods", "-n", testNamespace,
+					"-l", "garage.rajsingh.info/node-local-pool="+nodeLocalPoolName+
+						",garage.rajsingh.info/kubernetes-node="+removedK8sNode,
+					"-o", `jsonpath={range .items[*]}{.metadata.uid}{"|"}{.status.phase}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}`))
+				if err != nil {
+					return false, err
+				}
+				podLines := strings.Fields(output)
+				sourceHealthy := false
+				if len(podLines) == 1 {
+					podParts := strings.Split(podLines[0], "|")
+					sourceHealthy = len(podParts) == 3 && podParts[0] == sourcePodUID &&
+						podParts[1] == "Running" && podParts[2] == "True"
+				}
+				if sourceHealthy {
+					return false, nil
+				}
+
+				// Finalizer completion and DaemonSet deactivation may occur
+				// between the GarageNode and Pod reads. Reconfirm the parent
+				// before treating a changed source as a safety violation.
+				confirmedNode, confirmErr := utils.Run(exec.Command("kubectl", "get", "garagenode",
+					removedGarageNode, "-n", testNamespace, "--ignore-not-found", "-o", "name"))
+				if confirmErr != nil {
+					return false, confirmErr
+				}
+				if strings.TrimSpace(confirmedNode) != "" {
+					StopTrying(fmt.Sprintf(
+						"retiring GarageNode still exists but source Pod %s was replaced or became unavailable: %q",
+						sourcePodUID, output)).Now()
+				}
+				// The GarageNode disappeared at the successful boundary; fall
+				// through and require the exact remaining DaemonSet set below.
+			}
+
+			output, err = utils.Run(exec.Command("kubectl", "get", "daemonset",
+				clusterName+"-storage-"+nodeLocalPoolName, "-n", testNamespace,
+				"-o", "jsonpath={.status.desiredNumberScheduled}/{.status.numberReady}"))
+			if err != nil {
+				return false, err
+			}
+			return output == "1/1", nil
+		}, 20*time.Minute, 10*time.Second).Should(BeTrue())
+
+		By("proving Garage committed the role removal with no staged topology mutation")
+		removedNodeID := originalNodeIDs[removedGarageNode]
+		Expect(removedNodeID).NotTo(BeEmpty())
+		Eventually(func(g Gomega) {
+			const adminToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+			curlCmd := fmt.Sprintf(
+				"curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterLayout",
+				adminToken, clusterName, testNamespace)
+			output := runCurlPod(g, testNamespace, "node-local-retirement-layout", curlCmd)
+			jsonStart := strings.Index(output, "{")
+			jsonEnd := strings.LastIndex(output, "}")
+			g.Expect(jsonStart).To(BeNumerically(">=", 0), "no layout JSON in output: %s", output)
+			g.Expect(jsonEnd).To(BeNumerically(">", jsonStart), "invalid layout JSON in output: %s", output)
+			var layout struct {
+				Roles []struct {
+					ID string `json:"id"`
+				} `json:"roles"`
+				StagedRoleChanges []json.RawMessage `json:"stagedRoleChanges"`
+			}
+			jsonBody := output[jsonStart : jsonEnd+1]
+			g.Expect(json.Unmarshal([]byte(jsonBody), &layout)).To(Succeed(),
+				"failed to parse Garage layout: %s", jsonBody)
+			roleIDs := make([]string, 0, len(layout.Roles))
+			for _, role := range layout.Roles {
+				roleIDs = append(roleIDs, role.ID)
+			}
+			g.Expect(roleIDs).NotTo(ContainElement(removedNodeID),
+				"retired positive-capacity identity remains in Garage's committed layout")
+			g.Expect(layout.StagedRoleChanges).To(BeEmpty(),
+				"selector retirement left an uncommitted Garage layout mutation")
+		}, 3*time.Minute, 15*time.Second).Should(Succeed())
+
+		By("verifying retirement did not delete the removed Node's HostPath contents")
+		for _, directory := range []string{"meta", "fast", "bulk"} {
+			path := filepath.Join(hostPathBase, directory)
+			cmd = exec.Command("docker", "exec", removedK8sNode, "sh", "-ec",
+				`test -f "$1/.garage-volume-id" && test -f "$1/operator-must-not-delete"`,
+				"garage-e2e", path)
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(),
+				"retirement altered HostPath contents on %s:%s: %s", removedK8sNode, path, output)
+		}
+
+		By("adding the worker back")
+		cmd = exec.Command("kubectl", "label", "--overwrite", "node", removedK8sNode,
+			"garage.rajsingh.info/e2e-storage=true")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("waiting for a new GarageNode CR to recover the same persisted Garage identity")
+		rejoinedPodUID := ""
+		rejoinedGarageNodeUID := ""
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "daemonset", clusterName+"-storage-"+nodeLocalPoolName, "-n", testNamespace,
+				"-o", "jsonpath={.status.desiredNumberScheduled}/{.status.numberReady}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("2/2"))
+
+			cmd = exec.Command("kubectl", "get", "pods", "-n", testNamespace,
+				"-l", "garage.rajsingh.info/node-local-pool="+nodeLocalPoolName+
+					",garage.rajsingh.info/kubernetes-node="+removedK8sNode,
+				"-o", `jsonpath={range .items[*]}{.metadata.uid}{"|"}{.status.phase}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}`)
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			podLines := strings.Fields(output)
+			g.Expect(podLines).To(HaveLen(1), "expected exactly one current pool Pod on the rejoined Node: %q", output)
+			podParts := strings.Split(podLines[0], "|")
+			g.Expect(podParts).To(HaveLen(3))
+			g.Expect(podParts[0]).NotTo(BeEmpty())
+			g.Expect(podParts[1:]).To(Equal([]string{"Running", "True"}))
+			currentPodUID := podParts[0]
+
+			cmd = exec.Command("kubectl", "get", "garagenode", removedGarageNode, "-n", testNamespace,
+				"-o", "jsonpath={.status.nodeId}/{.metadata.uid}/{.status.observedPodUid}")
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			parts := strings.Split(output, "/")
+			g.Expect(parts).To(HaveLen(3))
+			g.Expect(parts[0]).To(Equal(originalNodeIDs[removedGarageNode]))
+			g.Expect(parts[1]).NotTo(Equal(originalNodeUIDs[removedGarageNode]),
+				"selector scale-in/out should recreate the GarageNode CR while retaining the disk identity")
+			g.Expect(parts[2]).To(Equal(currentPodUID),
+				"the recreated GarageNode must observe the exact current pool Pod")
+			rejoinedGarageNodeUID = parts[1]
+			rejoinedPodUID = currentPodUID
+		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("proving rejoin remains fail closed while Garage drains the prior layout version")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenode", removedGarageNode, "-n", testNamespace,
+				"-o", `jsonpath={.metadata.generation}|{.status.conditions[?(@.type=="Ready")].observedGeneration}|{.status.connected}|{.status.inLayout}|{.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].message}`)
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			parts := strings.Split(output, "|")
+			g.Expect(parts).To(HaveLen(6))
+			g.Expect(parts[1]).To(Equal(parts[0]), "GarageNode Ready condition is stale: %q", output)
+			g.Expect(parts[2:5]).To(Equal([]string{"false", "false", "False"}))
+			g.Expect(parts[5]).To(ContainSubstring("layout version(s)"))
+			g.Expect(parts[5]).To(ContainSubstring("still draining"))
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		const adminToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		Eventually(func(g Gomega) {
+			rejoinLayout, rejoinHistory := readGarageLayoutSnapshot(
+				g, testNamespace, "node-local-rejoin-applied-snapshot", clusterName, adminToken,
+			)
+			rejoinRoleIDs := make([]string, 0, len(rejoinLayout.Roles))
+			for _, role := range rejoinLayout.Roles {
+				rejoinRoleIDs = append(rejoinRoleIDs, role.ID)
+			}
+			g.Expect(rejoinRoleIDs).To(ContainElement(originalNodeIDs[removedGarageNode]),
+				"the rejoin layout Apply did not commit the retained disk identity")
+			g.Expect(rejoinLayout.StagedRoleChanges).To(BeEmpty(),
+				"rejoin left an uncommitted Garage layout mutation")
+			historyStatuses := make([]string, 0, len(rejoinHistory.Versions))
+			for _, version := range rejoinHistory.Versions {
+				historyStatuses = append(historyStatuses, version.Status)
+			}
+			g.Expect(historyStatuses).To(ContainElement("Draining"),
+				"GarageNode reported a history barrier without a directly observed draining version")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("waiting for Garage's prior layout version to finish synchronizing before reporting rejoin convergence")
+		Eventually(func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "daemonset", clusterName+"-storage-"+nodeLocalPoolName, "-n", testNamespace,
+				"-o", "jsonpath={.status.desiredNumberScheduled}/{.status.numberReady}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("2/2"))
+
+			cmd = exec.Command("kubectl", "get", "pods", "-n", testNamespace,
+				"-l", "garage.rajsingh.info/node-local-pool="+nodeLocalPoolName+
+					",garage.rajsingh.info/kubernetes-node="+removedK8sNode,
+				"-o", `jsonpath={range .items[*]}{.metadata.uid}{"|"}{.status.phase}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}`)
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			podLines := strings.Fields(output)
+			g.Expect(podLines).To(HaveLen(1), "expected exactly one current pool Pod on the rejoined Node: %q", output)
+			podParts := strings.Split(podLines[0], "|")
+			g.Expect(podParts).To(HaveLen(3))
+			g.Expect(podParts).To(Equal([]string{rejoinedPodUID, "Running", "True"}),
+				"rejoin must not replace the exact Pod while Garage layout history is settling")
+
+			cmd = exec.Command("kubectl", "get", "garagenode", removedGarageNode, "-n", testNamespace,
+				"-o", `jsonpath={.metadata.generation}/{.status.conditions[?(@.type=="Ready")].observedGeneration}/{.status.nodeId}/{.metadata.uid}/{.status.observedPodUid}/{.status.connected}/{.status.inLayout}`)
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			parts := strings.Split(output, "/")
+			g.Expect(parts).To(HaveLen(7))
+			g.Expect(parts[1]).To(Equal(parts[0]), "GarageNode Ready condition is stale: %q", output)
+			g.Expect(parts[2:]).To(Equal([]string{
+				originalNodeIDs[removedGarageNode], rejoinedGarageNodeUID, rejoinedPodUID, "true", "true",
+			}))
+
+			cmd = exec.Command("kubectl", "get", "garagecluster", clusterName, "-n", testNamespace,
+				"-o", `jsonpath={.metadata.generation}/{.status.conditions[?(@.type=="NodeLocalPoolsReady")].observedGeneration}/{.status.conditions[?(@.type=="NodeLocalPoolsReady")].status}/{.status.conditions[?(@.type=="NodeLocalPoolsReady")].reason}`)
+			output, err = utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			conditionParts := strings.Split(output, "/")
+			g.Expect(conditionParts).To(HaveLen(4))
+			g.Expect(conditionParts[1]).To(Equal(conditionParts[0]), "node-local readiness condition is stale: %q", output)
+			g.Expect(conditionParts[2:]).To(Equal([]string{"True", "Converged"}))
+		}, 20*time.Minute, 10*time.Second).Should(Succeed())
+		// A selector rejoin is a second Garage topology mutation. Upstream Garage
+		// retains the previous layout until its table synchronization is
+		// acknowledged, so the wait above is scoped to that live history barrier.
+
+		By("proving final readiness corresponds to a settled current layout snapshot")
+		settledLayout, settledHistory := readGarageLayoutSnapshot(
+			Default, testNamespace, "node-local-rejoin-settled-snapshot", clusterName, adminToken,
+		)
+		settledRoleIDs := make([]string, 0, len(settledLayout.Roles))
+		for _, role := range settledLayout.Roles {
+			settledRoleIDs = append(settledRoleIDs, role.ID)
+		}
+		Expect(settledRoleIDs).To(ContainElement(originalNodeIDs[removedGarageNode]))
+		Expect(settledLayout.StagedRoleChanges).To(BeEmpty())
+
+		for _, version := range settledHistory.Versions {
+			Expect(version.Status).NotTo(Equal("Draining"),
+				"NodeLocalPoolsReady=True was published while layout version history was still draining")
+		}
+	})
+
+	It("should reject a pool with an invalid HostPath", func() {
+		invalidYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta2
+kind: GarageCluster
+metadata:
+  name: ds-invalid
+  namespace: %s
+spec:
+  layoutPolicy: Manual
+  replication:
+    factor: 1
+  storage:
+    metadata:
+      size: 100Mi
+    data:
+      size: 1Gi
+    nodeLocalPools:
+      - name: invalid
+        capacity: 1Gi
+        selector:
+          matchLabels:
+            garage.rajsingh.info/e2e-storage: "true"
+        metadata:
+          hostPath: %s/invalid-meta
+        data:
+          hostPath: relative/data
+  admin:
+    adminTokenSecretRef:
+      name: garage-admin-token
+      key: admin-token
+  security:
+    allowInsecureSecretPermissions: true
+`, testNamespace, hostPathBase)
+
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(invalidYAML)
+		output, err := utils.Run(cmd)
+		Expect(err).To(HaveOccurred(),
+			"Webhook should reject a node-local pool with a relative HostPath. Output: %s", output)
+		Expect(output).To(ContainSubstring("absolute path"),
+			"Error should mention the absolute HostPath contract. Output: %s", output)
+	})
+})
 
 // cleanupManagementHandle tears down the management-handle e2e block with a
 // LIGHT teardown: it deletes only this block's namespace and CRs and leaves the
@@ -5523,7 +8020,7 @@ func cleanupManagementHandle(testNamespace string, clusterNames []string) {
 // Cleanup order that survives both: delete admission webhooks first → scale
 // operator to 0 → clear finalizers → delete CRs (--wait=false) → delete ns
 // (--timeout) → make undeploy → make uninstall.
-func cleanupAuto190(testNamespace, clusterName string, garageNodeNames []string) {
+func cleanupAuto190(testNamespace string, garageNodeNames []string) {
 	By("deleting admission webhook configurations first")
 	_, _ = utils.Run(exec.Command("kubectl", "delete", "validatingwebhookconfiguration",
 		"garage-operator-validating-webhook-configuration", "--ignore-not-found"))
@@ -5540,8 +8037,12 @@ func cleanupAuto190(testNamespace, clusterName string, garageNodeNames []string)
 		_, _ = utils.Run(exec.Command("kubectl", "patch", "garagenode", n, "-n", testNamespace,
 			"--type=merge", "-p", `{"metadata":{"finalizers":null}}`))
 	}
-	_, _ = utils.Run(exec.Command("kubectl", "patch", "garagecluster", clusterName, "-n", testNamespace,
-		"--type=merge", "-p", `{"metadata":{"finalizers":null}}`))
+	output, _ := utils.Run(exec.Command("kubectl", "get", "garageclusters", "-n", testNamespace,
+		"-o", "jsonpath={.items[*].metadata.name}"))
+	for _, n := range strings.Fields(output) {
+		_, _ = utils.Run(exec.Command("kubectl", "patch", "garagecluster", n, "-n", testNamespace,
+			"--type=merge", "-p", `{"metadata":{"finalizers":null}}`))
+	}
 	_, _ = utils.Run(exec.Command("kubectl", "delete", "garagenode", "--all", "-n", testNamespace,
 		"--wait=false", "--ignore-not-found"))
 	_, _ = utils.Run(exec.Command("kubectl", "delete", "garagecluster", "--all", "-n", testNamespace,

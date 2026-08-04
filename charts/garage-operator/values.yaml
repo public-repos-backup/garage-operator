@@ -71,8 +71,10 @@ resources:
 
 # Leader election configuration
 leaderElection:
-  # -- Enable leader election for HA deployments
+  # -- Enable the single-active-manager safety boundary. Required for supported installations.
   enabled: true
+  # -- Explicitly acknowledge unsupported single-replica operation without leader election.
+  unsafeAllowDisabled: false
 
 # Health probes configuration
 livenessProbe:
@@ -184,7 +186,9 @@ networkPolicy:
 # Kubernetes' storedVersions invariant is preserved.
 webhooks:
   # -- Enable admission and conversion webhooks. Required when multiple API versions
-  # are in use. cert-manager must be installed.
+  # are in use, for nodeLocalPools, and for admission-protected storage deletion.
+  # Disabling this is supported only for local development or simple v1beta2-only
+  # installs that do not rely on those safety boundaries. cert-manager must be installed.
   enabled: true
   # -- Failure policy for webhooks (Fail or Ignore)
   failurePolicy: Fail
