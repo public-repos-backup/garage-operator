@@ -39,6 +39,10 @@ A Kubernetes operator for [Garage](https://garagehq.deuxfleurs.fr/) - distribute
 
 ## Install
 
+Requires Kubernetes 1.25+, or **1.27+ if you use
+[node-local pools](#experimental-node-local-pools-daemonset-backed)**, which
+depend on Pod scheduling gates for their activation fence.
+
 The Helm chart enables admission and conversion webhooks by default, so install
 cert-manager first. Disabling webhooks is limited to local development or
 simple v1beta2-only installs that neither use `nodeLocalPools` nor rely on
@@ -830,7 +834,7 @@ ordinary `GarageNode` with a pre-provisioned `existingClaim`.
 
 ## Custom Container Environment Variables
 
-Both tiers expose `env` and `envFrom` for injecting arbitrary env vars into the Garage container. Built-in vars (`GARAGE_NODE_HOST`, log sinks) are set first; user entries are appended after, so a user-supplied `GARAGE_NODE_HOST` would shadow the built-in.
+Both tiers expose `env` and `envFrom` for injecting arbitrary env vars into the Garage container, as does `GarageNode.spec.env`. Built-in vars (`GARAGE_NODE_HOST`, log sinks) are set first; user entries are appended after, so a user-supplied `GARAGE_NODE_HOST` would shadow the built-in.
 
 ```yaml
 spec:
@@ -846,6 +850,28 @@ spec:
       - name: RUST_BACKTRACE
         value: "full"
 ```
+
+### Reserved variables
+
+These names are operator-reserved and rejected by admission:
+
+| Variable | Also reserved |
+|---|---|
+| `GARAGE_CONFIG_FILE` | — |
+| `GARAGE_RPC_SECRET` | `GARAGE_RPC_SECRET_FILE` |
+| `GARAGE_ADMIN_TOKEN` | `GARAGE_ADMIN_TOKEN_FILE` |
+| `GARAGE_METRICS_TOKEN` | `GARAGE_METRICS_TOKEN_FILE` |
+
+Overriding them would change the live mesh identity, or the consistency and
+timeout settings a storage-drain proof depends on, without the operator being
+able to see it. `envFrom` prefixes that could expand into one of these names are
+rejected for the same reason.
+
+Earlier releases accepted these overrides. If you are upgrading with one set,
+the object keeps reconciling only while the entry stays byte-for-byte unchanged,
+and the operator asks you to remove it — see
+[MIGRATION.md](MIGRATION.md#reserved-garage-environment-variables-v070) for the
+two-step annotation flow.
 
 ## Operational Annotations
 
