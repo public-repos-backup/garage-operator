@@ -135,14 +135,18 @@ func unprovenTokenFixture() (*garagev1beta2.GarageCluster, []client.Object, stri
 // A replication-factor purge deletes cluster_layout on every storage node, so
 // Garage answers every admin-token read with "Layout not ready" until a layout is
 // committed. Re-proving the dynamic token needs that table; committing a layout
-// needs an Admin client. If an unproven-but-intact token is fatal to client
-// construction, those two facts close a loop and RebuildingLayout waits forever
-// — observed as a 40-minute e2e shard timeout with the cluster fully healthy.
+// needs an Admin client. That loop is real — it wedged RebuildingLayout for a
+// full 40m e2e shard — but it must NOT be broken here, by downgrading the shared
+// client to the static credential.
 //
-// The static bootstrap credential is mounted in the very Pods being dialed and is
-// what the token's own re-verification authenticates with, so it is the correct
-// fallback here, exactly as it is before any dynamic token exists.
-func TestAdminTokenFallsBackToStaticWhenDynamicTokenIsUnprovenOnLivePods(t *testing.T) {
+// GetStaticAdminToken returns the cluster's *current* credential revision, while
+// this client dials the load-balanced Service. A Pod that started before the last
+// rotation still holds the older bearer (Garage reads its config once at
+// startup), so the substituted token draws a 403 from whichever Pod the Service
+// happens to pick — intermittently, which is the worst way to fail. Callers that
+// must reach Garage while the dynamic token is unprovable pin to one Pod instead:
+// staticGarageClientForPod reads the bearer from that Pod's own spec.
+func TestAdminTokenDoesNotDowngradeToStaticOnTheSharedServiceClient(t *testing.T) {
 	cluster, objects, staticToken := unprovenTokenFixture()
 	kubeClient := fake.NewClientBuilder().WithScheme(operatorPodSetTestScheme(t)).WithObjects(objects...).Build()
 
@@ -151,11 +155,14 @@ func TestAdminTokenFallsBackToStaticWhenDynamicTokenIsUnprovenOnLivePods(t *test
 	}
 
 	token, err := GetAdminToken(context.Background(), kubeClient, cluster)
-	if err != nil {
-		t.Fatalf("GetAdminToken must fall back to the mounted static credential, got error: %v", err)
+	if err == nil {
+		t.Fatalf("an unproven dynamic token must not silently become the static credential; got token %q", token)
 	}
-	if token != staticToken {
-		t.Fatalf("GetAdminToken = %q, want the static bootstrap credential %q", token, staticToken)
+	if token == staticToken {
+		t.Fatal("GetAdminToken returned the static credential for the load-balanced Service client")
+	}
+	if !strings.Contains(err.Error(), "not been directly verified") {
+		t.Fatalf("want the unproven-incarnation error, got: %v", err)
 	}
 }
 

@@ -21,7 +21,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	stderrors "errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -383,30 +382,24 @@ const (
 // every running process, and otherwise uses the immutable static bootstrap
 // credential revision.
 func GetAdminToken(ctx context.Context, c client.Client, cluster *garagev1beta2.GarageCluster) (string, error) {
+	// An unproven dynamic token is deliberately NOT downgraded to the static
+	// credential here. This client dials the load-balanced cluster Service, and
+	// GetStaticAdminToken returns the cluster's *current* credential revision —
+	// which a Pod that started before the last rotation does not have, because
+	// Garage reads its config once at startup. Substituting it sends a bearer the
+	// receiving process never accepted and earns a 403 from whichever Pod the
+	// Service happens to pick, intermittently.
+	//
+	// Callers that legitimately need to reach Garage while the dynamic token is
+	// unprovable must pin to one Pod instead: directVerifiedOperatorAdminClient
+	// once a layout is committed, or staticGarageClientForPod before one exists,
+	// which reads the credential from that Pod's own spec and so cannot mismatch.
 	token, ready, err := getReadyOperatorAdminToken(ctx, c, cluster)
-	switch {
-	case ready:
-		return token, nil
-	case err == nil:
-		// No dynamic token exists yet — ordinary bootstrap.
-	case stderrors.Is(err, errAdminTokenUnproven):
-		// The credential is intact but not proven against the Pod incarnations
-		// that are live now, so it cannot be used. That is a liveness state, not
-		// an integrity failure, and it is indistinguishable — credential-wise —
-		// from the bootstrap case above: the static token mounted into those very
-		// Pods is the operator's own, and is what every direct Pod probe and the
-		// dynamic token's own re-verification already authenticate with. Falling
-		// through keeps a deliberate whole-cluster restart (a factor-migration
-		// purge above all) from wedging: re-proving the dynamic token needs the
-		// admin-token table, the table needs a layout, and committing a layout
-		// needs this client.
-		static, staticErr := GetStaticAdminToken(ctx, c, cluster)
-		if staticErr != nil {
-			return "", fmt.Errorf("%w; static bootstrap fallback also unavailable: %w", err, staticErr)
-		}
-		return static, nil
-	default:
+	if err != nil {
 		return "", err
+	}
+	if ready {
+		return token, nil
 	}
 	return GetStaticAdminToken(ctx, c, cluster)
 }
