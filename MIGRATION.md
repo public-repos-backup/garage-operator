@@ -1,9 +1,6 @@
 # Migration Guide
 
-## Node-local pools (next minor release)
-
-No release version is assigned by this change. Do not tag or publish a release
-as part of this migration work.
+## Node-local pools (v0.7.0)
 
 Node-local pools are an experimental, explicitly selected v1beta2 API under
 `spec.storage.nodeLocalPools`. Released v0.6.29 does not contain the feature, so existing
@@ -108,7 +105,7 @@ After the final topology transaction and rollout have cleared at every site,
 configuration-only rollout if the deployment relies on that read-availability
 tradeoff.
 
-## Reserved Garage environment variables (next minor release)
+## Reserved Garage environment variables (v0.7.0)
 
 Released operators let `spec.storage.env`, `spec.gateway.env`, and
 `GarageNode.spec.env` override `GARAGE_CONFIG_FILE` and the RPC, Admin, and

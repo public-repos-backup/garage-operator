@@ -652,7 +652,7 @@ failure domains within one workload-owning cluster.
 
 ## Upgrading development snapshots of this feature
 
-Node-local pools are new in the next minor release; released v0.6.29 and the
+Node-local pools are new in v0.7.0; released v0.6.29 and the
 upstream base do not contain a pool API. Ordinary v1beta1/v1beta2 clusters need
 no compatibility migration.
 
