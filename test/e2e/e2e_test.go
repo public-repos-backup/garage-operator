@@ -7858,8 +7858,30 @@ spec:
 		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		const adminToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+		// Corroborate the barrier against Garage while the operator is still
+		// asserting it, immediately after the check above — not behind the rejoin
+		// below. The two advance on independent clocks: the operator releases once
+		// data movement is done, while Garage retires a version only once its
+		// bookkeeping catches up, and either can finish first. Demanding both a
+		// committed rejoin and a still-visible Draining version in one poll asserts
+		// an overlap nothing guarantees, which is a flake, not a property.
+		By("corroborating the reported barrier against a directly observed draining version")
 		Eventually(func(g Gomega) {
-			rejoinLayout, rejoinHistory := readGarageLayoutSnapshot(
+			_, barrierHistory := readGarageLayoutSnapshot(
+				g, testNamespace, "node-local-rejoin-draining-snapshot", clusterName, adminToken,
+			)
+			historyStatuses := make([]string, 0, len(barrierHistory.Versions))
+			for _, version := range barrierHistory.Versions {
+				historyStatuses = append(historyStatuses, version.Status)
+			}
+			g.Expect(historyStatuses).To(ContainElement("Draining"),
+				"GarageNode reported a history barrier without a directly observed draining version")
+		}, time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying the rejoin Apply committed the retained disk identity")
+		Eventually(func(g Gomega) {
+			rejoinLayout, _ := readGarageLayoutSnapshot(
 				g, testNamespace, "node-local-rejoin-applied-snapshot", clusterName, adminToken,
 			)
 			rejoinRoleIDs := make([]string, 0, len(rejoinLayout.Roles))
@@ -7870,12 +7892,6 @@ spec:
 				"the rejoin layout Apply did not commit the retained disk identity")
 			g.Expect(rejoinLayout.StagedRoleChanges).To(BeEmpty(),
 				"rejoin left an uncommitted Garage layout mutation")
-			historyStatuses := make([]string, 0, len(rejoinHistory.Versions))
-			for _, version := range rejoinHistory.Versions {
-				historyStatuses = append(historyStatuses, version.Status)
-			}
-			g.Expect(historyStatuses).To(ContainElement("Draining"),
-				"GarageNode reported a history barrier without a directly observed draining version")
 		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("waiting for Garage's prior layout version to finish synchronizing before reporting rejoin convergence")
