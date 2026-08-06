@@ -35,9 +35,11 @@ rules:
   resources:
   - pods
   verbs:
+  - create
   - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - ""
@@ -50,6 +52,7 @@ rules:
 - apiGroups:
   - apps
   resources:
+  - daemonsets
   - deployments
   - statefulsets
   verbs:
@@ -59,6 +62,16 @@ rules:
   - list
   - patch
   - update
+  - watch
+# Read-only: the released-environment migration walks Deployment -> ReplicaSet
+# -> Pod to prove which live Garage processes share an RPC identity.
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+  - list
   - watch
 # Policy resources for PodDisruptionBudget
 - apiGroups:

@@ -22,12 +22,17 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -40,14 +45,16 @@ import (
 // pod landed on, so one cluster can express internal failure domains.
 var _ = Describe("GarageNode zoneFrom resolution", func() {
 	const (
-		ns          = "zf-ns"
-		clusterName = "zf"
-		nodeName    = "zf-storage-0"
-		podName     = "zf-storage-0-0"
-		k8sNodeName = "worker-3"
-		rackLabel   = "example.com/rack"
-		specZone    = "fallback-zone"
-		rackB       = "rack-b"
+		ns           = "zf-ns"
+		clusterName  = "zf"
+		nodeName     = "zf-storage-0"
+		podName      = "zf-storage-0-0"
+		k8sNodeName  = "worker-3"
+		rackLabel    = "example.com/rack"
+		specZone     = "fallback-zone"
+		rackB        = "rack-b"
+		clusterUID   = types.UID("test-cluster-uid")
+		daemonSetUID = types.UID("test-daemonset-uid")
 	)
 
 	var (
@@ -58,6 +65,7 @@ var _ = Describe("GarageNode zoneFrom resolution", func() {
 	BeforeEach(func() {
 		bctx = context.Background()
 		scheme = runtime.NewScheme()
+		Expect(appsv1.AddToScheme(scheme)).To(Succeed())
 		Expect(corev1.AddToScheme(scheme)).To(Succeed())
 		Expect(garagev1beta1.AddToScheme(scheme)).To(Succeed())
 		Expect(garagev1beta2.AddToScheme(scheme)).To(Succeed())
@@ -65,7 +73,7 @@ var _ = Describe("GarageNode zoneFrom resolution", func() {
 
 	cluster := func() *garagev1beta2.GarageCluster {
 		return &garagev1beta2.GarageCluster{
-			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns, UID: clusterUID},
 		}
 	}
 
@@ -119,6 +127,49 @@ var _ = Describe("GarageNode zoneFrom resolution", func() {
 		Expect(zone).To(Equal("us-east-1c"))
 	})
 
+	It("resolves through the shared DaemonSet pod on kubernetesNodeName", func() {
+		gn := garageNode(&garagev1beta1.ZoneSource{NodeLabel: rackLabel})
+		gn.Spec.Backing = garagev1beta1.NodeBackingNodeLocalPool
+		gn.Spec.KubernetesNodeName = k8sNodeName
+		gn.Spec.NodeLocalPoolName = testTagLocal
+		dsPod := pod(k8sNodeName)
+		dsPod.Name = "zf-storage-daemonset-abcde"
+		dsPod.Labels = map[string]string{
+			labelCluster:       clusterName,
+			labelTier:          tierStorage,
+			labelNodeLocalPool: testTagLocal,
+		}
+		dsPod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "apps/v1",
+			Kind:       daemonSetKind,
+			Name:       clusterName + "-storage-local",
+			UID:        daemonSetUID,
+			Controller: ptr.To(true),
+		}}
+		daemonSet := &appsv1.DaemonSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName + "-storage-local",
+				Namespace: ns,
+				UID:       daemonSetUID,
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: garagev1beta2.GroupVersion.String(),
+					Kind:       testGarageClusterKind,
+					Name:       clusterName,
+					UID:        clusterUID,
+					Controller: ptr.To(true),
+				}},
+			},
+		}
+
+		zone := resolve(
+			gn,
+			daemonSet,
+			dsPod,
+			k8sNode(map[string]string{rackLabel: rackB}),
+		)
+		Expect(zone).To(Equal(rackB))
+	})
+
 	It("returns spec.zone unchanged when zoneFrom is unset", func() {
 		zone := resolve(
 			garageNode(nil),
@@ -148,19 +199,32 @@ var _ = Describe("GarageNode zoneFrom resolution", func() {
 		Expect(zone).To(Equal(specZone))
 	})
 
-	It("falls back when the Kubernetes Node does not carry the label", func() {
+	It("retains the last observed zone across a transient pod replacement gap", func() {
+		gn := garageNode(&garagev1beta1.ZoneSource{NodeLabel: rackLabel})
+		gn.Status.Zone = rackB
 		zone := resolve(
-			garageNode(&garagev1beta1.ZoneSource{NodeLabel: rackLabel}),
+			gn,
+			k8sNode(map[string]string{rackLabel: "rack-c"}),
+		)
+		Expect(zone).To(Equal(rackB),
+			"a missing replacement pod must not flip the committed role to spec.zone and back")
+	})
+
+	It("falls back when the Kubernetes Node does not carry the label", func() {
+		gn := garageNode(&garagev1beta1.ZoneSource{NodeLabel: rackLabel})
+		gn.Status.Zone = rackB
+		zone := resolve(
+			gn,
 			pod(k8sNodeName),
 			k8sNode(map[string]string{"other/label": rackB}),
 		)
-		Expect(zone).To(Equal(specZone))
+		Expect(zone).To(Equal(specZone), "a readable Node with the label removed uses the explicit fallback")
 	})
 
 	It("falls back when Nodes are not readable (namespace-scoped install)", func() {
-		// A namespace-scoped install grants only Roles, so the cluster-scoped
-		// `nodes` resource 403s. Erroring here would wedge every GarageNode in
-		// such an install the moment someone set zoneFrom.
+		// The low-level resolver keeps an already-running process on its safe
+		// fallback if a Node read transiently fails. Normal reconciliation rejects
+		// new namespace-scoped zoneFrom use explicitly below.
 		gn := garageNode(&garagev1beta1.ZoneSource{NodeLabel: rackLabel})
 		fc := fake.NewClientBuilder().WithScheme(scheme).
 			WithObjects(gn, pod(k8sNodeName), k8sNode(map[string]string{rackLabel: rackB})).
@@ -174,6 +238,27 @@ var _ = Describe("GarageNode zoneFrom resolution", func() {
 			}).Build()
 		r := &GarageNodeReconciler{Client: fc, Scheme: scheme}
 		Expect(r.effectiveNodeZone(bctx, gn, cluster())).To(Equal(specZone))
+	})
+
+	It("reports an actionable failure for Manual or SMB nodes in a namespace-scoped install", func() {
+		gn := garageNode(&garagev1beta1.ZoneSource{NodeLabel: rackLabel})
+		gn.Generation = 3
+		parent := cluster()
+		parent.Spec.LayoutPolicy = LayoutPolicyManual
+		fc := fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&garagev1beta1.GarageNode{}).
+			WithObjects(gn, parent).
+			Build()
+		r := &GarageNodeReconciler{Client: fc, Scheme: scheme, ClusterScoped: false}
+		_, err := r.Reconcile(bctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(gn)})
+		Expect(err).NotTo(HaveOccurred())
+
+		fresh := &garagev1beta1.GarageNode{}
+		Expect(fc.Get(bctx, client.ObjectKeyFromObject(gn), fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(PhaseFailed))
+		condition := meta.FindStatusCondition(fresh.Status.Conditions, PhaseReady)
+		Expect(condition).NotTo(BeNil())
+		Expect(condition.Message).To(ContainSubstring("cluster-scoped operator install"))
 	})
 
 	It("falls back on external nodes, which have no pod", func() {

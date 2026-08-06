@@ -19,6 +19,8 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"reflect"
+	"slices"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -113,35 +115,60 @@ func TestNodeIDFromDiscovery(t *testing.T) {
 }
 
 func TestNodeSpecificRPCAddressTags(t *testing.T) {
-	original := []string{testGatewayOwnershipTag, testTierStorageTag, nodeRPCAddressTagPrefix + "old.example:3901"}
-	tags := desiredNodeRoleTags(original, "new.example:3901")
-	if len(tags) != 3 || tags[2] != nodeRPCAddressTagPrefix+"new.example:3901" {
-		t.Fatalf("desired tags = %#v, want one current RPC address tag", tags)
+	original := []string{
+		"cluster:forged/namespace",
+		"cluster-uid:forged",
+		testTierGatewayTag,
+		nodeRPCAddressTagPrefix + "old.example:3901",
+		"node-local-pool:forged",
+		"kubernetes-node:forged",
+		testRackATag,
 	}
-	if original[2] != nodeRPCAddressTagPrefix+"old.example:3901" {
+	tags := desiredNodeRoleTags(
+		original,
+		"new.example:3901",
+		testGatewayOwnershipTag,
+		"cluster-uid:real-site",
+		testTierStorageTag,
+		"node-local-pool:local",
+		"kubernetes-node:worker-1",
+	)
+	want := []string{
+		testGatewayOwnershipTag,
+		"cluster-uid:real-site",
+		testTierStorageTag,
+		"node-local-pool:local",
+		"kubernetes-node:worker-1",
+		testRackATag,
+		nodeRPCAddressTagPrefix + "new.example:3901",
+	}
+	if !reflect.DeepEqual(tags, want) {
+		t.Fatalf("desired tags = %#v, want canonical reserved tags %#v", tags, want)
+	}
+	if original[3] != nodeRPCAddressTagPrefix+"old.example:3901" {
 		t.Fatalf("desiredNodeRoleTags mutated its input: %#v", original)
 	}
 
 	capacity := uint64(1024)
 	remote := garagev1beta2.RemoteClusterConfig{Name: testRemoteRoleTag, Zone: "remote-zone"}
-	imported := remoteImportTags(remote, "garage", &capacity, tags)
+	imported := remoteImportTags(remote, testGarageValue, &capacity, tags)
 	wantRPC := nodeRPCAddressTagPrefix + "new.example:3901"
 	foundRPC := false
 	for _, tag := range imported {
 		if tag == wantRPC {
 			foundRPC = true
 		}
-		if tag == testGatewayOwnershipTag {
-			t.Fatalf("source ownership tag must not survive import: %#v", imported)
-		}
 	}
 	if !foundRPC {
 		t.Fatalf("imported tags lost node RPC address: %#v", imported)
 	}
+	if !slices.Contains(imported, testGatewayOwnershipTag) || !slices.Contains(imported, "cluster-uid:real-site") {
+		t.Fatalf("federated import rewrote immutable source ownership tags: %#v", imported)
+	}
 
 	node := garage.NodeInfo{Role: &garage.NodeAssignedRole{Tags: imported}}
 	addr, source := remoteNodeRPCAddress(node, "shared.example", 3901)
-	if addr != "new.example:3901" || source != "layout-tag" {
+	if addr != "new.example:3901" || source != nodeRPCAddressSourceLayoutTag {
 		t.Fatalf("address = (%q,%q), want node-specific layout address", addr, source)
 	}
 }
@@ -154,6 +181,35 @@ func TestRemoteNodeRPCAddressFallbacks(t *testing.T) {
 	}
 	if addr, source := remoteNodeRPCAddress(node, "", 3901); addr != observed || source != "observed-peer" {
 		t.Fatalf("observed fallback = (%q,%q)", addr, source)
+	}
+}
+
+func TestMergeRemoteLayoutRolesRefreshesDaemonSetRPCAddress(t *testing.T) {
+	const nodeID = "1111111111111111111111111111111111111111111111111111111111111111"
+	nodes := []garage.NodeInfo{{
+		ID:   nodeID,
+		IsUp: false,
+		Role: &garage.NodeAssignedRole{
+			Zone: "remote",
+			Tags: []string{nodeRPCAddressTagPrefix + "10.0.0.10:3901"},
+		},
+	}}
+	layout := &garage.ClusterLayout{Roles: []garage.LayoutNodeRole{{
+		ID:   nodeID,
+		Zone: "remote",
+		Tags: []string{nodeRPCAddressTagPrefix + "10.0.0.11:3901"},
+	}}}
+
+	merged := mergeRemoteLayoutRoles(nodes, layout)
+	addr, source := remoteNodeRPCAddress(merged[0], "", 3901)
+	if addr != "10.0.0.11:3901" || source != nodeRPCAddressSourceLayoutTag {
+		t.Fatalf("refreshed address = (%q,%q), want new remote layout tag", addr, source)
+	}
+	if nodes[0].Role.Tags[0] != nodeRPCAddressTagPrefix+"10.0.0.10:3901" {
+		t.Fatalf("mergeRemoteLayoutRoles mutated local status input: %#v", nodes)
+	}
+	if merged[0].IsUp {
+		t.Fatal("role refresh must not overwrite local liveness observation")
 	}
 }
 

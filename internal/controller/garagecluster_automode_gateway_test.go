@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -32,6 +33,7 @@ import (
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
+	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
 func listOperatorOwnedGatewayNodes(clusterName string) *garagev1beta1.GarageNodeList {
@@ -55,7 +57,21 @@ var _ = Describe("GarageCluster unified-gateway Auto-mode (#209)", func() {
 	)
 
 	BeforeEach(func() {
-		reconciler = &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		reconciler = &GarageClusterReconciler{
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			layoutHistoryGetter: func(_ context.Context, _ *garagev1beta2.GarageCluster) (*garage.LayoutHistoryResponse, error) {
+				return &garage.LayoutHistoryResponse{
+					CurrentVersion: 1,
+					Versions: []garage.LayoutVersion{{
+						Version:      1,
+						Status:       garage.LayoutVersionStatusCurrent,
+						StorageNodes: 3,
+					}},
+				}, nil
+			},
+		}
 		clusterNN = types.NamespacedName{Name: uniqueClusterName("uni-gw"), Namespace: testNamespace}
 		cluster = &garagev1beta2.GarageCluster{
 			ObjectMeta: metav1.ObjectMeta{Name: clusterNN.Name, Namespace: testNamespace},
@@ -72,6 +88,32 @@ var _ = Describe("GarageCluster unified-gateway Auto-mode (#209)", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+		// Unified gateway identities are not allowed to bootstrap an empty
+		// Garage layout. Seed the already-settled storage member that would have
+		// been created by reconcileAutoModeStorageNodes in a full cluster
+		// reconciliation.
+		storagePrerequisite := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterNN.Name + "-storage-prerequisite",
+				Namespace: testNamespace,
+				Labels: map[string]string{
+					labelCluster: clusterNN.Name,
+					labelTier:    tierStorage,
+				},
+			},
+			Spec: garagev1beta1.GarageNodeSpec{
+				ClusterRef: garagev1beta1.ClusterReference{Name: clusterNN.Name},
+				Zone:       testZone,
+				Capacity:   ptrQuantity(resource.MustParse("10Gi")),
+			},
+		}
+		Expect(k8sClient.Create(ctx, storagePrerequisite)).To(Succeed())
+		storagePrerequisite.Status.NodeID = "node-" + storagePrerequisite.Name
+		storagePrerequisite.Status.Connected = true
+		storagePrerequisite.Status.InLayout = true
+		storagePrerequisite.Status.ObservedGeneration = storagePrerequisite.Generation
+		Expect(k8sClient.Status().Update(ctx, storagePrerequisite)).To(Succeed())
 	})
 
 	AfterEach(func() {
@@ -91,7 +133,29 @@ var _ = Describe("GarageCluster unified-gateway Auto-mode (#209)", func() {
 		}
 	})
 
+	markGatewayNodesReady := func() {
+		for _, item := range listOperatorOwnedGatewayNodes(clusterNN.Name).Items {
+			node := item.DeepCopy()
+			node.Status.NodeID = "node-" + node.Name
+			node.Status.Connected = true
+			node.Status.InLayout = true
+			node.Status.ObservedGeneration = node.Generation
+			Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+		}
+	}
+
+	reconcileAllGatewayNodes := func() {
+		for i := int32(0); i < cluster.GatewayReplicas(); i++ {
+			Expect(reconciler.reconcileAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
+			markGatewayNodesReady()
+		}
+	}
+
 	It("creates one gateway GarageNode per gateway replica with capacity=nil", func() {
+		Expect(reconciler.reconcileAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
+		Expect(listOperatorOwnedGatewayNodes(clusterNN.Name).Items).To(HaveLen(1),
+			"gateway identities must be admitted one at a time")
+		markGatewayNodesReady()
 		Expect(reconciler.reconcileAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
 
 		gnList := listOperatorOwnedGatewayNodes(clusterNN.Name)
@@ -116,9 +180,58 @@ var _ = Describe("GarageCluster unified-gateway Auto-mode (#209)", func() {
 		Expect(names).To(HaveKey(clusterNN.Name + "-gateway-1"))
 	})
 
+	It("projects the unified gateway metadata selector to newly generated GarageNodes", func() {
+		selector := &metav1.LabelSelector{MatchLabels: map[string]string{"disk.example.com/name": "gateway-meta"}}
+		cluster.Spec.Gateway.Metadata = &garagev1beta2.VolumeConfig{
+			Size:     ptrQuantity(resource.MustParse("1Gi")),
+			Selector: selector,
+		}
+		node, err := reconciler.buildAutoModeGatewayNode(cluster, 0, "")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(node.Spec.Storage).NotTo(BeNil())
+		Expect(node.Spec.Storage.Metadata).NotTo(BeNil())
+		Expect(node.Spec.Storage.Metadata.Selector).To(Equal(selector))
+		Expect(node.Labels).To(HaveKeyWithValue(labelAutoNodeSlot, node.Name))
+	})
+
+	It("keeps a promoted cycle sibling as the durable gateway ordinal", func() {
+		cluster.Spec.Gateway.Replicas = 1
+		Expect(reconciler.reconcileAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
+		markGatewayNodesReady()
+
+		canonicalName := autoModeGatewayNodeName(cluster.Name, 0)
+		canonical := &garagev1beta1.GarageNode{}
+		canonicalKey := types.NamespacedName{Name: canonicalName, Namespace: testNamespace}
+		Expect(k8sClient.Get(ctx, canonicalKey, canonical)).To(Succeed())
+
+		promoted := canonical.DeepCopy()
+		promoted.Name = canonicalName + cycleSiblingSuffix
+		promoted.ResourceVersion = ""
+		promoted.UID = ""
+		promoted.Generation = 0
+		promoted.CreationTimestamp = metav1.Time{}
+		promoted.ManagedFields = nil
+		promoted.Status = garagev1beta1.GarageNodeStatus{}
+		promoted.Labels[labelAutoNodeSlot] = canonicalName
+		delete(promoted.Labels, labelCycleSibling)
+		Expect(k8sClient.Create(ctx, promoted)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, canonical)).To(Succeed())
+
+		Expect(reconciler.reconcileAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
+
+		missingCanonical := &garagev1beta1.GarageNode{}
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, canonicalKey, missingCanonical))).To(BeTrue())
+		kept := &garagev1beta1.GarageNode{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Name: promoted.Name, Namespace: testNamespace,
+		}, kept)).To(Succeed())
+		Expect(kept.DeletionTimestamp.IsZero()).To(BeTrue(),
+			"the parent must not undo a completed gateway cycle")
+	})
+
 	It("is a no-op for gateway-only (edge) clusters", func() {
 		edge := &garagev1beta2.GarageCluster{
-			ObjectMeta: metav1.ObjectMeta{Name: uniqueClusterName("edge"), Namespace: testNamespace},
+			ObjectMeta: metav1.ObjectMeta{Name: uniqueClusterName(testEdgeValue), Namespace: testNamespace},
 			Spec: garagev1beta2.GarageClusterSpec{
 				LayoutPolicy: LayoutPolicyAuto,
 				Zone:         testZone,
@@ -133,7 +246,7 @@ var _ = Describe("GarageCluster unified-gateway Auto-mode (#209)", func() {
 	})
 
 	It("scales gateway GarageNodes down when replicas shrink", func() {
-		Expect(reconciler.reconcileAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
+		reconcileAllGatewayNodes()
 		Expect(listOperatorOwnedGatewayNodes(clusterNN.Name).Items).To(HaveLen(2))
 
 		Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
@@ -158,7 +271,7 @@ var _ = Describe("GarageCluster unified-gateway Auto-mode (#209)", func() {
 		Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
 		cluster.Spec.Gateway.RPCPublicAddr = testGatewayRPCAddr
 		Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
-		Expect(reconciler.reconcileAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
+		reconcileAllGatewayNodes()
 
 		for _, n := range listOperatorOwnedGatewayNodes(clusterNN.Name).Items {
 			Expect(n.Spec.Network).NotTo(BeNil())
@@ -167,7 +280,7 @@ var _ = Describe("GarageCluster unified-gateway Auto-mode (#209)", func() {
 	})
 
 	It("ejects gateway GarageNodes on Auto→Manual (drops controllerRef + managed-by)", func() {
-		Expect(reconciler.reconcileAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
+		reconcileAllGatewayNodes()
 		Expect(listOperatorOwnedGatewayNodes(clusterNN.Name).Items).To(HaveLen(2))
 
 		Expect(reconciler.ejectAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
@@ -197,7 +310,7 @@ var _ = Describe("GarageCluster unified-gateway Auto-mode (#209)", func() {
 				Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{labelCluster: clusterNN.Name, labelTier: tierGateway}},
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelCluster: clusterNN.Name, labelTier: tierGateway}},
-					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "garage", Image: "garage:test"}}},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: testGarageValue, Image: "garage:test"}}},
 				},
 				VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
 					ObjectMeta: metav1.ObjectMeta{Name: metadataVolName},
@@ -223,7 +336,7 @@ var _ = Describe("GarageCluster unified-gateway Auto-mode (#209)", func() {
 					Namespace: testNamespace,
 					OwnerReferences: []metav1.OwnerReference{{
 						APIVersion: "apps/v1",
-						Kind:       "StatefulSet",
+						Kind:       kindStatefulSet,
 						Name:       stsName,
 						UID:        legacySTS.UID,
 						Controller: ptr.To(true),
@@ -271,18 +384,48 @@ var _ = Describe("GarageCluster unified-gateway Auto-mode (#209)", func() {
 	})
 
 	It("per-node gateway STS does not delete the metadata PVC on STS update (Retain)", func() {
+		expectRetain := func(policy *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy) {
+			GinkgoHelper()
+			// Stated explicitly rather than left nil: it is the same policy the API
+			// server defaults to, but nil never DeepEquals the stored value, which
+			// made every reconcile rewrite the StatefulSet.
+			Expect(policy).NotTo(BeNil())
+			Expect(policy.WhenDeleted).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
+			Expect(policy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
+		}
+
 		gwNode, err := reconciler.buildAutoModeGatewayNode(cluster, 0, "")
 		Expect(err).NotTo(HaveOccurred())
-		// Gateway node → nil retention policy == K8s default Retain.
-		Expect(stsPVCRetentionPolicy(cluster, gwNode)).To(BeNil())
+		expectRetain(stsPVCRetentionPolicy(cluster, gwNode))
 
 		// Positive control: a storage node without spec.storage.pvcRetentionPolicy
-		// also yields nil (Retain).
+		// also retains.
 		storageNode := &garagev1beta1.GarageNode{
 			ObjectMeta: metav1.ObjectMeta{Name: clusterNN.Name + "-storage-0", Namespace: testNamespace},
 			Spec:       garagev1beta1.GarageNodeSpec{ClusterRef: garagev1beta1.ClusterReference{Name: clusterNN.Name}},
 		}
-		Expect(stsPVCRetentionPolicy(cluster, storageNode)).To(BeNil())
+		expectRetain(stsPVCRetentionPolicy(cluster, storageNode))
+	})
+
+	It("applies an explicit gateway PVC retention policy only to unified gateway members", func() {
+		cluster.Spec.Gateway.PVCRetentionPolicy = &garagev1beta2.PVCRetentionPolicy{
+			WhenDeleted: pvcRetentionDelete, WhenScaled: testRetentionRetain,
+		}
+		gatewayNode, err := reconciler.buildAutoModeGatewayNode(cluster, 0, "")
+		Expect(err).NotTo(HaveOccurred())
+		policy := stsPVCRetentionPolicy(cluster, gatewayNode)
+		Expect(policy).NotTo(BeNil())
+		Expect(policy.WhenDeleted).To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
+		Expect(policy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
+
+		storageNode := &garagev1beta1.GarageNode{
+			Spec: garagev1beta1.GarageNodeSpec{ClusterRef: garagev1beta1.ClusterReference{Name: clusterNN.Name}},
+		}
+		storagePolicy := stsPVCRetentionPolicy(cluster, storageNode)
+		Expect(storagePolicy).NotTo(BeNil())
+		Expect(storagePolicy.WhenDeleted).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType),
+			"gateway retention must not leak into positive-capacity storage claims")
+		Expect(storagePolicy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 	})
 
 	It("substitutes {ordinal} into gateway.rpcPublicAddr per pod (#cross-region per-pod reachability)", func() {

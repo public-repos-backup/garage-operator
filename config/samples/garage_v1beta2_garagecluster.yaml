@@ -32,9 +32,10 @@ spec:
         cpu: 1000m
         memory: 1Gi
 
-  # Gateway tier — ephemeral Deployment, EmptyDir for both metadata and data.
-  # Pod node IDs rotate per pod restart; the operator garbage-collects stale
-  # layout entries via tombstone cleanup.
+  # Gateway tier — one persistent Garage identity per replica. In the default
+  # Auto layout mode, a unified cluster generates one GarageNode and
+  # single-replica StatefulSet per gateway. Metadata uses a small PVC by
+  # default; block data stays EmptyDir.
   gateway:
     replicas: 2
     resources:

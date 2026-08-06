@@ -30,7 +30,7 @@ import (
 
 const (
 	mhName     = "existing"
-	mhNS       = "garage"
+	mhNS       = testGarageValue
 	mhEndpoint = "http://garage.garage.svc:3903"
 	mhSecret   = "ext-admin"
 )

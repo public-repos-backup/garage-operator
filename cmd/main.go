@@ -19,6 +19,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -30,6 +31,7 @@ import (
 
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -78,6 +80,7 @@ func main() {
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
 	var enableLeaderElection bool
+	var unsafeAllowNoLeaderElection bool
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
@@ -85,9 +88,7 @@ func main() {
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
+	bindLeaderElectionFlags(flag.CommandLine, &enableLeaderElection, &unsafeAllowNoLeaderElection)
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
@@ -153,6 +154,13 @@ func main() {
 		"GOMAXPROCS", runtime.GOMAXPROCS(0),
 		"GOMEMLIMIT", os.Getenv("GOMEMLIMIT"),
 	)
+	if err := validateLeaderElectionSafety(enableLeaderElection, unsafeAllowNoLeaderElection); err != nil {
+		setupLog.Error(err, "refusing unsafe controller-manager startup")
+		os.Exit(1)
+	}
+	if !enableLeaderElection {
+		setupLog.Info("UNSAFE CONFIGURATION: leader election is disabled; only one controller-manager process may run, and layout mutation is not serialized across processes or Kubernetes clusters")
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -225,6 +233,7 @@ func main() {
 	if watchNamespaces == "" {
 		watchNamespaces = os.Getenv("WATCH_NAMESPACE")
 	}
+	clusterScoped := true
 
 	managerOptions := ctrl.Options{
 		Scheme:                 scheme,
@@ -245,6 +254,7 @@ func main() {
 		}
 		if len(nsMap) > 0 {
 			managerOptions.Cache.DefaultNamespaces = nsMap
+			clusterScoped = false
 			setupLog.Info("watching namespaces", "namespaces", watchNamespaces)
 		} else {
 			setupLog.Info("watching all namespaces (WATCH_NAMESPACE set but resolved to empty)")
@@ -253,19 +263,31 @@ func main() {
 		setupLog.Info("watching all namespaces")
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), managerOptions)
+	restConfig := ctrl.GetConfigOrDie()
+	mgr, err := ctrl.NewManager(restConfig, managerOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "unable to create Kubernetes discovery client")
+		os.Exit(1)
+	}
+	layoutMutations := controller.NewLayoutMutationCoordinator()
 
 	_ = operatorNamespace // deprecated, kept for backward-compat flag parsing only
 	if err := (&controller.GarageClusterReconciler{
-		Client:        mgr.GetClient(),
-		APIReader:     mgr.GetAPIReader(),
-		Scheme:        mgr.GetScheme(),
-		ClusterDomain: clusterDomain,
-		DefaultImage:  defaultGarageImage,
+		Client:          mgr.GetClient(),
+		APIReader:       mgr.GetAPIReader(),
+		Scheme:          mgr.GetScheme(),
+		ClusterDomain:   clusterDomain,
+		DefaultImage:    defaultGarageImage,
+		ClusterScoped:   clusterScoped,
+		LayoutMutations: layoutMutations,
+		NodeLocalPoolPrerequisites: controller.NewNodeLocalPoolPrerequisiteChecker(
+			mgr.GetClient(), mgr.GetAPIReader(), discoveryClient,
+		),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GarageCluster")
 		os.Exit(1)
@@ -287,10 +309,13 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.GarageNodeReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		ClusterDomain: clusterDomain,
-		DefaultImage:  defaultGarageImage,
+		Client:          mgr.GetClient(),
+		APIReader:       mgr.GetAPIReader(),
+		Scheme:          mgr.GetScheme(),
+		ClusterDomain:   clusterDomain,
+		DefaultImage:    defaultGarageImage,
+		ClusterScoped:   clusterScoped,
+		LayoutMutations: layoutMutations,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GarageNode")
 		os.Exit(1)
@@ -401,4 +426,20 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func validateLeaderElectionSafety(enabled, unsafeOverride bool) error {
+	if enabled || unsafeOverride {
+		return nil
+	}
+	return fmt.Errorf("leader election is required; set --leader-elect=true or explicitly acknowledge unsupported operation with --unsafe-allow-no-leader-election")
+}
+
+func bindLeaderElectionFlags(flags *flag.FlagSet, enabled, unsafeOverride *bool) {
+	flags.BoolVar(enabled, "leader-elect", true,
+		"Enable leader election for controller manager. "+
+			"Node-local layout mutation requires exactly one active controller manager.")
+	flags.BoolVar(unsafeOverride, "unsafe-allow-no-leader-election", false,
+		"Explicitly allow the unsupported single-replica mode without leader election. "+
+			"Concurrent active managers can violate single-flight Garage layout mutation.")
 }

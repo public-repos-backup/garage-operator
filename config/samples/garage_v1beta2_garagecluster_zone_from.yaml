@@ -26,13 +26,13 @@ metadata:
 spec:
   image: dxflrs/garage:v2.3.0
 
-  # Applies to Auto-mode storage nodes. In Manual mode, set zoneFrom on each
-  # GarageNode instead.
+  # Applies to operator-managed default-group and node-local-pool GarageNodes.
+  # Set zoneFrom directly on user-owned Manual GarageNodes instead.
   layoutPolicy: Auto
 
-  # Fallback zone. Still required: it is what a node uses before its pod is
-  # scheduled, when the Kubernetes Node does not carry the label, and in
-  # namespace-scoped installs where the operator cannot read Nodes.
+  # Fallback zone. Still required: it is what a node uses before its Pod is
+  # scheduled or when the readable Kubernetes Node does not carry the label.
+  # Failure to read Nodes is reported as Failed; it does not use this fallback.
   zone: site-a
 
   zoneFrom:

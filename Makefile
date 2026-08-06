@@ -147,9 +147,21 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
 KIND_CLUSTER ?= garage-operator-test-e2e
+# Optional Kubernetes node image. CI pins this so Kind does not silently move
+# the suite to a newer Kubernetes release when Kind's default changes.
+KIND_NODE_IMAGE ?=
+# Optional Kind config for topology-specific shards (for example, the
+# multi-worker DaemonSet node-local-pool suite). Empty keeps Kind's one-node default.
+KIND_CONFIG_E2E ?=
 # GINKGO_LABEL_FILTER selects a subset of e2e specs by Ginkgo label (empty = all).
 # CI sets this per matrix shard to split the suite across parallel Kind clusters.
 GINKGO_LABEL_FILTER ?=
+# E2E_GO_TIMEOUT must stay BELOW the CI job's timeout-minutes. When the job
+# timeout fires first the runner SIGKILLs the process group and Go never prints
+# its goroutine dump, so a hung spec is indistinguishable from a slow one. Going
+# through Go's own timeout instead yields a full stack trace naming the stuck
+# spec.
+E2E_GO_TIMEOUT ?= 40m
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -162,12 +174,16 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
 		*) \
 			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+			if [ -n "$(KIND_CONFIG_E2E)" ]; then \
+				$(KIND) create cluster --name $(KIND_CLUSTER) --config "$(KIND_CONFIG_E2E)" $(if $(KIND_NODE_IMAGE),--image "$(KIND_NODE_IMAGE)"); \
+			else \
+				$(KIND) create cluster --name $(KIND_CLUSTER) $(if $(KIND_NODE_IMAGE),--image "$(KIND_NODE_IMAGE)"); \
+			fi ;; \
 	esac
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter="$(GINKGO_LABEL_FILTER)" -timeout 50m
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter="$(GINKGO_LABEL_FILTER)" -timeout $(E2E_GO_TIMEOUT)
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e

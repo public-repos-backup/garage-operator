@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -88,6 +90,87 @@ var _ = BeforeSuite(func() {
 		}
 	}
 })
+
+// captureFailureDiagnostics writes operator logs and cluster state for a failed
+// spec while the cluster is still intact.
+//
+// This runs as JustAfterEach, the earliest cleanup hook Ginkgo offers: it fires
+// immediately after the subject node, before any DeferCleanup registered inside
+// the spec and before a Describe-level AfterAll runs "make undeploy". Both of
+// those destroy the evidence — an AfterEach here still ran after a spec's own
+// DeferCleanup had deleted the namespace, and CI's post-run collection step
+// observes a fully torn-down cluster and uploads an empty artifact.
+var _ = JustAfterEach(func() {
+	report := CurrentSpecReport()
+	if !report.Failed() {
+		return
+	}
+	directory := os.Getenv("E2E_DEBUG_DIR")
+	if directory == "" {
+		directory = "/tmp/e2e-debug"
+	}
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: cannot create %s: %v\n", directory, err)
+		return
+	}
+	slug := failureArtifactSlug(report.FullText())
+	for name, args := range map[string][]string{
+		"operator-logs": {
+			"logs", "deployment/garage-operator-controller-manager",
+			"-n", "garage-operator-system", "--tail=2000",
+		},
+		// A crashed-and-restarted operator is the case where the current
+		// container's log is least useful: it starts after the interesting part.
+		// Fails harmlessly (and is recorded as such) when there was no restart.
+		"operator-logs-previous": {
+			"logs", "deployment/garage-operator-controller-manager",
+			"-n", "garage-operator-system", "--previous", "--tail=2000",
+		},
+		"garage-resources": {
+			"get", "garageclusters,garagenodes,garagebuckets,garagekeys",
+			"-A", "-o", "yaml",
+		},
+		"workloads": {"get", "all,pvc,pv", "-A"},
+		"events":    {"get", "events", "-A", "--sort-by=.lastTimestamp"},
+	} {
+		output, err := utils.Run(exec.Command("kubectl", args...))
+		if err != nil {
+			output += "\n" + err.Error()
+		}
+		path := filepath.Join(directory, slug+"-"+name+".txt")
+		if writeErr := os.WriteFile(path, []byte(output), 0o600); writeErr != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: cannot write %s: %v\n", path, writeErr)
+			continue
+		}
+		_, _ = fmt.Fprintf(GinkgoWriter, "wrote failure diagnostics to %s\n", path)
+	}
+})
+
+// failureArtifactSlug reduces a spec name to a bounded, filesystem-safe stem.
+func failureArtifactSlug(name string) string {
+	var builder strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			builder.WriteRune(r + ('a' - 'A'))
+		default:
+			builder.WriteByte('-')
+		}
+	}
+	slug := strings.Trim(builder.String(), "-")
+	for strings.Contains(slug, "--") {
+		slug = strings.ReplaceAll(slug, "--", "-")
+	}
+	if len(slug) > 80 {
+		slug = slug[:80]
+	}
+	if slug == "" {
+		slug = "spec"
+	}
+	return slug
+}
 
 var _ = AfterSuite(func() {
 	if os.Getenv("E2E_SKIP_SUITE_SETUP") == "true" {

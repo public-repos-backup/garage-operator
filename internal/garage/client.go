@@ -19,6 +19,7 @@ package garage
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -75,6 +76,13 @@ func IsBadRequest(err error) bool {
 		return apiErr.StatusCode == http.StatusBadRequest
 	}
 	return false
+}
+
+// IsForbidden returns true when Garage rejected the supplied Admin bearer
+// token or its dynamic-token scope.
+func IsForbidden(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusForbidden
 }
 
 // IsServiceUnavailable returns true if the error is a 503 Service Unavailable error.
@@ -273,6 +281,134 @@ type ClusterStatus struct {
 	Nodes         []NodeInfo `json:"nodes"`
 }
 
+// LocalNodeInfo is the identity-bearing subset of Garage's
+// LocalGetNodeInfoResponse. The nodeId is read from garage.system.id by the
+// daemon that serves the request; it is not inferred from cluster peer state.
+type LocalNodeInfo struct {
+	NodeID string `json:"nodeId"`
+}
+
+// AdminTokenInfo is Garage v2's metadata for a dynamic Admin API token. Static
+// configured admin/metrics pseudo-entries returned by ListAdminTokens have a
+// nil ID and cannot be updated or deleted through the table API.
+type AdminTokenInfo struct {
+	ID         *string    `json:"id"`
+	Created    *time.Time `json:"created"`
+	Name       string     `json:"name"`
+	Expiration *time.Time `json:"expiration"`
+	Expired    bool       `json:"expired"`
+	Scope      []string   `json:"scope"`
+}
+
+// AdminTokenUpdate is accepted by CreateAdminToken and UpdateAdminToken.
+type AdminTokenUpdate struct {
+	Name         *string    `json:"name,omitempty"`
+	Expiration   *time.Time `json:"expiration,omitempty"`
+	NeverExpires bool       `json:"neverExpires,omitempty"`
+	Scope        *[]string  `json:"scope,omitempty"`
+}
+
+// CreateAdminTokenResponse contains the one-time bearer secret plus flattened
+// token metadata.
+type CreateAdminTokenResponse struct {
+	SecretToken string `json:"secretToken"`
+	AdminTokenInfo
+}
+
+// ListAdminTokens returns dynamic table entries and Garage's static configured
+// pseudo-entries (the latter have ID=nil).
+func (c *Client) ListAdminTokens(ctx context.Context) ([]AdminTokenInfo, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/v2/ListAdminTokens", nil)
+	if err != nil {
+		return nil, err
+	}
+	var tokens []AdminTokenInfo
+	if err := json.Unmarshal(resp, &tokens); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal admin token list: %w", err)
+	}
+	return tokens, nil
+}
+
+// GetAdminTokenInfo retrieves exactly one dynamic token by full ID or unique
+// search string. Exactly one of id and search must be non-empty.
+func (c *Client) GetAdminTokenInfo(ctx context.Context, id, search string) (*AdminTokenInfo, error) {
+	if (id == "") == (search == "") {
+		return nil, fmt.Errorf("exactly one of admin token id or search must be provided")
+	}
+	query := map[string]string{}
+	if id != "" {
+		query["id"] = id
+	} else {
+		query["search"] = search
+	}
+	resp, err := c.doRequestWithQuery(ctx, http.MethodGet, "/v2/GetAdminTokenInfo", query, nil)
+	if err != nil {
+		return nil, err
+	}
+	var info AdminTokenInfo
+	if err := json.Unmarshal(resp, &info); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal admin token info: %w", err)
+	}
+	return &info, nil
+}
+
+// CreateAdminToken creates a table-backed token. SecretToken is returned by
+// Garage only once and must be durably persisted by the caller.
+func (c *Client) CreateAdminToken(ctx context.Context, update AdminTokenUpdate) (*CreateAdminTokenResponse, error) {
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v2/CreateAdminToken", update)
+	if err != nil {
+		return nil, err
+	}
+	var created CreateAdminTokenResponse
+	if err := json.Unmarshal(resp, &created); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal created admin token: %w", err)
+	}
+	if created.ID == nil || *created.ID == "" || created.SecretToken == "" {
+		return nil, fmt.Errorf("garage returned an incomplete dynamic admin token")
+	}
+	return &created, nil
+}
+
+// UpdateAdminToken changes metadata, expiry, or scope for a dynamic token.
+func (c *Client) UpdateAdminToken(ctx context.Context, id string, update AdminTokenUpdate) (*AdminTokenInfo, error) {
+	if id == "" {
+		return nil, fmt.Errorf("admin token id must not be empty")
+	}
+	resp, err := c.doRequestWithQuery(ctx, http.MethodPost, "/v2/UpdateAdminToken", map[string]string{"id": id}, update)
+	if err != nil {
+		return nil, err
+	}
+	var info AdminTokenInfo
+	if err := json.Unmarshal(resp, &info); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal updated admin token: %w", err)
+	}
+	return &info, nil
+}
+
+// DeleteAdminToken tombstones a dynamic token. Garage uses POST rather than
+// HTTP DELETE for this v2 endpoint.
+func (c *Client) DeleteAdminToken(ctx context.Context, id string) error {
+	if id == "" {
+		return fmt.Errorf("admin token id must not be empty")
+	}
+	_, err := c.doRequestWithQuery(ctx, http.MethodPost, "/v2/DeleteAdminToken", map[string]string{"id": id}, nil)
+	return err
+}
+
+// GetCurrentAdminTokenInfo verifies the client's own bearer against the
+// endpoint and returns its effective dynamic/static metadata.
+func (c *Client) GetCurrentAdminTokenInfo(ctx context.Context) (*AdminTokenInfo, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/v2/GetCurrentAdminTokenInfo", nil)
+	if err != nil {
+		return nil, err
+	}
+	var info AdminTokenInfo
+	if err := json.Unmarshal(resp, &info); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal current admin token info: %w", err)
+	}
+	return &info, nil
+}
+
 // NodeInfo represents information about a Garage node
 // Matches Garage's NodeResp
 type NodeInfo struct {
@@ -316,6 +452,61 @@ func (c *Client) GetClusterStatus(ctx context.Context) (*ClusterStatus, error) {
 	return &status, nil
 }
 
+// GetSelfNodeInfo asks the daemon reached by this client for its own identity.
+// Garage v2 returns local-node endpoints in a MultiResponse even for
+// node=self, so a valid response has exactly one success, no dispatch errors,
+// and a success-map key equal to the canonical nodeId in the response body.
+func (c *Client) GetSelfNodeInfo(ctx context.Context) (*LocalNodeInfo, error) {
+	resp, err := c.doRequestWithQuery(
+		ctx,
+		http.MethodGet,
+		"/v2/GetNodeInfo",
+		map[string]string{workerNodeKey: "self"},
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var result multiNodeResponse[LocalNodeInfo]
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal self node-info response: %w", err)
+	}
+	if err := aggregateNodeErrors(result.Error); err != nil {
+		return nil, fmt.Errorf("garage self node-info dispatch failed: %w", err)
+	}
+	if len(result.Success) != 1 {
+		return nil, fmt.Errorf("garage self node-info returned %d successful nodes, expected exactly one", len(result.Success))
+	}
+	for responseKey, info := range result.Success {
+		keyID, err := canonicalGarageNodeID(responseKey)
+		if err != nil {
+			return nil, fmt.Errorf("garage self node-info success key is invalid: %w", err)
+		}
+		bodyID, err := canonicalGarageNodeID(info.NodeID)
+		if err != nil {
+			return nil, fmt.Errorf("garage self node-info nodeId is invalid: %w", err)
+		}
+		if keyID != bodyID {
+			return nil, fmt.Errorf("garage self node-info response key %s does not match body nodeId %s", keyID, bodyID)
+		}
+		info.NodeID = bodyID
+		return &info, nil
+	}
+	return nil, fmt.Errorf("garage self node-info returned no successful node")
+}
+
+func canonicalGarageNodeID(raw string) (string, error) {
+	id := strings.ToLower(strings.TrimSpace(raw))
+	if len(id) != 64 {
+		return "", fmt.Errorf("node ID must contain exactly 64 hexadecimal characters")
+	}
+	decoded, err := hex.DecodeString(id)
+	if err != nil || len(decoded) != 32 {
+		return "", fmt.Errorf("node ID must contain exactly 64 hexadecimal characters")
+	}
+	return id, nil
+}
+
 // ClusterHealth represents the Garage cluster health
 // Matches Garage's GetClusterHealthResponse
 type ClusterHealth struct {
@@ -327,6 +518,42 @@ type ClusterHealth struct {
 	Partitions       int    `json:"partitions"`
 	PartitionsQuorum int    `json:"partitionsQuorum"`
 	PartitionsAllOK  int    `json:"partitionsAllOk"`
+}
+
+// UnmarshalJSON accepts both Garage v2.0's storageNodesOk field and the
+// storageNodesUp name introduced in v2.1. Presence-aware decoding prevents a
+// dual-field response from silently selecting a contradictory value.
+func (h *ClusterHealth) UnmarshalJSON(data []byte) error {
+	type wireHealth struct {
+		Status           string `json:"status"`
+		KnownNodes       int    `json:"knownNodes"`
+		ConnectedNodes   int    `json:"connectedNodes"`
+		StorageNodes     int    `json:"storageNodes"`
+		StorageNodesUp   *int   `json:"storageNodesUp"`
+		StorageNodesOK   *int   `json:"storageNodesOk"`
+		Partitions       int    `json:"partitions"`
+		PartitionsQuorum int    `json:"partitionsQuorum"`
+		PartitionsAllOK  int    `json:"partitionsAllOk"`
+	}
+	var wire wireHealth
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.StorageNodesUp != nil && wire.StorageNodesOK != nil && *wire.StorageNodesUp != *wire.StorageNodesOK {
+		return fmt.Errorf("conflicting Garage health fields storageNodesUp=%d and storageNodesOk=%d", *wire.StorageNodesUp, *wire.StorageNodesOK)
+	}
+	storageNodesUp := 0
+	if wire.StorageNodesUp != nil {
+		storageNodesUp = *wire.StorageNodesUp
+	} else if wire.StorageNodesOK != nil {
+		storageNodesUp = *wire.StorageNodesOK
+	}
+	*h = ClusterHealth{
+		Status: wire.Status, KnownNodes: wire.KnownNodes, ConnectedNodes: wire.ConnectedNodes,
+		StorageNodes: wire.StorageNodes, StorageNodesUp: storageNodesUp,
+		Partitions: wire.Partitions, PartitionsQuorum: wire.PartitionsQuorum, PartitionsAllOK: wire.PartitionsAllOK,
+	}
+	return nil
 }
 
 // GetClusterHealth returns the cluster health status
@@ -342,6 +569,13 @@ func (c *Client) GetClusterHealth(ctx context.Context) (*ClusterHealth, error) {
 	}
 
 	return &health, nil
+}
+
+// CheckMetrics verifies that the configured bearer can scrape Garage's
+// Prometheus endpoint. Dynamic tokens require the dedicated "Metrics" scope.
+func (c *Client) CheckMetrics(ctx context.Context) error {
+	_, err := c.doRequest(ctx, http.MethodGet, "/metrics", nil)
+	return err
 }
 
 // ClusterLayout represents the Garage cluster layout
@@ -481,9 +715,9 @@ func (c *Client) ApplyClusterLayout(ctx context.Context, version uint64) error {
 	return err
 }
 
-// ApplyStagedLayoutChanges commits whatever layout changes are currently staged,
-// tolerating the concurrent-writer race that arises when several reconcilers
-// stage their own role into the same cluster layout.
+// ApplyStagedLayoutChanges commits whatever layout changes are currently staged.
+// Callers must hold the per-GarageCluster layout mutation coordinator across
+// staging and this apply.
 //
 // Two upstream facts make a naive `ApplyClusterLayout(version+1)` wrong (verified
 // against Garage v2.3.0):
@@ -493,17 +727,10 @@ func (c *Client) ApplyClusterLayout(ctx context.Context, version uint64) error {
 //     is staged churns the version + layout gossip pointlessly. So we read the
 //     layout first and return early when nothing is staged.
 //
-//  2. The version-mismatch rejection is a generic Error::Message("Invalid new
-//     layout version") that maps to HTTP 500, NOT 409
-//     (src/rpc/layout/history.rs:273-276). IsConflict() (which only matches 409)
-//     therefore never catches an apply race. When apply fails we re-read the
-//     layout: if another writer already advanced the version (committing our
-//     staged change too, since staging is a per-node LwwMap that merges), we
-//     treat it as success; otherwise we surface the error so the caller requeues
-//     and retries against the new current+1.
-//
-// Staging is a CRDT merge keyed by node UUID, so committing "whatever is staged"
-// is safe — it commits our change plus any sibling's concurrently-staged change.
+// A version-mismatch rejection is a generic HTTP 500 rather than a conflict.
+// We intentionally return it. Seeing a newer version is not proof that this
+// caller's requested role mutation was included in that version; the caller
+// must re-read roles on its next coordinated reconcile.
 func (c *Client) ApplyStagedLayoutChanges(ctx context.Context) error {
 	layout, err := c.GetClusterLayout(ctx)
 	if err != nil {
@@ -514,15 +741,7 @@ func (c *Client) ApplyStagedLayoutChanges(ctx context.Context) error {
 		return nil
 	}
 	target := layout.Version + 1
-	if err := c.ApplyClusterLayout(ctx, target); err != nil {
-		// Apply rejection is not a 409; re-read to decide whether a concurrent
-		// writer already committed our staged change.
-		if fresh, gerr := c.GetClusterLayout(ctx); gerr == nil && fresh.Version >= target {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return c.ApplyClusterLayout(ctx, target)
 }
 
 // RevertClusterLayout reverts staged layout changes
@@ -549,7 +768,9 @@ type SkipDeadNodesResponse struct {
 
 // ClusterLayoutSkipDeadNodes marks dead/removed nodes as synced to unblock draining layout versions.
 // This is useful when nodes are permanently removed and will never acknowledge syncing.
-// Use allowMissingData=true for gateway nodes that never stored data.
+// AllowMissingData is global to the referenced layout version. Callers must
+// reserve true for an explicit administrator acknowledgement; even when the
+// intended target is a gateway it can force unrelated storage trackers synced.
 func (c *Client) ClusterLayoutSkipDeadNodes(ctx context.Context, req SkipDeadNodesRequest) (*SkipDeadNodesResponse, error) {
 	resp, err := c.doRequest(ctx, http.MethodPost, "/v2/ClusterLayoutSkipDeadNodes", req)
 	if err != nil {
@@ -624,6 +845,42 @@ func (h *LayoutHistoryResponse) NodeSyncedToCurrent(nodeID string) bool {
 		return false
 	}
 	return t.Sync >= h.CurrentVersion
+}
+
+// DataMigrationSettled reports whether every node Garage is tracking has
+// completed a full table sync at the current layout version — i.e. the data
+// movement a draining version exists to cover is finished, and only Garage's
+// internal bookkeeping still trails.
+//
+// The distinction matters because "Draining" does not mean "still moving data".
+// Upstream retires a version when sync_ack_map advances past it
+// (LayoutHistory::cleanup_old_versions), and sync_ack_map is only ever written by
+// LayoutHelper::update_update_trackers, which runs at startup and on merging a
+// peer advertisement — nothing else. sync_table_until sets sync_map and
+// broadcasts, but does not update sync_ack_map locally. A cluster with no peers
+// therefore has no trigger: on a single-node cluster in `consistent` mode the
+// previous version reports Draining until the process restarts, forever, even
+// with an empty dataset. Multi-node clusters escape only because each peer's
+// broadcast drives the others' merge path.
+//
+// sync_map is the honest progress signal: sync_table_until advances it to
+// ack_map_min once every table's full sync completes (src/table/sync.rs), so
+// Sync >= CurrentVersion means each tracked node holds what the current layout
+// assigns it. A node that is gone never advances, so a genuinely dead peer still
+// reports unsettled and still requires the explicit skip-dead-nodes recovery.
+func (h *LayoutHistoryResponse) DataMigrationSettled() bool {
+	// Garage omits the trackers entirely while only one version is active. If a
+	// version reports Draining and they are still absent, we cannot prove
+	// anything — stay conservative.
+	if len(h.UpdateTrackers) == 0 {
+		return false
+	}
+	for _, t := range h.UpdateTrackers {
+		if t.Sync < h.CurrentVersion {
+			return false
+		}
+	}
+	return true
 }
 
 // GetDrainingVersions returns all layout versions currently in Draining status
@@ -1307,6 +1564,76 @@ type WorkerInfo struct {
 	Freeform          []string         `json:"freeform"`
 }
 
+// ListWorkersResponse preserves Garage's MultiResponse payload. The success
+// map is keyed by node ID; the error map contains per-node dispatch failures.
+type ListWorkersResponse struct {
+	Success map[string][]WorkerInfo `json:"success"`
+	Error   map[string]string       `json:"error"`
+}
+
+// BlockError is one persistent block-resync error reported by Garage.
+type BlockError struct {
+	BlockHash      string `json:"blockHash"`
+	Refcount       uint64 `json:"refcount"`
+	ErrorCount     uint64 `json:"errorCount"`
+	LastTrySecsAgo uint64 `json:"lastTrySecsAgo"`
+	NextTryInSecs  uint64 `json:"nextTryInSecs"`
+}
+
+// ListBlockErrorsResponse preserves Garage's per-node result so callers can
+// fail closed when one verification process cannot read its error database.
+type ListBlockErrorsResponse struct {
+	Success map[string][]BlockError `json:"success"`
+	Error   map[string]string       `json:"error"`
+}
+
+// ListWorkers returns structured background-worker state for one node, all
+// nodes ("*"), or the responding node ("self"). Block resync workers have
+// exposed queueLength and persistentErrors since Garage v2.0, making this the
+// version-compatible data-drain signal.
+func (c *Client) ListWorkers(ctx context.Context, nodeID string, busyOnly, errorOnly bool) (*ListWorkersResponse, error) {
+	query := map[string]string{workerNodeKey: nodeID}
+	body := struct {
+		BusyOnly  bool `json:"busyOnly"`
+		ErrorOnly bool `json:"errorOnly"`
+	}{BusyOnly: busyOnly, ErrorOnly: errorOnly}
+	resp, err := c.doRequestWithQuery(ctx, http.MethodPost, "/v2/ListWorkers", query, body)
+	if err != nil {
+		return nil, err
+	}
+	var workers ListWorkersResponse
+	if err := json.Unmarshal(resp, &workers); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	if workers.Success == nil {
+		workers.Success = make(map[string][]WorkerInfo)
+	}
+	if workers.Error == nil {
+		workers.Error = make(map[string]string)
+	}
+	return &workers, nil
+}
+
+// ListBlockErrors returns persistent block-resync errors from one node, every
+// node ("*"), or the responding node ("self").
+func (c *Client) ListBlockErrors(ctx context.Context, nodeID string) (*ListBlockErrorsResponse, error) {
+	resp, err := c.doRequestWithQuery(ctx, http.MethodGet, "/v2/ListBlockErrors", map[string]string{workerNodeKey: nodeID}, nil)
+	if err != nil {
+		return nil, err
+	}
+	var result ListBlockErrorsResponse
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block-error response: %w", err)
+	}
+	if result.Success == nil {
+		result.Success = make(map[string][]BlockError)
+	}
+	if result.Error == nil {
+		result.Error = make(map[string]string)
+	}
+	return &result, nil
+}
+
 // SetWorkerVariableRequest sets a worker configuration variable
 type SetWorkerVariableRequest struct {
 	Variable string `json:"variable"`
@@ -1326,6 +1653,13 @@ type LaunchRepairRequest struct {
 	RepairType string `json:"repairType"` // Tables, Blocks, Versions, Rebalance, Scrub, etc.
 }
 
+// LaunchRepairResponse preserves the per-node dispatch result returned by
+// Garage. A 200 response can still contain individual node failures.
+type LaunchRepairResponse struct {
+	Success map[string]json.RawMessage `json:"success"`
+	Error   map[string]string          `json:"error"`
+}
+
 // LaunchRepair starts a repair operation on a node.
 // The annotation accepts PascalCase values (e.g. "Blocks") matching the operator
 // constants, but the Garage v2 API expects camelCase (e.g. "blocks"). This function
@@ -1337,8 +1671,30 @@ func (c *Client) LaunchRepair(ctx context.Context, nodeID, repairType string) er
 		apiType = strings.ToLower(apiType[:1]) + apiType[1:]
 	}
 	req := LaunchRepairRequest{RepairType: apiType}
-	_, err := c.doRequestWithQuery(ctx, http.MethodPost, "/v2/LaunchRepairOperation", query, req)
-	return err
+	resp, err := c.doRequestWithQuery(ctx, http.MethodPost, "/v2/LaunchRepairOperation", query, req)
+	if err != nil {
+		return err
+	}
+	var result LaunchRepairResponse
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return fmt.Errorf("failed to unmarshal repair launch response: %w", err)
+	}
+	if len(result.Error) > 0 {
+		failed := make([]string, 0, len(result.Error))
+		for id, message := range result.Error {
+			failed = append(failed, fmt.Sprintf("%s: %s", id, message))
+		}
+		sort.Strings(failed)
+		return fmt.Errorf("garage rejected repair launch on node(s): %s", strings.Join(failed, "; "))
+	}
+	if nodeID != "*" {
+		if _, ok := result.Success[nodeID]; !ok {
+			return fmt.Errorf("garage repair launch returned no success result for node %s", nodeID)
+		}
+	} else if len(result.Success) == 0 {
+		return fmt.Errorf("garage repair launch returned no successful nodes")
+	}
+	return nil
 }
 
 // LaunchScrubCommand sends a scrub control command to nodes.

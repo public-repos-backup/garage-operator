@@ -72,9 +72,9 @@ var _ = BeforeSuite(func() {
 		ErrorIfCRDPathMissing: true,
 	}
 
-	// Retrieve the first found binary directory to allow running tests from IDEs
-	if getFirstFoundEnvTestBinaryDir() != "" {
-		testEnv.BinaryAssetsDirectory = getFirstFoundEnvTestBinaryDir()
+	// Retrieve a complete binary directory to allow running tests from IDEs.
+	if binaryDir := getEnvTestBinaryDir(); binaryDir != "" {
+		testEnv.BinaryAssetsDirectory = binaryDir
 	}
 
 	// cfg is defined in this file globally.
@@ -94,7 +94,7 @@ var _ = AfterSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 })
 
-// getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
+// getEnvTestBinaryDir locates a complete envtest binary set.
 // ENVTEST-based tests depend on specific binaries, usually located in paths set by
 // controller-runtime. When running tests directly (e.g., via an IDE) without using
 // Makefile targets, the 'BinaryAssetsDirectory' must be explicitly configured.
@@ -102,17 +102,40 @@ var _ = AfterSuite(func() {
 // This function streamlines the process by finding the required binaries, similar to
 // setting the 'KUBEBUILDER_ASSETS' environment variable. To ensure the binaries are
 // properly set up, run 'make setup-envtest' beforehand.
-func getFirstFoundEnvTestBinaryDir() string {
+func getEnvTestBinaryDir() string {
+	if configured := os.Getenv("KUBEBUILDER_ASSETS"); envtestBinaryDirComplete(configured) {
+		return configured
+	}
 	basePath := filepath.Join("..", "..", "bin", "k8s")
 	entries, err := os.ReadDir(basePath)
 	if err != nil {
 		logf.Log.Error(err, "Failed to read directory", "path", basePath)
 		return ""
 	}
-	for _, entry := range entries {
+	// os.ReadDir sorts by filename. Prefer the newest complete cached release
+	// and skip interrupted downloads rather than blindly selecting the oldest
+	// directory and failing several seconds later in envtest.Start.
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
 		if entry.IsDir() {
-			return filepath.Join(basePath, entry.Name())
+			candidate := filepath.Join(basePath, entry.Name())
+			if envtestBinaryDirComplete(candidate) {
+				return candidate
+			}
 		}
 	}
 	return ""
+}
+
+func envtestBinaryDirComplete(directory string) bool {
+	if directory == "" {
+		return false
+	}
+	for _, binary := range []string{"kube-apiserver", "etcd", "kubectl"} {
+		info, err := os.Stat(filepath.Join(directory, binary))
+		if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+			return false
+		}
+	}
+	return true
 }

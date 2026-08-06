@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -46,6 +47,8 @@ const testBootstrapPeer = "0123456789abcdef0123456789abcdef0123456789abcdef01234
 // (e.g. v0.5.5 gateway Deployments) in controller tests.
 const legacyLabelKey = "legacy"
 
+const hostileLabelTestImage = "example.invalid/label-test"
+
 var _ = Describe("GarageCluster Controller", func() {
 	const (
 		timeout  = time.Second * 10
@@ -64,6 +67,7 @@ var _ = Describe("GarageCluster Controller", func() {
 		})
 
 		AfterEach(func() {
+			_ = deleteTestGarageNodesForCluster(ctx, k8sClient, testNamespace, resourceName)
 			// Cleanup the GarageCluster
 			cluster := &garagev1beta2.GarageCluster{}
 			err := k8sClient.Get(ctx, typeNamespacedName, cluster)
@@ -96,6 +100,7 @@ var _ = Describe("GarageCluster Controller", func() {
 			_ = k8sClient.Delete(ctx, &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: resourceName + "-rpc-secret", Namespace: testNamespace},
 			})
+			_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, resourceName)
 		})
 
 		It("should create the necessary Kubernetes resources", func() {
@@ -172,12 +177,11 @@ var _ = Describe("GarageCluster Controller", func() {
 			Expect(apiSvc.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
 
 			By("Verifying the ConfigMap was created")
-			cm := &corev1.ConfigMap{}
+			var cm *corev1.ConfigMap
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{
-					Name:      resourceName + "-config",
-					Namespace: testNamespace,
-				}, cm)
+				var err error
+				cm, err = testConfigMapForBase(ctx, k8sClient, testNamespace, resourceName+"-config")
+				return err
 			}, timeout, interval).Should(Succeed())
 			Expect(cm.Data).To(HaveKey("garage.toml"))
 
@@ -190,6 +194,18 @@ var _ = Describe("GarageCluster Controller", func() {
 				}, secret)
 			}, timeout, interval).Should(Succeed())
 			Expect(secret.Data).To(HaveKey("rpc-secret"))
+			Expect(secret.Immutable).NotTo(BeNil())
+			Expect(*secret.Immutable).To(BeTrue())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, cluster)).To(Succeed())
+			Expect(cluster.Annotations).To(HaveKey(annotationRPCIdentitySHA256))
+
+			By("refusing to regenerate a deleted identity after bootstrap")
+			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+			Eventually(func() bool {
+				return errors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(secret), &corev1.Secret{}))
+			}, timeout, interval).Should(BeTrue())
+			_, err = reconciler.ensureRPCSecret(ctx, cluster)
+			Expect(err).To(MatchError(ContainSubstring("refusing to generate a different identity")))
 		})
 
 		It("should preserve an explicit gateway replicas: 0", func() {
@@ -218,6 +234,9 @@ var _ = Describe("GarageCluster Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-gateway", Namespace: testNamespace}, sts)).To(Succeed())
 			Expect(sts.Spec.Replicas).NotTo(BeNil())
 			Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+			Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(
+				annotationGatewayDataMarker, gatewayDataMarkerLegacyContent,
+			), "edge gateway Pods must project the legacy empty data marker")
 
 			// Gateway pods carry a bind-only TCP readiness probe by default (gating
 			// on the cluster-wide write-quorum /health would collapse the anycast at
@@ -230,6 +249,98 @@ var _ = Describe("GarageCluster Controller", func() {
 			Expect(probe).NotTo(BeNil(), "gateway pod must have a readiness probe")
 			Expect(probe.TCPSocket).NotTo(BeNil(), "gateway default readiness must be bind-only TCP")
 			Expect(probe.TCPSocket.Port.StrVal).To(Equal(s3PortName))
+		})
+
+		It("keeps edge gateway selector and Scale labels operator-owned", func() {
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: testNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					Gateway: &garagev1beta2.GatewaySpec{
+						Replicas: 1,
+						PodTemplate: garagev1beta2.PodTemplate{PodLabels: map[string]string{
+							labelAppName: "hostile", labelAppInstance: "wrong-instance",
+							labelAppManagedBy: "wrong-manager", labelCluster: "wrong-gateway-cluster",
+							labelTier: tierStorage, labelStorageGroup: storageGroupDefault,
+							labelScaleTarget: scaleTargetDisabled, "example.com/gateway-label": "gateway-kept",
+						}},
+					},
+					Replication: &garagev1beta2.ReplicationConfig{Factor: 1},
+					ConnectTo: &garagev1beta2.ConnectToConfig{
+						BootstrapPeers: []string{testBootstrapPeer},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			r := &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			Expect(r.reconcileGatewayStatefulSet(ctx, cluster, "test-config-hash")).To(Succeed())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-gateway", Namespace: testNamespace}, sts)).To(Succeed())
+			for key, value := range sts.Spec.Selector.MatchLabels {
+				Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(key, value))
+			}
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(labelAppName, defaultAppName))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(labelAppInstance, resourceName))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(labelAppManagedBy, operatorName))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(labelCluster, resourceName))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(labelTier, tierGateway))
+			Expect(sts.Spec.Template.Labels).NotTo(HaveKey(labelStorageGroup))
+			Expect(sts.Spec.Template.Labels).NotTo(HaveKey(labelScaleTarget))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("example.com/gateway-label", "gateway-kept"))
+
+			gatewayPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: "gateway-scale-pod", Namespace: testNamespace, Labels: map[string]string{},
+			}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: fmGarageContainer, Image: hostileLabelTestImage}}}}
+			for key, value := range sts.Spec.Template.Labels {
+				gatewayPod.Labels[key] = value
+			}
+			storagePod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: "gateway-scale-storage-pod", Namespace: testNamespace,
+				Labels: map[string]string{labelCluster: resourceName, labelTier: tierStorage},
+			}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: fmGarageContainer, Image: hostileLabelTestImage}}}}
+			Expect(k8sClient.Create(ctx, gatewayPod)).To(Succeed())
+			Expect(k8sClient.Create(ctx, storagePod)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, gatewayPod)
+				_ = k8sClient.Delete(ctx, storagePod)
+			})
+
+			observation, err := r.observeGarageClusterScale(ctx, cluster)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(observation.replicas).To(Equal(int32(1)))
+			Expect(observation.selector).To(Equal(
+				"garage.rajsingh.info/cluster=" + resourceName + ",garage.rajsingh.info/tier=gateway",
+			))
+		})
+
+		It("pins an existing generated-name RPC Secret without replacing its identity", func() {
+			rpcValue := testTerminalNodeID
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: testNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					Storage:     &garagev1beta2.StorageSpec{Replicas: 0},
+					Replication: &garagev1beta2.ReplicationConfig{Factor: 1},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			preexisting := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            resourceName + "-rpc-secret",
+					Namespace:       testNamespace,
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(cluster, garagev1beta2.GroupVersion.WithKind(kindGarageCluster))},
+				},
+				Data: map[string][]byte{RPCSecretKey: []byte(rpcValue)},
+			}
+			Expect(k8sClient.Create(ctx, preexisting)).To(Succeed())
+			reconciler := &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, cluster)).To(Succeed())
+			pinned, err := reconciler.ensureRPCSecret(ctx, cluster)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(pinned.Data[RPCSecretKey])).To(Equal(rpcValue))
+			Expect(pinned.Immutable).NotTo(BeNil())
+			Expect(*pinned.Immutable).To(BeTrue())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, cluster)).To(Succeed())
+			Expect(cluster.Annotations).To(HaveKey(annotationRPCIdentitySHA256))
 		})
 
 		It("should provision a 1Gi metadata PVC for gateway pods by default", func() {
@@ -281,6 +392,46 @@ var _ = Describe("GarageCluster Controller", func() {
 			Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy).NotTo(BeNil())
 			Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled).To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
 			Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
+		})
+
+		It("should honor and update an explicit edge-gateway PVC retention policy", func() {
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: testNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					Gateway: &garagev1beta2.GatewaySpec{
+						Replicas: 0,
+						PVCRetentionPolicy: &garagev1beta2.PVCRetentionPolicy{
+							WhenDeleted: testRetentionRetain, WhenScaled: pvcRetentionDelete,
+						},
+					},
+					Replication: &garagev1beta2.ReplicationConfig{Factor: 1},
+					ConnectTo: &garagev1beta2.ConnectToConfig{
+						BootstrapPeers: []string{testBootstrapPeer},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+			reconciler := &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			Expect(reconciler.reconcileGatewayStatefulSet(ctx, cluster, "test-config-hash")).To(Succeed())
+			key := types.NamespacedName{Name: resourceName + "-gateway", Namespace: testNamespace}
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
+			Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy).NotTo(BeNil())
+			Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).
+				To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
+			Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled).
+				To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
+
+			cluster.Spec.Gateway.PVCRetentionPolicy = &garagev1beta2.PVCRetentionPolicy{
+				WhenDeleted: pvcRetentionDelete, WhenScaled: testRetentionRetain,
+			}
+			Expect(reconciler.reconcileGatewayStatefulSet(ctx, cluster, "test-config-hash")).To(Succeed())
+			Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
+			Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).
+				To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
+			Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled).
+				To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 		})
 
 		It("should honor a user-supplied gateway metadata size", func() {
@@ -394,6 +545,94 @@ var _ = Describe("GarageCluster Controller", func() {
 			Expect(updated.Status.Selector).To(Equal(labelCluster + "=" + resourceName))
 		})
 
+		It("promptly retries a ready edge gateway until live health is observable", func() {
+			const clusterName = "health-retry-edge-gateway"
+			clusterKey := types.NamespacedName{Name: clusterName, Namespace: testNamespace}
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: testNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					Admin: &garagev1beta2.AdminConfig{AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "health-retry-missing-token"},
+						Key:                  DefaultAdminTokenKey,
+					}},
+					Gateway:     &garagev1beta2.GatewaySpec{Replicas: 1},
+					Replication: &garagev1beta2.ReplicationConfig{Factor: 1},
+					ConnectTo: &garagev1beta2.ConnectToConfig{
+						BootstrapPeers: []string{testBootstrapPeer},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cluster) })
+
+			labels := map[string]string{"app": clusterName}
+			gateway := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: gatewayWorkloadName(cluster), Namespace: testNamespace},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas:    ptr.To[int32](1),
+					ServiceName: clusterName,
+					Selector:    &metav1.LabelSelector{MatchLabels: labels},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: labels},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: defaultAppName, Image: defaultGarageImage}},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, gateway)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, gateway) })
+			gateway.Status.Replicas = 1
+			gateway.Status.ReadyReplicas = 1
+			Expect(k8sClient.Status().Update(ctx, gateway)).To(Succeed())
+
+			// No managed Pod or verified operator token exists, which models the
+			// transient Admin API gap immediately after an external layout apply.
+			reconciler := &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			result, err := reconciler.updateStatusFromCluster(ctx, cluster)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(RequeueAfterUnhealthy),
+				"unknown live health must override the normal five-minute edge-gateway interval")
+
+			updated := &garagev1beta2.GarageCluster{}
+			Expect(k8sClient.Get(ctx, clusterKey, updated)).To(Succeed())
+			Expect(updated.Status.Health).To(BeNil())
+		})
+
+		It("uses the stable cadence for a ready storage cluster with no configured Admin credential", func() {
+			const clusterName = "tokenless-health-cadence"
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: testNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					Storage: &garagev1beta2.StorageSpec{LayoutPolicy: LayoutPolicyManual},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cluster) })
+
+			node := &garagev1beta1.GarageNode{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-node", Namespace: testNamespace},
+				Spec: garagev1beta1.GarageNodeSpec{
+					ClusterRef: garagev1beta1.ClusterReference{Name: clusterName},
+					Zone:       "zone-a",
+					Capacity:   ptrQuantity(resource.MustParse("1Gi")),
+				},
+			}
+			Expect(k8sClient.Create(ctx, node)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+			node.Status.NodeID = testTerminalNodeID
+			node.Status.Connected = true
+			node.Status.InLayout = true
+			node.Status.ObservedGeneration = node.Generation
+			Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+
+			reconciler := &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			result, err := reconciler.updateStatusFromCluster(ctx, cluster)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(RequeueAfterShort),
+				"absence of optional Admin auth must not be treated as a transient health failure")
+		})
+
 		It("counts unlabeled clusterRef-matched GarageNodes toward readiness in Auto mode (#237)", func() {
 			// Mirrors the robbinsdale incident: cluster-level Auto with a Manual
 			// storage tier. The storage GarageNodes are hand-written and do NOT
@@ -433,7 +672,10 @@ var _ = Describe("GarageCluster Controller", func() {
 				}
 				Expect(k8sClient.Create(ctx, node)).To(Succeed())
 				DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+				node.Status.NodeID = name
 				node.Status.Connected = true
+				node.Status.InLayout = true
+				node.Status.ObservedGeneration = node.Generation
 				Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
 			}
 
@@ -490,7 +732,10 @@ var _ = Describe("GarageCluster Controller", func() {
 			DeferCleanup(func() {
 				_ = k8sClient.Delete(ctx, node)
 			})
+			node.Status.NodeID = node.Name
 			node.Status.Connected = true
+			node.Status.InLayout = true
+			node.Status.ObservedGeneration = node.Generation
 			Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
 
 			reconciler := &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
@@ -517,6 +762,55 @@ var _ = Describe("GarageCluster Controller", func() {
 			Expect(updated.Status.ReadyReplicas).To(Equal(int32(1)))
 			Expect(updated.Status.Replicas).To(Equal(int32(1)))
 			Expect(updated.Status.Phase).To(Equal("Running"))
+		})
+
+		It("never adopts a newer resourceVersion without its concurrent drain status", func() {
+			const cName = "status-rv-adoption-cluster"
+			cNN := types.NamespacedName{Name: cName, Namespace: testNamespace}
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: cName, Namespace: testNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					LayoutPolicy: LayoutPolicyManual,
+					Storage:      &garagev1beta2.StorageSpec{},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cluster) })
+
+			stale := &garagev1beta2.GarageCluster{}
+			Expect(k8sClient.Get(ctx, cNN, stale)).To(Succeed())
+			fresh := &garagev1beta2.GarageCluster{}
+			Expect(k8sClient.Get(ctx, cNN, fresh)).To(Succeed())
+			proof := &blockResyncProof{
+				Actor:                 storageDrainActorForCluster(fresh),
+				TransactionID:         "rv-adoption-drain",
+				StartedAt:             metav1.Now(),
+				RoleRemovalNodeIDs:    []string{testOwnedNodeID},
+				RemovedStorageNodeIDs: []string{testOwnedNodeID},
+			}
+			proof.TargetHash = storageDrainProofTargetHash(proof)
+			fresh.Status.StorageDrain = v1beta2StorageDrainStatus(proof)
+			setStorageDrainCondition(fresh, metav1.ConditionFalse, garagev1beta1.ReasonStorageDraining, "durable drain")
+			Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
+
+			reconciler := &GarageClusterReconciler{Client: k8sClient, APIReader: k8sClient}
+			// This helper intentionally has no metadata change to make. It still
+			// refreshes the object. Historically it copied only that refresh's RV
+			// into stale, which let the next whole-status update erase the proof.
+			Expect(reconciler.setOperatorMetricsTokenIntent(ctx, stale, false)).To(Succeed())
+			Expect(stale.Status.StorageDrain).NotTo(BeNil())
+			Expect(reconciler.setNodeLocalPoolsCondition(
+				ctx, stale, metav1.ConditionFalse,
+				garagev1beta1.ReasonNodeLocalPoolDraining, "concurrent pool status",
+			)).To(Succeed())
+
+			persisted := &garagev1beta2.GarageCluster{}
+			Expect(k8sClient.Get(ctx, cNN, persisted)).To(Succeed())
+			Expect(persisted.Status.StorageDrain).NotTo(BeNil())
+			Expect(persisted.Status.StorageDrain.TransactionID).To(Equal(proof.TransactionID))
+			Expect(meta.FindStatusCondition(
+				persisted.Status.Conditions, garagev1beta1.ConditionStorageDrainReady,
+			)).NotTo(BeNil())
 		})
 
 		It("should add a finalizer to the GarageCluster", func() {
@@ -604,12 +898,11 @@ var _ = Describe("GarageCluster Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying custom ports are used in the ConfigMap")
-			cm := &corev1.ConfigMap{}
+			var cm *corev1.ConfigMap
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{
-					Name:      resourceName + "-config",
-					Namespace: testNamespace,
-				}, cm)
+				var err error
+				cm, err = testConfigMapForBase(ctx, k8sClient, testNamespace, resourceName+"-config")
+				return err
 			}, timeout, interval).Should(Succeed())
 			Expect(cm.Data["garage.toml"]).To(ContainSubstring("4901"))
 			Expect(cm.Data["garage.toml"]).To(ContainSubstring("4900"))
@@ -672,6 +965,9 @@ var _ = Describe("GarageCluster Controller", func() {
 			_ = k8sClient.Delete(ctx, &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: testExternalRPCSecret, Namespace: testNamespace},
 			})
+			_ = k8sClient.Delete(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName + "-rpc-secret-snapshot", Namespace: testNamespace},
+			})
 		})
 
 		It("should use the external RPC secret", func() {
@@ -720,13 +1016,29 @@ var _ = Describe("GarageCluster Controller", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying no auto-generated secret was created")
-			autoSecret := &corev1.Secret{}
+			By("Verifying the external value was pinned into one immutable canonical local Secret")
+			snapshot := &corev1.Secret{}
 			err = k8sClient.Get(ctx, types.NamespacedName{
-				Name:      resourceName + "-rpc-secret",
+				Name:      resourceName + "-rpc-secret-snapshot",
 				Namespace: testNamespace,
-			}, autoSecret)
-			Expect(errors.IsNotFound(err)).To(BeTrue())
+			}, snapshot)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(snapshot.Immutable).NotTo(BeNil())
+			Expect(*snapshot.Immutable).To(BeTrue())
+			Expect(string(snapshot.Data[RPCSecretKey])).To(Equal("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"))
+			Expect(snapshot.Annotations).To(HaveKeyWithValue(
+				annotationRPCIdentitySource, testNamespace+"/"+testExternalRPCSecret+":my-key",
+			))
+			Expect(k8sClient.Get(ctx, typeNamespacedName, cluster)).To(Succeed())
+			Expect(cluster.Annotations).To(HaveKey(annotationRPCIdentitySHA256))
+
+			By("failing closed when the mutable source drifts after bootstrap")
+			external := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: testExternalRPCSecret, Namespace: testNamespace}, external)).To(Succeed())
+			external.Data["my-key"] = []byte("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+			Expect(k8sClient.Update(ctx, external)).To(Succeed())
+			_, err = reconciler.ensureRPCSecret(ctx, cluster)
+			Expect(err).To(MatchError(ContainSubstring("no longer matches immutable snapshot")))
 		})
 	})
 })
@@ -762,6 +1074,7 @@ var _ = Describe("GarageCluster PodDisruptionBudget reconcile", func() {
 		_ = k8sClient.Delete(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: testNamespace}})
 		_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-rpc-secret", Namespace: testNamespace}})
 		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-config", Namespace: testNamespace}})
+		_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 	})
 
 	newCluster := func(pdb *garagev1beta2.PodDisruptionBudgetConfig) *garagev1beta2.GarageCluster {
@@ -780,11 +1093,9 @@ var _ = Describe("GarageCluster PodDisruptionBudget reconcile", func() {
 	}
 
 	driveReconciles := func() {
-		// Twice — first adds finalizer, second creates resources.
-		for i := 0; i < 2; i++ {
-			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
-			Expect(err).NotTo(HaveOccurred())
-		}
+		cluster := &garagev1beta2.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, cluster)).To(Succeed())
+		Expect(reconciler.reconcileTierPodDisruptionBudget(ctx, cluster, tierStorage)).To(Succeed())
 	}
 
 	It("defaults MinAvailable to replicas-1 to preserve quorum on drain", func() {
@@ -807,6 +1118,20 @@ var _ = Describe("GarageCluster PodDisruptionBudget reconcile", func() {
 	It("honors an explicit MaxUnavailable", func() {
 		one := intstr.FromInt(1)
 		Expect(k8sClient.Create(ctx, newCluster(&garagev1beta2.PodDisruptionBudgetConfig{Enabled: true, MaxUnavailable: &one}))).To(Succeed())
+		driveReconciles()
+
+		pdb := &policyv1.PodDisruptionBudget{}
+		Expect(k8sClient.Get(ctx, key, pdb)).To(Succeed())
+		Expect(pdb.Spec.MinAvailable).To(BeNil())
+		Expect(pdb.Spec.MaxUnavailable).NotTo(BeNil())
+		Expect(pdb.Spec.MaxUnavailable.IntValue()).To(Equal(1))
+	})
+
+	It("defaults Manual storage membership to maxUnavailable=1 instead of the ignored replica field", func() {
+		cluster := newCluster(&garagev1beta2.PodDisruptionBudgetConfig{Enabled: true})
+		cluster.Spec.LayoutPolicy = LayoutPolicyManual
+		cluster.Spec.Storage.Replicas = 9 // ignored in Manual mode
+		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
 		driveReconciles()
 
 		pdb := &policyv1.PodDisruptionBudget{}
@@ -875,7 +1200,7 @@ var _ = Describe("GarageCluster PodDisruptionBudget reconcile", func() {
 				}},
 			},
 			Spec: policyv1.PodDisruptionBudgetSpec{
-				Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"foreign": annotationTrue}},
+				Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{testForeignValue: annotationTrue}},
 				MinAvailable: ptr.To(intstr.FromInt(7)),
 			},
 		}
@@ -887,7 +1212,7 @@ var _ = Describe("GarageCluster PodDisruptionBudget reconcile", func() {
 		got := &policyv1.PodDisruptionBudget{}
 		Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
 		Expect(got.Spec.MinAvailable.IntValue()).To(Equal(7))
-		Expect(got.Spec.Selector.MatchLabels).To(HaveKeyWithValue("foreign", "true"))
+		Expect(got.Spec.Selector.MatchLabels).To(HaveKeyWithValue(testForeignValue, annotationTrue))
 
 		// And the foreign PDB also isn't deleted when wantPDB=false.
 		updated := &garagev1beta2.GarageCluster{}
@@ -929,6 +1254,7 @@ var _ = Describe("GarageCluster gateway PodDisruptionBudget reconcile", func() {
 		_ = k8sClient.Delete(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-gateway", Namespace: testNamespace}})
 		_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-rpc-secret", Namespace: testNamespace}})
 		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-config", Namespace: testNamespace}})
+		_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 	})
 
 	// Unified cluster — storage + gateway. Storage is required so HasGatewayTier
@@ -952,10 +1278,11 @@ var _ = Describe("GarageCluster gateway PodDisruptionBudget reconcile", func() {
 	}
 
 	driveReconciles := func() {
-		for i := 0; i < 2; i++ {
-			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: clusterName, Namespace: testNamespace}})
-			Expect(err).NotTo(HaveOccurred())
-		}
+		cluster := &garagev1beta2.GarageCluster{}
+		clusterKey := types.NamespacedName{Name: clusterName, Namespace: testNamespace}
+		Expect(k8sClient.Get(ctx, clusterKey, cluster)).To(Succeed())
+		Expect(reconciler.reconcileTierPodDisruptionBudget(ctx, cluster, tierStorage)).To(Succeed())
+		Expect(reconciler.reconcileTierPodDisruptionBudget(ctx, cluster, tierGateway)).To(Succeed())
 	}
 
 	It("creates a tier-specific PDB named <cluster>-gateway", func() {
@@ -997,6 +1324,19 @@ var _ = Describe("GarageCluster gateway PodDisruptionBudget reconcile", func() {
 		driveReconciles()
 
 		Expect(errors.IsNotFound(k8sClient.Get(ctx, gwKey, &policyv1.PodDisruptionBudget{}))).To(BeTrue())
+	})
+
+	It("creates a maxUnavailable=1 PDB for Manual gateway members even when the ignored replicas field is zero", func() {
+		cluster := newUnifiedCluster(&garagev1beta2.PodDisruptionBudgetConfig{Enabled: true}, 0)
+		cluster.Spec.LayoutPolicy = LayoutPolicyManual
+		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+		driveReconciles()
+
+		pdb := &policyv1.PodDisruptionBudget{}
+		Expect(k8sClient.Get(ctx, gwKey, pdb)).To(Succeed())
+		Expect(pdb.Spec.MinAvailable).To(BeNil())
+		Expect(pdb.Spec.MaxUnavailable).NotTo(BeNil())
+		Expect(pdb.Spec.MaxUnavailable.IntValue()).To(Equal(1))
 	})
 
 	It("does not create a PDB when the field is omitted", func() {

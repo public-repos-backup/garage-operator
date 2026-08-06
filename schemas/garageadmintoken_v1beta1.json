@@ -1,5 +1,5 @@
 {
-  "description": "GarageAdminToken is the Schema for the garageadmintokens API\nIt manages admin API tokens for Garage clusters",
+  "description": "GarageAdminToken is the Schema for the garageadmintokens API\nIt manages static Admin API bootstrap material for Garage clusters.",
   "properties": {
     "apiVersion": {
       "description": "APIVersion defines the versioned schema of this representation of an object.\nServers should convert recognized schemas to the latest internal value, and\nmay reject unrecognized values.\nMore info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
@@ -13,7 +13,7 @@
       "type": "object"
     },
     "spec": {
-      "description": "GarageAdminTokenSpec defines the desired state of GarageAdminToken.\n\nGarageAdminToken provisions secrets for accessing the Garage Admin HTTP API.\nAdmin tokens authenticate differently from S3 keys (GarageKey) \u2014 they use\nBearer token auth against the admin port (default 3903) instead of HMAC-SHA256.\n\nThe operator writes the token as an admin_token_file in Garage's TOML config.\nFile-based tokens always have full admin access; there is no scope restriction.\nTo create scoped tokens, use Garage's Admin API (CreateAdminToken) directly \u2014\nthis resource is for provisioning the full-access operator/tooling token.",
+      "description": "GarageAdminTokenSpec defines the desired state of GarageAdminToken.\n\nGarageAdminToken provisions a static bootstrap Secret for the Garage Admin\nHTTP API. The referenced GarageCluster must explicitly select this Secret in\nspec.admin.adminTokenSecretRef. This resource does not create a row in\nGarage's dynamic Admin-token table, and deletion does not revoke bytes that a\nrunning Garage process already loaded at startup.\nAdmin tokens authenticate differently from S3 keys (GarageKey) \u2014 they use\nBearer token auth against the admin port (default 3903) instead of HMAC-SHA256.\n\nStatic configured tokens always have full admin access and no server-side\nname, scope, or expiry metadata. Use Garage's Admin API directly for a\nuser-managed scoped/dynamic token.",
       "properties": {
         "clusterRef": {
           "description": "ClusterRef references the GarageCluster this token belongs to",
@@ -58,16 +58,16 @@
           "additionalProperties": false
         },
         "expiresAt": {
-          "description": "ExpiresAt sets when this token should be rotated.\nThe operator tracks this and sets the TokenExpired condition when the date passes,\nbut does NOT automatically rotate or revoke the token \u2014 rotation requires manual action\n(update or delete the GarageAdminToken resource). Use NeverExpires to suppress expiry tracking.\nMutually exclusive with NeverExpires.",
+          "description": "ExpiresAt is retained for compatibility but rejected because static\nconfigured tokens have no Garage-side expiry or revocation record.",
           "format": "date-time",
           "type": "string"
         },
         "name": {
-          "description": "Name is a friendly name for this admin token\nIf not set, metadata.name is used",
+          "description": "Name is retained for compatibility but rejected because static bootstrap\nmaterial has no Garage-side friendly name.",
           "type": "string"
         },
         "neverExpires": {
-          "description": "NeverExpires sets the token to never expire.\nMutually exclusive with ExpiresAt.",
+          "description": "NeverExpires is retained for compatibility. Static configured tokens are\nalways non-expiring, so this field is deprecated and has no effect.",
           "type": "boolean"
         },
         "secretTemplate": {
@@ -180,7 +180,7 @@
           "x-kubernetes-list-type": "map"
         },
         "expiresAt": {
-          "description": "ExpiresAt is when this token expires (if set)",
+          "description": "ExpiresAt is deprecated and always cleared because static configured\ntokens have no Garage-side expiry record.",
           "format": "date-time",
           "type": "string"
         },
@@ -218,8 +218,12 @@
           "x-kubernetes-map-type": "atomic",
           "additionalProperties": false
         },
+        "tokenDigest": {
+          "description": "TokenDigest is the full SHA-256 digest of the static bearer. The controller\nuses it to detect mutation of an existing generated Secret without exposing\nany bearer bytes.",
+          "type": "string"
+        },
         "tokenId": {
-          "description": "TokenID is the Garage-assigned token ID (first 8 chars)",
+          "description": "TokenID is a short display fingerprint of the generated static token. It is\nnot a Garage-assigned dynamic token ID.",
           "type": "string"
         }
       },

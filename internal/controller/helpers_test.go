@@ -18,12 +18,17 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
@@ -31,34 +36,238 @@ import (
 	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
+func testConfigMapForBase(
+	ctx context.Context,
+	c client.Client,
+	namespace,
+	baseName string,
+) (*corev1.ConfigMap, error) {
+	return testConfigMapForBaseMatching(ctx, c, namespace, baseName, func(*corev1.ConfigMap) bool { return true })
+}
+
+func testConfigMapForBaseMatching(
+	ctx context.Context,
+	c client.Client,
+	namespace,
+	baseName string,
+	matchesContent func(*corev1.ConfigMap) bool,
+) (*corev1.ConfigMap, error) {
+	list := &corev1.ConfigMapList{}
+	if err := c.List(ctx, list, client.InNamespace(namespace)); err != nil {
+		return nil, err
+	}
+	matches := make([]corev1.ConfigMap, 0, 1)
+	for i := range list.Items {
+		item := &list.Items[i]
+		if item.DeletionTimestamp.IsZero() && item.Annotations[annotationGarageConfigBaseName] == baseName && matchesContent(item) {
+			matches = append(matches, *item)
+		}
+	}
+	if len(matches) != 1 {
+		names := make([]string, 0, len(matches))
+		for i := range matches {
+			names = append(names, matches[i].Name)
+		}
+		return nil, fmt.Errorf("found %d live ConfigMap revisions for base %s/%s: %v", len(matches), namespace, baseName, names)
+	}
+	return &matches[0], nil
+}
+
+func publishTestClusterConfig(
+	ctx context.Context,
+	c client.Client,
+	cluster *garagev1beta2.GarageCluster,
+) error {
+	_, _, err := (&GarageClusterReconciler{Client: c, Scheme: c.Scheme()}).reconcileConfigMap(ctx, cluster)
+	return err
+}
+
+func testNodeConfigMap(
+	ctx context.Context,
+	c client.Client,
+	cluster *garagev1beta2.GarageCluster,
+	node *garagev1beta1.GarageNode,
+) (*corev1.ConfigMap, error) {
+	return testConfigMapForBase(ctx, c, cluster.Namespace, garageNodeConfigBaseName(cluster, node))
+}
+
+func deleteTestGarageConfigResourcesForCluster(
+	ctx context.Context,
+	c client.Client,
+	clusterName string,
+) error {
+	namespace := testNamespace
+	belongs := func(annotations map[string]string) bool {
+		base := annotations[annotationGarageConfigBaseName]
+		return base == clusterName+"-config" || strings.HasPrefix(base, clusterName+"-")
+	}
+	configMaps := &corev1.ConfigMapList{}
+	if err := c.List(ctx, configMaps, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+	for i := range configMaps.Items {
+		if belongs(configMaps.Items[i].Annotations) {
+			if err := c.Delete(ctx, &configMaps.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+	}
+	secrets := &corev1.SecretList{}
+	if err := c.List(ctx, secrets, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+	for i := range secrets.Items {
+		if belongs(secrets.Items[i].Annotations) {
+			if err := c.Delete(ctx, &secrets.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func deleteTestManagedSecretsForCluster(
+	ctx context.Context,
+	c client.Client,
+	namespace,
+	clusterName string,
+) error {
+	secrets := &corev1.SecretList{}
+	if err := c.List(
+		ctx,
+		secrets,
+		client.InNamespace(namespace),
+		client.MatchingLabels{labelCluster: clusterName},
+	); err != nil {
+		return err
+	}
+	for i := range secrets.Items {
+		if err := c.Delete(ctx, &secrets.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func deleteTestGarageNodesForCluster(
+	ctx context.Context,
+	c client.Client,
+	namespace,
+	clusterName string,
+) error {
+	nodes := &garagev1beta1.GarageNodeList{}
+	if err := c.List(ctx, nodes, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		if node.Spec.ClusterRef.Name != clusterName ||
+			(node.Spec.ClusterRef.Namespace != "" && node.Spec.ClusterRef.Namespace != namespace) {
+			continue
+		}
+		if len(node.Finalizers) > 0 {
+			node.Finalizers = nil
+			if err := c.Update(ctx, node); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+		if err := c.Delete(ctx, node); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestValidateManagedTierReplicasRuntimeBackstop(t *testing.T) {
+	if err := validateManagedTierReplicas(50, "spec.storage.replicas"); err != nil {
+		t.Fatalf("supported maximum rejected: %v", err)
+	}
+	if err := validateManagedTierReplicas(51, "spec.storage.replicas"); err == nil || !strings.Contains(err.Error(), "at most 50") {
+		t.Fatalf("unsafe replica count accepted by controller backstop: %v", err)
+	}
+}
+
 const (
-	testClusterDomain       = "cluster.local"
-	testClusterName         = "test-cluster"
-	testNonExistentCluster  = "non-existent-cluster"
-	testNonExistent         = "non-existent"
-	testExternalRPCSecret   = "external-rpc-secret"
-	testStorageClass        = "fast-ssd"
-	testIPv4Addr            = "10.0.0.1"
-	testIPv4RPCAddr         = "10.0.0.1:3901"
-	testEndpointKey         = "endpoint"
-	testHostKey             = "host"
-	testAccessKeyID         = "AKIAIOSFODNN7EXAMPLE"
-	testCustomKey           = "custom-key"
-	testImageFull           = "custom/garage:v1.0.0"
-	testImageRepo           = "my-mirror/garage"
-	testImageFull2          = "custom/garage:v3.0.0"
-	testNodeImageRepo       = "node-mirror/garage"
-	testAccessKeyIDKey      = "access-key-id"
-	testSecretAccessKey     = "secret-access-key"
-	testSchemeKey           = "scheme"
-	testRegionKey           = "region"
-	testBucketNameKey       = "bucket"
-	testCustomBucketNameKey = "BUCKET_NAME"
-	testBucketName          = "my-bucket"
-	testSecretValue         = "secret123"
-	testOperatorImage       = "registry.example.com/garage:v2.0.0"
-	testPortNameRPC         = "rpc"
-	teamLabelKey            = "team"
+	testClusterDomain           = "cluster.local"
+	testClusterName             = "test-cluster"
+	testNonExistentCluster      = "non-existent-cluster"
+	testNonExistent             = "non-existent"
+	testExternalRPCSecret       = "external-rpc-secret"
+	testStorageClass            = "fast-ssd"
+	testIPv4Addr                = "10.0.0.1"
+	testIPv4RPCAddr             = "10.0.0.1:3901"
+	testEndpointKey             = "endpoint"
+	testHostKey                 = "host"
+	testAccessKeyID             = "AKIAIOSFODNN7EXAMPLE"
+	testCustomKey               = "custom-key"
+	testImageFull               = "custom/garage:v1.0.0"
+	testImageRepo               = "my-mirror/garage"
+	testImageFull2              = "custom/garage:v3.0.0"
+	testNodeImageRepo           = "node-mirror/garage"
+	testAccessKeyIDKey          = "access-key-id"
+	testSecretAccessKey         = "secret-access-key"
+	testSchemeKey               = "scheme"
+	testRegionKey               = "region"
+	testBucketNameKey           = "bucket"
+	testCustomBucketNameKey     = "BUCKET_NAME"
+	testBucketName              = "my-bucket"
+	testSecretValue             = "secret123"
+	testOperatorImage           = "registry.example.com/garage:v2.0.0"
+	testPortNameRPC             = "rpc"
+	teamLabelKey                = "team"
+	testGarageValue             = "garage"
+	testBlockResyncWorkerName   = "Block resync worker #1"
+	testClusterUID              = "cluster-uid"
+	testGarageNodeUID           = "garage-node-uid"
+	testDaemonSetUID            = "daemonset-uid"
+	testGatewayNodeID           = "gateway-a"
+	testGarageNodeID            = "garage-a"
+	testForeignValue            = "foreign"
+	testEdgeValue               = "edge"
+	testGarageNodeConfig        = "# test GarageNode config\n"
+	testArchiveMetadataHostPath = "/var/lib/garage/archive-meta"
+	testArchiveDataHostPath     = "/var/lib/garage/archive-data"
+	testOwnedClusterTag         = "cluster:gc/garage"
+	testOwnedClusterUIDTag      = "cluster-uid:local-uid"
+	testOrphanGatewayID         = "gw-orphan"
+	testStorageNodeName         = "storage-a"
+	testRemovedNodeID           = "removed-a"
+	testTerminalNodeID          = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testSecondStorageNodeID     = "storage-b"
+	testNodeUID                 = "node-uid"
+	testSourcePodUID            = "source-pod-uid"
+	testStatefulSetUID          = "statefulset-uid"
+	testStorageMetadataPVC      = "metadata-storage-a-0"
+	testSiteA                   = "site-a"
+	testLocalDeadNodeID         = "local-dead"
+	testOttawaName              = "ottawa"
+	testNodeAddressTemplate     = "{nodeName}.example.net:3901"
+	testSMBNodeName             = "smb-a"
+	testKubernetesNodeA         = "node-a"
+	testKubernetesNodeB         = "node-b"
+	testPoolA                   = "pool-a"
+	testNewValue                = "new"
+	testOldPodUID               = "old-pod"
+	testNewSpecHash             = "new-spec"
+	testSMBMetadataPVC          = "metadata-smb-a-0"
+	testPVCUID                  = "pvc-uid"
+	testNewConfigHash           = "new-config"
+	testRackATag                = "rack:a"
+	testOwnedNodeID             = "owned"
+	testKubernetesWorkerA       = "worker-a"
+	testReplacementPodUID       = "replacement-pod-uid"
+	testLoopbackPodIP           = "127.0.0.1"
+	testManualGarageNodeName    = "manual-node"
+	testStoragePodIP            = "10.0.0.11"
+	testSharedRPCPublicAddr     = "shared.example.net:3901"
+	testHTTPErrorKey            = "error"
+	testHTTPSuccessKey          = "success"
+	testSiteName                = "site"
+	testStorageOwnerLabelKey    = "storage.example/owner"
+	testSecondDiskHostPath      = "/var/lib/garage/shared/disk-2"
+	testGetNodeInfoPath         = "/v2/GetNodeInfo"
+	testNodeIDJSONKey           = "nodeId"
+	testPoolB                   = "pool-b"
 )
 
 func TestResolveSecretConfig(t *testing.T) {
@@ -1151,6 +1360,28 @@ func TestBuildNodeTags_TierTag(t *testing.T) {
 	}
 }
 
+func TestBuildNodeTags_DropsForgedReservedDefaults(t *testing.T) {
+	defaults := []string{
+		"cluster:other/namespace",
+		"cluster-uid:other-site",
+		testTierGatewayTag,
+		"rpc-address:other.example:3901",
+		"node-local-pool:other",
+		"kubernetes-node:other-worker",
+		testRackATag,
+	}
+	want := []string{
+		"cluster:my-cluster/my-ns",
+		"cluster-uid:real-site",
+		"tier:storage",
+		testRackATag,
+		"my-cluster-0",
+	}
+	if got := buildNodeTags("my-cluster", "my-ns", tierStorage, defaults, "my-cluster-0", "real-site"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildNodeTags() = %#v, want %#v", got, want)
+	}
+}
+
 func TestCountTotalNodesAfterApply(t *testing.T) {
 	role := func(id string) garage.LayoutNodeRole { return garage.LayoutNodeRole{ID: id, Zone: "z"} }
 	add := func(id string) garage.NodeRoleChange { return garage.NodeRoleChange{ID: id, Zone: "z"} }
@@ -1279,7 +1510,8 @@ func TestBuildGaragePodSpec_UserEnv(t *testing.T) {
 		{Name: envGarageNodeHost, Value: "overridden.example"},
 	}
 	userEnvFrom := []corev1.EnvFromSource{
-		{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "my-secret"}}},
+		{Prefix: "CUSTOM_", SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "my-secret"}}},
+		{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "unsafe-unprefixed"}}},
 	}
 
 	spec := buildGaragePodSpec(PodSpecConfig{
@@ -1292,9 +1524,10 @@ func TestBuildGaragePodSpec_UserEnv(t *testing.T) {
 	}
 	c := spec.Containers[0]
 
-	// EnvFrom passes through verbatim.
-	if len(c.EnvFrom) != 1 || c.EnvFrom[0].SecretRef == nil || c.EnvFrom[0].SecretRef.Name != "my-secret" {
-		t.Errorf("envFrom not propagated: %+v", c.EnvFrom)
+	// A safely prefixed source passes through; an admission-bypassed source that
+	// could inject Garage's literal secret variables is filtered fail closed.
+	if len(c.EnvFrom) != 1 || c.EnvFrom[0].Prefix != "CUSTOM_" || c.EnvFrom[0].SecretRef == nil || c.EnvFrom[0].SecretRef.Name != "my-secret" {
+		t.Errorf("safe envFrom not propagated or unsafe source not filtered: %+v", c.EnvFrom)
 	}
 
 	// Custom env var must be present.
@@ -1302,7 +1535,7 @@ func TestBuildGaragePodSpec_UserEnv(t *testing.T) {
 	for _, e := range c.Env {
 		got[e.Name] = append(got[e.Name], e.Value)
 	}
-	if vs, ok := got["GARAGE_ALLOW_WORLD_READABLE_SECRETS"]; !ok || vs[0] != "true" {
+	if vs, ok := got["GARAGE_ALLOW_WORLD_READABLE_SECRETS"]; !ok || vs[0] != annotationTrue {
 		t.Errorf("expected GARAGE_ALLOW_WORLD_READABLE_SECRETS=true, got %v", vs)
 	}
 	if vs, ok := got["MY_EXTRA"]; !ok || vs[0] != "user-supplied-value" {
@@ -1364,5 +1597,167 @@ func TestBuildGaragePodSpec_GatewayReadinessProbe(t *testing.T) {
 	st := buildGaragePodSpec(PodSpecConfig{Image: defaultGarageImage, IsGateway: false}, nil, nil, nil)
 	if st.Containers[0].ReadinessProbe != nil {
 		t.Errorf("storage pod should have no readiness probe, got %+v", st.Containers[0].ReadinessProbe)
+	}
+}
+
+func TestGatewayUsesLegacyCompatibleProjectedDataMarkerWithoutInitImage(t *testing.T) {
+	cluster := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: testNamespace},
+		Spec:       garagev1beta2.GarageClusterSpec{Gateway: &garagev1beta2.GatewaySpec{Replicas: 1}},
+	}
+	volumes, mounts := buildGatewayVolumesAndMounts(cluster)
+	podSpec := buildGaragePodSpec(
+		PodSpecConfig{Image: defaultGarageImage, IsGateway: true},
+		volumes,
+		mounts,
+		nil,
+	)
+	if len(podSpec.InitContainers) != 0 {
+		t.Fatalf("gateway must not require a third-party marker init image: %+v", podSpec.InitContainers)
+	}
+	var markerVolume *corev1.Volume
+	for i := range podSpec.Volumes {
+		if podSpec.Volumes[i].Name == gatewayDataMarkerVolumeName {
+			markerVolume = &podSpec.Volumes[i]
+			break
+		}
+	}
+	if markerVolume == nil || markerVolume.DownwardAPI == nil || len(markerVolume.DownwardAPI.Items) != 1 {
+		t.Fatalf("gateway marker DownwardAPI projection missing: %+v", markerVolume)
+	}
+	item := markerVolume.DownwardAPI.Items[0]
+	if item.Path != gatewayDataMarkerFile || item.FieldRef == nil || item.FieldRef.FieldPath != gatewayDataMarkerFieldPath {
+		t.Fatalf("gateway marker projection does not read the operator-owned compatibility annotation: %+v", item)
+	}
+	if gatewayDataMarkerLegacyContent != "" {
+		t.Fatalf("gateway marker content %q is incompatible with the empty marker written by released workloads", gatewayDataMarkerLegacyContent)
+	}
+	var markerMount *corev1.VolumeMount
+	for i := range podSpec.Containers[0].VolumeMounts {
+		if podSpec.Containers[0].VolumeMounts[i].Name == gatewayDataMarkerVolumeName {
+			markerMount = &podSpec.Containers[0].VolumeMounts[i]
+			break
+		}
+	}
+	if markerMount == nil || !markerMount.ReadOnly || markerMount.SubPath != gatewayDataMarkerFile ||
+		markerMount.MountPath != dataPath+"/"+gatewayDataMarkerFile {
+		t.Fatalf("gateway marker is not mounted as the exact read-only data marker: %+v", markerMount)
+	}
+
+	node := &garagev1beta1.GarageNode{Spec: garagev1beta1.GarageNodeSpec{
+		Gateway: true,
+		Storage: &garagev1beta1.NodeStorageConfig{},
+	}}
+	nodeVolumes, nodeMounts := (&GarageNodeReconciler{}).buildNodeVolumesAndMounts(node, cluster)
+	foundVolume := false
+	foundMount := false
+	for i := range nodeVolumes {
+		foundVolume = foundVolume || nodeVolumes[i].Name == gatewayDataMarkerVolumeName
+	}
+	for i := range nodeMounts {
+		foundMount = foundMount || nodeMounts[i].Name == gatewayDataMarkerVolumeName
+	}
+	if !foundVolume || !foundMount {
+		t.Fatalf("unified gateway GarageNode lacks projected marker: volume=%v mount=%v", foundVolume, foundMount)
+	}
+}
+
+func TestEdgeGatewayEmptyDirMetadataRendersVolumeWithoutClaim(t *testing.T) {
+	size := resource.MustParse("64Mi")
+	cluster := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: testNamespace},
+		Spec: garagev1beta2.GarageClusterSpec{Gateway: &garagev1beta2.GatewaySpec{
+			Replicas: 1,
+			Metadata: &garagev1beta2.VolumeConfig{
+				Type: garagev1beta2.VolumeTypeEmptyDir,
+				Size: &size,
+			},
+		}},
+	}
+
+	volumes, mounts := buildGatewayVolumesAndMounts(cluster)
+	var metadataVolume *corev1.Volume
+	for i := range volumes {
+		if volumes[i].Name == metadataVolName {
+			metadataVolume = &volumes[i]
+			break
+		}
+	}
+	if metadataVolume == nil || metadataVolume.EmptyDir == nil {
+		t.Fatalf("edge gateway metadata EmptyDir volume missing: %+v", volumes)
+	}
+	if metadataVolume.EmptyDir.SizeLimit == nil || metadataVolume.EmptyDir.SizeLimit.Cmp(size) != 0 {
+		t.Fatalf("edge gateway metadata sizeLimit = %v, want %s", metadataVolume.EmptyDir.SizeLimit, size.String())
+	}
+	foundMount := false
+	for i := range mounts {
+		if mounts[i].Name == metadataVolName && mounts[i].MountPath == metadataPath {
+			foundMount = true
+		}
+	}
+	if !foundMount {
+		t.Fatalf("edge gateway metadata mount missing: %+v", mounts)
+	}
+	if claims := buildGatewayVolumeClaimTemplates(cluster); len(claims) != 0 {
+		t.Fatalf("edge gateway EmptyDir metadata must not render a PVC template: %+v", claims)
+	}
+}
+
+func TestEdgeGatewayPersistentMetadataRendersClaimWithoutExplicitVolume(t *testing.T) {
+	cluster := &garagev1beta2.GarageCluster{
+		Spec: garagev1beta2.GarageClusterSpec{Gateway: &garagev1beta2.GatewaySpec{Replicas: 1}},
+	}
+	volumes, _ := buildGatewayVolumesAndMounts(cluster)
+	for i := range volumes {
+		if volumes[i].Name == metadataVolName {
+			t.Fatalf("persistent edge gateway metadata must come only from the claim template: %+v", volumes[i])
+		}
+	}
+	claims := buildGatewayVolumeClaimTemplates(cluster)
+	if len(claims) != 1 || claims[0].Name != metadataVolName {
+		t.Fatalf("persistent edge gateway metadata claim missing: %+v", claims)
+	}
+}
+
+func TestGatewayVolumeClaimTemplatesChangedCoversSupportedImmutableShape(t *testing.T) {
+	baseCluster := &garagev1beta2.GarageCluster{Spec: garagev1beta2.GarageClusterSpec{
+		Gateway: &garagev1beta2.GatewaySpec{Replicas: 0},
+	}}
+	base := buildGatewayVolumeClaimTemplates(baseCluster)
+	if gatewayVolumeClaimTemplatesChanged(base, base) {
+		t.Fatal("identical gateway claim templates reported drift")
+	}
+	if !gatewayVolumeClaimTemplatesChanged(base, nil) {
+		t.Fatal("PVC to EmptyDir template removal was not detected")
+	}
+
+	cases := map[string]func(*garagev1beta2.VolumeConfig){
+		"size": func(metadata *garagev1beta2.VolumeConfig) {
+			value := resource.MustParse("2Gi")
+			metadata.Size = &value
+		},
+		"accessModes": func(metadata *garagev1beta2.VolumeConfig) {
+			metadata.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+		},
+		"selector": func(metadata *garagev1beta2.VolumeConfig) {
+			metadata.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"disk": tierGateway}}
+		},
+		"labels": func(metadata *garagev1beta2.VolumeConfig) {
+			metadata.Labels = map[string]string{"example.com/claim": tierGateway}
+		},
+		"annotations": func(metadata *garagev1beta2.VolumeConfig) {
+			metadata.Annotations = map[string]string{"example.com/claim": tierGateway}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			cluster := baseCluster.DeepCopy()
+			cluster.Spec.Gateway.Metadata = &garagev1beta2.VolumeConfig{}
+			mutate(cluster.Spec.Gateway.Metadata)
+			desired := buildGatewayVolumeClaimTemplates(cluster)
+			if !gatewayVolumeClaimTemplatesChanged(base, desired) {
+				t.Fatalf("%s claim-template drift was not detected", name)
+			}
+		})
 	}
 }

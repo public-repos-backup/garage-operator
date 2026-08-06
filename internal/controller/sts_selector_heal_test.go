@@ -44,6 +44,7 @@ var _ = Describe("reconcileStatefulSet heals an immutable-selector mismatch (orp
 
 	AfterEach(func() {
 		_ = k8sClient.Delete(ctx, &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: testNamespace}})
+		_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 		n := &garagev1beta1.GarageNode{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: nodeName, Namespace: testNamespace}, n); err == nil {
 			n.Finalizers = nil
@@ -72,6 +73,7 @@ var _ = Describe("reconcileStatefulSet heals an immutable-selector mismatch (orp
 			},
 		}
 		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+		Expect(publishTestClusterConfig(ctx, k8sClient, cluster)).To(Succeed())
 
 		capacity := resource.MustParse("10Gi")
 		node := &garagev1beta1.GarageNode{
@@ -100,7 +102,7 @@ var _ = Describe("reconcileStatefulSet heals an immutable-selector mismatch (orp
 				Selector:    &metav1.LabelSelector{MatchLabels: oldSelector},
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: oldSelector},
-					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "garage", Image: "dxflrs/garage:test"}}},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: testGarageValue, Image: "dxflrs/garage:test"}}},
 				},
 			},
 		}

@@ -1,3 +1,9 @@
+{{- if and (not .Values.leaderElection.enabled) (not .Values.leaderElection.unsafeAllowDisabled) }}
+{{- fail "leaderElection.enabled=false is unsupported unless leaderElection.unsafeAllowDisabled=true explicitly acknowledges the single-manager safety risk" }}
+{{- end }}
+{{- if and (not .Values.leaderElection.enabled) (gt (int .Values.replicaCount) 1) }}
+{{- fail "replicaCount must be 1 when leader election is disabled" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,8 +55,9 @@ spec:
         {{- if .Values.metrics.enabled }}
         - --metrics-bind-address={{ .Values.metrics.bindAddress }}
         {{- end }}
-        {{- if .Values.leaderElection.enabled }}
-        - --leader-elect
+        - --leader-elect={{ .Values.leaderElection.enabled }}
+        {{- if and (not .Values.leaderElection.enabled) .Values.leaderElection.unsafeAllowDisabled }}
+        - --unsafe-allow-no-leader-election
         {{- end }}
         - --health-probe-bind-address=:8081
         {{- if .Values.webhooks.enabled }}

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
@@ -39,6 +40,58 @@ func warnError(err error) {
 	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
 }
 
+const (
+	// defaultKubectlDeleteTimeout bounds any `kubectl delete` the suite issues
+	// without saying how long it is willing to wait.
+	//
+	// Garage finalizers are fail-closed: a GarageCluster whose Admin API it cannot
+	// reach, or whose layout it cannot prove safe to release, blocks deletion
+	// indefinitely. An unbounded delete in a teardown hook inherits that block, and
+	// because teardown runs inside the same `go test` process it consumes the rest of
+	// the shard's budget. The result reports as "panic: test timed out after 40m"
+	// attributed to whichever cleanup line happened to be executing, hiding both the
+	// stuck finalizer and every spec that never got to run — twice observed on this
+	// suite, in two different shards.
+	//
+	// Bounding only the wait is behaviour-preserving: the delete is still issued and
+	// still processed asynchronously; the suite just stops blocking on it. Callers
+	// that need to assert a delete completed keep doing so with their own Eventually.
+	defaultKubectlDeleteTimeout = "3m"
+
+	kubectlBinary     = "kubectl"
+	kubectlDeleteVerb = "delete"
+)
+
+// boundKubectlDelete adds that deadline to a kubectl delete that has no explicit
+// --timeout. It deliberately does not touch any other verb: `kubectl wait` and
+// friends carry intentional deadlines of their own.
+func boundKubectlDelete(cmd *exec.Cmd) {
+	if cmd == nil || len(cmd.Args) < 2 || filepath.Base(cmd.Args[0]) != kubectlBinary {
+		return
+	}
+	isDelete := false
+	for _, arg := range cmd.Args[1:] {
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		isDelete = arg == kubectlDeleteVerb
+		break
+	}
+	if !isDelete {
+		return
+	}
+	for _, arg := range cmd.Args {
+		if arg == "--timeout" || strings.HasPrefix(arg, "--timeout=") {
+			return
+		}
+		// --wait=false already means "do not block", so there is nothing to bound.
+		if arg == "--wait=false" {
+			return
+		}
+	}
+	cmd.Args = append(cmd.Args, "--timeout="+defaultKubectlDeleteTimeout)
+}
+
 // Run executes the provided command within this context
 func Run(cmd *exec.Cmd) (string, error) {
 	dir, _ := GetProjectDir()
@@ -49,6 +102,7 @@ func Run(cmd *exec.Cmd) (string, error) {
 	}
 
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
+	boundKubectlDelete(cmd)
 	command := strings.Join(cmd.Args, " ")
 	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
 	output, err := cmd.CombinedOutput()

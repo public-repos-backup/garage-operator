@@ -30,7 +30,7 @@ func TestIsManagementHandle(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "connectTo + storage (edge/unified, not a handle)",
+			name: "invalid connectTo + storage is not a handle",
 			spec: GarageClusterSpec{Storage: &StorageSpec{}, ConnectTo: &ConnectToConfig{}},
 			want: false,
 		},

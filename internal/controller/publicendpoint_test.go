@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -53,6 +54,7 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 	})
 
 	AfterEach(func() {
+		_ = deleteTestGarageNodesForCluster(ctx, k8sClient, peNamespace, peClusterName)
 		cluster := &garagev1beta2.GarageCluster{}
 		if err := k8sClient.Get(ctx, nn, cluster); err == nil {
 			cluster.Finalizers = nil
@@ -62,7 +64,8 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 		for _, name := range []string{peClusterName, peClusterName + "-headless", peClusterName + "-rpc", peClusterName + "-0-rpc", peClusterName + "-1-rpc", peClusterName + "-2-rpc"} {
 			_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: peNamespace}})
 		}
-		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: peClusterName + "-config", Namespace: peNamespace}})
+		_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, peClusterName)
+		_ = deleteTestManagedSecretsForCluster(ctx, k8sClient, peNamespace, peClusterName)
 		_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: peClusterName + "-rpc-secret", Namespace: peNamespace}})
 	})
 
@@ -71,6 +74,14 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 		Expect(err).NotTo(HaveOccurred())
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
+	}
+	configMapContaining := func(needle string) (*corev1.ConfigMap, error) {
+		return testConfigMapForBaseMatching(
+			ctx, k8sClient, peNamespace, peClusterName+"-config",
+			func(configMap *corev1.ConfigMap) bool {
+				return strings.Contains(configMap.Data[configFileName], needle)
+			},
+		)
 	}
 
 	Context("LoadBalancer type", func() {
@@ -119,8 +130,46 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 			rpcSvc := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: peClusterName + "-rpc", Namespace: peNamespace}, rpcSvc)).To(Succeed())
 			Expect(rpcSvc.Spec.Selector).To(Equal(map[string]string{
-				labelCluster: peClusterName,
+				labelCluster:      peClusterName,
+				labelTier:         tierStorage,
+				labelStorageGroup: storageGroupDefault,
 			}))
+		})
+
+		It("keeps a mixed-cluster public endpoint scoped to default storage identities", func() {
+			capacity := resource.MustParse("500Gi")
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: peClusterName, Namespace: peNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					LayoutPolicy: LayoutPolicyManual,
+					Storage: &garagev1beta2.StorageSpec{
+						Replicas: 0,
+						NodeLocalPools: []garagev1beta2.NodeLocalPoolSpec{{
+							Name:     testTagLocal,
+							Selector: metav1.LabelSelector{MatchLabels: map[string]string{"storage.example/pool": testTagLocal}},
+							Capacity: &capacity,
+							Metadata: &garagev1beta2.HostPathVolumeConfig{HostPath: "/mnt/garage/meta"},
+							Data:     &garagev1beta2.HostPathVolumeConfig{HostPath: "/mnt/garage/data"},
+						}},
+					},
+					Replication: &garagev1beta2.ReplicationConfig{Factor: 1},
+					PublicEndpoint: &garagev1beta2.PublicEndpointConfig{
+						Type: publicEndpointTypeLoadBalancer,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			Expect(reconciler.reconcilePublicEndpointService(ctx, cluster)).To(Succeed())
+
+			rpcSvc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: peClusterName + "-rpc", Namespace: peNamespace}, rpcSvc)).To(Succeed())
+			Expect(rpcSvc.Spec.Selector).To(Equal(map[string]string{
+				labelCluster:      peClusterName,
+				labelTier:         tierStorage,
+				labelStorageGroup: storageGroupDefault,
+			}))
+			Expect(rpcSvc.Spec.Selector).NotTo(HaveKey(labelNodeLocalPool),
+				"node-local-pool identities need an exact-node route, not a shared Service")
 		})
 
 		It("sets rpc_public_addr in config once the LB service has an external IP", func() {
@@ -147,8 +196,8 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 			Expect(err).NotTo(HaveOccurred())
 
-			cm := &corev1.ConfigMap{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: peClusterName + "-config", Namespace: peNamespace}, cm)).To(Succeed())
+			cm, configErr := configMapContaining(`rpc_public_addr = "10.0.0.5:3901"`)
+			Expect(configErr).NotTo(HaveOccurred())
 			Expect(cm.Data["garage.toml"]).To(ContainSubstring(`rpc_public_addr = "10.0.0.5:3901"`))
 		})
 
@@ -178,8 +227,8 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 			Expect(err).NotTo(HaveOccurred())
 
-			cm := &corev1.ConfigMap{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: peClusterName + "-config", Namespace: peNamespace}, cm)).To(Succeed())
+			cm, configErr := configMapContaining(`rpc_public_addr = "explicit.example.com:3901"`)
+			Expect(configErr).NotTo(HaveOccurred())
 			Expect(cm.Data["garage.toml"]).To(ContainSubstring(`rpc_public_addr = "explicit.example.com:3901"`))
 			Expect(cm.Data["garage.toml"]).NotTo(ContainSubstring("10.0.0.5"))
 		})
@@ -241,6 +290,10 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 		})
 
 		It("creates per-node LoadBalancer RPC services for gateway-only (edge-gateway) cluster", func() {
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: peClusterName + "-rpc-secret", Namespace: peNamespace},
+				Data:       map[string][]byte{RPCSecretKey: []byte(strings.Repeat("a", 64))},
+			})).To(Succeed())
 			cluster := &garagev1beta2.GarageCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: peClusterName, Namespace: peNamespace},
 				Spec: garagev1beta2.GarageClusterSpec{
@@ -250,7 +303,7 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 						AdminAPIEndpoint: "http://192.168.0.10:3903",
 						AdminTokenSecretRef: &corev1.SecretKeySelector{
 							LocalObjectReference: corev1.LocalObjectReference{Name: "ext-admin-token"},
-							Key:                  "token",
+							Key:                  remoteAdminTokenKey,
 						},
 						RPCSecretRef: &corev1.SecretKeySelector{
 							LocalObjectReference: corev1.LocalObjectReference{Name: peClusterName + "-rpc-secret"},
@@ -294,6 +347,10 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 		})
 
 		It("populates rpc_public_addr in config once the gateway per-node LB service has an IP", func() {
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: peClusterName + "-rpc-secret", Namespace: peNamespace},
+				Data:       map[string][]byte{RPCSecretKey: []byte(strings.Repeat("b", 64))},
+			})).To(Succeed())
 			cluster := &garagev1beta2.GarageCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: peClusterName, Namespace: peNamespace},
 				Spec: garagev1beta2.GarageClusterSpec{
@@ -303,7 +360,7 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 						AdminAPIEndpoint: "http://192.168.0.10:3903",
 						AdminTokenSecretRef: &corev1.SecretKeySelector{
 							LocalObjectReference: corev1.LocalObjectReference{Name: "ext-admin-token"},
-							Key:                  "token",
+							Key:                  remoteAdminTokenKey,
 						},
 						RPCSecretRef: &corev1.SecretKeySelector{
 							LocalObjectReference: corev1.LocalObjectReference{Name: peClusterName + "-rpc-secret"},
@@ -329,8 +386,8 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 			_, err := reconciler2.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 			Expect(err).NotTo(HaveOccurred())
 
-			cm := &corev1.ConfigMap{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: peClusterName + "-config", Namespace: peNamespace}, cm)).To(Succeed())
+			cm, configErr := configMapContaining(`rpc_public_addr = "10.0.40.105:3901"`)
+			Expect(configErr).NotTo(HaveOccurred())
 			Expect(cm.Data["garage.toml"]).To(ContainSubstring(`rpc_public_addr = "10.0.40.105:3901"`))
 		})
 
@@ -365,7 +422,7 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(garagev1beta1.ReasonPerNodeNotImplemented))
-			Expect(cond.Message).To(ContainSubstring("GarageNode"))
+			Expect(cond.Message).To(ContainSubstring(kindGarageNode))
 		})
 	})
 
@@ -392,8 +449,8 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: peClusterName + "-rpc", Namespace: peNamespace}, rpcSvc)).To(Succeed())
 			Expect(rpcSvc.Spec.Type).To(Equal(corev1.ServiceTypeNodePort))
 
-			cm := &corev1.ConfigMap{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: peClusterName + "-config", Namespace: peNamespace}, cm)).To(Succeed())
+			cm, configErr := configMapContaining(`rpc_public_addr = "k8s-node.example.com:30901"`)
+			Expect(configErr).NotTo(HaveOccurred())
 			Expect(cm.Data["garage.toml"]).To(ContainSubstring(`rpc_public_addr = "k8s-node.example.com:30901"`))
 		})
 	})
@@ -455,7 +512,7 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 						AdminAPIEndpoint: "http://192.168.0.13:3903",
 						AdminTokenSecretRef: &corev1.SecretKeySelector{
 							LocalObjectReference: corev1.LocalObjectReference{Name: "pe-unraid-admin-token"},
-							Key:                  "admin-token",
+							Key:                  DefaultAdminTokenKey,
 						},
 					},
 					// No spec.admin configured — gateway's own admin API is unauthenticated/unconfigured
@@ -500,7 +557,7 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 			Expect(addr).To(BeEmpty())
 		})
 
-		It("returns the matching per-node LoadBalancer address when perNode is true", func() {
+		It("maps the gateway StatefulSet hostname to the stable per-node LoadBalancer service", func() {
 			cluster := &garagev1beta2.GarageCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: peClusterName, Namespace: peNamespace},
 				Spec: garagev1beta2.GarageClusterSpec{
@@ -525,9 +582,76 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 			Expect(k8sClient.Status().Update(ctx, svc)).To(Succeed())
 
 			addr := reconciler.deriveGatewayExternalAddrForNode(ctx, cluster, garage.NodeInfo{
-				Hostname: ptrString(peClusterName + "-0"),
+				Hostname: ptrString(peClusterName + "-gateway-0"),
 			})
 			Expect(addr).To(Equal("10.0.0.6:3901"))
+		})
+
+		It("lets a per-node LoadBalancer identity win over a shared network address", func() {
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: peClusterName, Namespace: peNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					Network: garagev1beta2.NetworkConfig{RPCPublicAddr: testSharedRPCPublicAddr},
+					PublicEndpoint: &garagev1beta2.PublicEndpointConfig{
+						Type: publicEndpointTypeLoadBalancer,
+						LoadBalancer: &garagev1beta2.LoadBalancerEndpointConfig{
+							PerNode: true,
+						},
+					},
+				},
+			}
+
+			svc := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: peClusterName + "-1-rpc", Namespace: peNamespace},
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Name: rpcPortName, Port: 3901}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, svc)).To(Succeed())
+			svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{Hostname: "gateway-1.example.net"}}
+			Expect(k8sClient.Status().Update(ctx, svc)).To(Succeed())
+
+			addr := reconciler.deriveGatewayExternalAddrForNode(ctx, cluster, garage.NodeInfo{
+				Hostname: ptrString(peClusterName + "-gateway-1"),
+			})
+			Expect(addr).To(Equal("gateway-1.example.net:3901"))
+		})
+
+		It("supports the legacy gateway hostname and falls back safely for malformed hostnames", func() {
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: peClusterName, Namespace: peNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					PublicEndpoint: &garagev1beta2.PublicEndpointConfig{
+						Type: publicEndpointTypeLoadBalancer,
+						LoadBalancer: &garagev1beta2.LoadBalancerEndpointConfig{
+							PerNode: true,
+						},
+					},
+				},
+			}
+
+			for _, ordinal := range []int32{0, 1} {
+				svc := &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: perNodeRPCServiceName(peClusterName, ordinal), Namespace: peNamespace},
+					Spec: corev1.ServiceSpec{
+						Type:  corev1.ServiceTypeLoadBalancer,
+						Ports: []corev1.ServicePort{{Name: rpcPortName, Port: 3901}},
+					},
+				}
+				Expect(k8sClient.Create(ctx, svc)).To(Succeed())
+				svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: fmt.Sprintf("10.0.0.%d", ordinal+10)}}
+				Expect(k8sClient.Status().Update(ctx, svc)).To(Succeed())
+			}
+
+			legacy := reconciler.deriveGatewayExternalAddrForNode(ctx, cluster, garage.NodeInfo{
+				Hostname: ptrString(peClusterName + "-1"),
+			})
+			Expect(legacy).To(Equal("10.0.0.11:3901"))
+			malformed := reconciler.deriveGatewayExternalAddrForNode(ctx, cluster, garage.NodeInfo{
+				Hostname: ptrString(peClusterName + "-gateway-not-an-ordinal"),
+			})
+			Expect(malformed).To(Equal("10.0.0.10:3901"))
 		})
 	})
 })

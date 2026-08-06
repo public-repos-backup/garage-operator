@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -85,21 +86,83 @@ func computeUnreachablePeers(nodes []garage.NodeInfo) []string {
 	return out
 }
 
-// clusterHasRPCPublicAddr reports whether the cluster advertises an
-// externally-routable RPC address — either an explicit network.rpcPublicAddr or
-// a publicEndpoint the operator derives one from. Federation needs this so
-// Garage's HelloMessage carries a server_addr peers can dial.
-func clusterHasRPCPublicAddr(cluster *garagev1beta2.GarageCluster) bool {
-	if cluster.Spec.Network.RPCPublicAddr != "" {
-		return true
+// clusterHasRPCPublicAddr reports whether every locally-declared identity group
+// has an externally routable federation address. A route for one group must
+// never mask an unaddressed group: the default PVC pool, every node-local pool, and
+// the gateway tier have different identities and often different Services.
+func clusterHasRPCPublicAddr(
+	cluster *garagev1beta2.GarageCluster,
+	garageNodeSnapshots ...[]garagev1beta1.GarageNode,
+) bool {
+	return len(clusterRPCAddressGaps(cluster, garageNodeSnapshots...)) == 0
+}
+
+func clusterRPCAddressGaps(
+	cluster *garagev1beta2.GarageCluster,
+	garageNodeSnapshots ...[]garagev1beta1.GarageNode,
+) []string {
+	if cluster == nil {
+		return []string{"cluster"}
 	}
-	if cluster.Spec.PublicEndpoint != nil {
-		return true
+	if strings.TrimSpace(cluster.Spec.Network.RPCPublicAddrSubnet) != "" {
+		return nil
 	}
-	if cluster.Spec.Gateway != nil && cluster.Spec.Gateway.RPCPublicAddr != "" {
-		return true
+	shared := strings.TrimSpace(cluster.Spec.Network.RPCPublicAddr) != ""
+	var gaps []string
+
+	defaultAddressed := shared || (cluster.Spec.Storage != nil && strings.TrimSpace(cluster.Spec.Storage.RPCPublicAddr) != "") ||
+		cluster.Spec.PublicEndpoint != nil
+	if cluster.Spec.Storage != nil && cluster.Spec.Storage.Replicas > 0 &&
+		cluster.EffectiveStorageLayoutPolicy() != LayoutPolicyManual && !defaultAddressed {
+		gaps = append(gaps, "default StatefulSet/PVC group")
 	}
-	return false
+	if cluster.Spec.Storage != nil {
+		for i := range cluster.Spec.Storage.NodeLocalPools {
+			pool := &cluster.Spec.Storage.NodeLocalPools[i]
+			if pool.Network == nil || strings.TrimSpace(pool.Network.RPCPublicAddrTemplate) == "" {
+				gaps = append(gaps, "node-local pool "+pool.Name)
+			}
+		}
+	}
+	gatewayAddressed := shared || (cluster.Spec.Gateway != nil && strings.TrimSpace(cluster.Spec.Gateway.RPCPublicAddr) != "")
+	if cluster.Spec.Gateway != nil && cluster.Spec.Gateway.Replicas > 0 && cluster.Spec.LayoutPolicy != LayoutPolicyManual {
+		// In a gateway-only cluster publicEndpoint targets the gateway workload.
+		if !cluster.HasStorageTier() && cluster.Spec.PublicEndpoint != nil {
+			gatewayAddressed = true
+		}
+		if !gatewayAddressed {
+			gaps = append(gaps, "gateway tier")
+		}
+	}
+
+	// Manual GarageNodes are real local identities too. When a live snapshot is
+	// available, require every user-managed identity to have either its own
+	// public address or a route supplied by its tier. This is what makes a mixed
+	// SMB + node-local-pool cluster diagnosable rather than silently treating replicas:
+	// 0 as "no default storage identities".
+	if len(garageNodeSnapshots) > 0 {
+		for i := range garageNodeSnapshots[0] {
+			node := &garageNodeSnapshots[0][i]
+			if node.Spec.ClusterRef.Name != cluster.Name || node.Spec.Backing == garagev1beta1.NodeBackingNodeLocalPool {
+				continue
+			}
+			nodeAddressed := node.Spec.Network != nil && strings.TrimSpace(node.Spec.Network.RPCPublicAddr) != ""
+			if node.Spec.PublicEndpoint != nil {
+				nodeAddressed = true
+			}
+			switch {
+			case node.Spec.Gateway && !gatewayAddressed && (cluster.HasStorageTier() || cluster.Spec.PublicEndpoint == nil) && !nodeAddressed:
+				gaps = append(gaps, "gateway GarageNode "+node.Name)
+			case !node.Spec.Gateway && !defaultAddressed && !nodeAddressed:
+				gaps = append(gaps, "storage GarageNode "+node.Name)
+			}
+		}
+	}
+	if !cluster.HasStorageTier() && !cluster.HasGatewayTier() && !shared && cluster.Spec.PublicEndpoint == nil {
+		gaps = append(gaps, "local Garage identities")
+	}
+	sort.Strings(gaps)
+	return gaps
 }
 
 // setClusterHealthConditions derives the actionable health conditions
@@ -111,7 +174,10 @@ func clusterHasRPCPublicAddr(cluster *garagev1beta2.GarageCluster) bool {
 //
 // Severity order (worst first): write-quorum loss → remote-cluster loss →
 // federation misconfiguration.
-func setClusterHealthConditions(cluster *garagev1beta2.GarageCluster) {
+func setClusterHealthConditions(
+	cluster *garagev1beta2.GarageCluster,
+	garageNodeSnapshots ...[]garagev1beta1.GarageNode,
+) {
 	gen := cluster.Generation
 	var diagnoses []string
 
@@ -157,10 +223,10 @@ func setClusterHealthConditions(cluster *garagev1beta2.GarageCluster) {
 			stale = append(stale, fmt.Sprintf("%s (%s)", rc.Name, age))
 		}
 		if len(stale) > 0 {
-			msg := fmt.Sprintf(
-				"federated remote clusters unreachable: %s; if a zone is permanently gone, "+
-					"reduce spec.replication.factor to restore write quorum",
-				strings.Join(stale, ", "))
+			msg := summarizeConditionItems(
+				"federated remote clusters unreachable: ", stale,
+				"; if a zone is permanently gone, reduce spec.replication.factor to restore write quorum",
+			)
 			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 				Type:               garagev1beta1.ConditionRemoteClustersHealthy,
 				Status:             metav1.ConditionFalse,
@@ -184,18 +250,20 @@ func setClusterHealthConditions(cluster *garagev1beta2.GarageCluster) {
 
 	// --- FederationConfigured: rpc_public_addr present when federated ------
 	if len(cluster.Spec.RemoteClusters) > 0 {
-		if clusterHasRPCPublicAddr(cluster) {
+		if clusterHasRPCPublicAddr(cluster, garageNodeSnapshots...) {
 			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 				Type:               garagev1beta1.ConditionFederationConfigured,
 				Status:             metav1.ConditionTrue,
 				Reason:             garagev1beta1.ReasonFederationReady,
-				Message:            "rpc_public_addr is configured for cross-cluster RPC",
+				Message:            "an identity-specific RPC route is configured for cross-cluster RPC",
 				ObservedGeneration: gen,
 			})
 		} else {
-			msg := "federation enabled (spec.remoteClusters) but no rpc_public_addr " +
-				"(set spec.network.rpcPublicAddr or a publicEndpoint); cross-cluster RPC will " +
-				"degrade after pod restarts as peers infer the unroutable pod IP"
+			gaps := clusterRPCAddressGaps(cluster, garageNodeSnapshots...)
+			msg := summarizeConditionItems(
+				"federation enabled (spec.remoteClusters) but no identity-specific RPC route for ", gaps,
+				" (set the matching tier address, every nodeLocalPools[].network.rpcPublicAddrTemplate, or network.rpcPublicAddrSubnet); cross-cluster RPC will degrade after pod restarts as peers infer the unroutable pod IP",
+			)
 			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 				Type:               garagev1beta1.ConditionFederationConfigured,
 				Status:             metav1.ConditionFalse,
@@ -211,10 +279,11 @@ func setClusterHealthConditions(cluster *garagev1beta2.GarageCluster) {
 
 	// --- PeerUnreachable: sustained-down peers ----------------------------
 	if len(cluster.Status.UnreachablePeers) > 0 {
-		msg := fmt.Sprintf(
-			"peers unreachable beyond %s: %s; the operator's periodic ConnectClusterNodes nudge is the recovery path "+
-				"(Garage stops retrying a peer after ~10 attempts)",
-			peerUnreachableThreshold, strings.Join(cluster.Status.UnreachablePeers, ", "))
+		msg := summarizeConditionItems(
+			fmt.Sprintf("peers unreachable beyond %s: ", peerUnreachableThreshold),
+			cluster.Status.UnreachablePeers,
+			"; the operator's periodic ConnectClusterNodes nudge is the recovery path (Garage stops retrying a peer after ~10 attempts)",
+		)
 		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 			Type:               garagev1beta1.ConditionPeerUnreachable,
 			Status:             metav1.ConditionTrue,
@@ -235,11 +304,10 @@ func setClusterHealthConditions(cluster *garagev1beta2.GarageCluster) {
 
 	// --- GatewayLayoutDegraded: gateway nodes missing their layout role -----
 	if len(cluster.Status.GatewayNodesNotInLayout) > 0 {
-		msg := fmt.Sprintf(
-			"gateway nodes not in layout: %s; they have lost the capacity:nil role that keeps S3 sig-auth local, "+
-				"so key/bucket lookups fall back to a per-request quorum RPC to storage — set the "+
-				"garage.rajsingh.info/force-layout-apply annotation to re-stage the gateway roles",
-			strings.Join(cluster.Status.GatewayNodesNotInLayout, ", "))
+		msg := summarizeConditionItems(
+			"gateway nodes not in layout: ", cluster.Status.GatewayNodesNotInLayout,
+			"; they have lost the capacity:nil role that replicates S3 authentication data locally, so signed requests can fail with 403 No such key — set the garage.rajsingh.info/force-layout-apply annotation to re-stage the gateway roles",
+		)
 		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 			Type:               garagev1beta1.ConditionGatewayLayoutDegraded,
 			Status:             metav1.ConditionTrue,

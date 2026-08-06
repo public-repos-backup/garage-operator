@@ -1,14 +1,19 @@
 # Edge Gateway Cluster Examples
 #
-# Gateway pods route S3/Admin traffic but store no data. They are deployed as a
-# Deployment (RollingUpdate strategy) and use EmptyDir for both metadata and
-# data — node IDs rotate on every pod restart. The operator garbage-collects
-# stale gateway layout entries via tombstone cleanup on each reconcile.
+# Gateway pods route S3/Admin traffic but store no object blocks. Metadata uses
+# a small PVC by default so each Garage node identity survives Pod replacement;
+# block data remains EmptyDir. In Auto layout mode, a unified cluster generates
+# one GarageNode and single-replica StatefulSet per gateway. Manual unified
+# members are user-owned GarageNodes. An edge gateway uses one cluster-level
+# StatefulSet. Setting gateway.metadata.type to EmptyDir is an explicit
+# ephemeral-identity choice and produces an admission warning.
+# Change edge metadata only at replicas: 0 after the old capacity-less roles
+# have retired; StatefulSet claim templates cannot be updated in place.
 #
 # Three patterns are shown below:
 #
 #  1. Unified cluster — `storage` + `gateway` in the same CR (most common,
-#     see garage_v1beta1_garagecluster.yaml).
+#     see garage_v1beta2_garagecluster.yaml).
 #  2. Edge gateway via clusterRef — gateway in the same namespace as storage.
 #  3. Edge gateway via adminApiEndpoint — gateway in a different K8s cluster.
 ---
@@ -24,9 +29,16 @@ metadata:
 spec:
   image: dxflrs/garage:v2.3.0
 
-  # Gateway tier only — no storage block means no PVCs, no StatefulSet.
+  # Gateway tier only — no storage block. This edge gateway uses one StatefulSet
+  # with a persistent metadata PVC per replica; block data stays EmptyDir.
   gateway:
     replicas: 2
+    # Edge gateways default to Delete/Delete for compatibility. Use Retain to
+    # keep the metadata node_key after scale-down/deletion. In a unified
+    # cluster, the omitted default is Retain/Retain instead.
+    # pvcRetentionPolicy:
+    #   whenDeleted: Retain
+    #   whenScaled: Retain
     podDisruptionBudget:
       enabled: true
       maxUnavailable: 1

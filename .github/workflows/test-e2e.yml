@@ -19,18 +19,20 @@ jobs:
   e2e-ginkgo:
     name: Ginkgo E2E Tests (${{ matrix.shard.name }})
     runs-on: ${{ matrix.shard.runner }}
-    # The api shard carries the two management-handle blocks (each stands up its
-    # own Garage), so it runs closer to the cap than the others.
+    # Keep each safety-coordinated API block in its own cluster. Manual drains
+    # and dual-version topology changes intentionally wait through Garage's
+    # production proof windows, while each management-handle block starts a
+    # real Garage. Isolation preserves cleanup/debug margin under this cap.
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        # The Ginkgo suite is split into 3 shards by Ginkgo label so each runs on
-        # its own Kind cluster in parallel, cutting the lane from ~28m to ~13m.
+        # The Ginkgo suite is split into 6 primary shards by Ginkgo label so
+        # each runs on its own Kind cluster in parallel.
         # The "layout" shard is a catch-all complement so any spec not explicitly
-        # claimed by "core" or "api" (including future unlabeled Describes) still
-        # runs exactly once — no coverage is silently dropped. The three filters
-        # are disjoint and exhaustive over the suite's labels.
+        # claimed by a dedicated shard (including future unlabeled Describes) still
+        # runs exactly once — no coverage is silently dropped. The six primary
+        # filters are disjoint and exhaustive over the suite's labels.
         # core-arm64 re-runs the core shard on GitHub's free arm64 runners —
         # the operator ships multi-arch images (docker.yml) but nothing
         # exercised them; arch-specific breakage surfaced only on user
@@ -39,15 +41,31 @@ jobs:
           - name: core
             runner: ubuntu-latest
             filter: "gateway || manager || webhooks || external-gateway"
-          - name: api
+            kind_config: ""
+          - name: api-dual-version
             runner: ubuntu-latest
-            filter: "dual-version || manual-mode || management-handle"
+            filter: "dual-version"
+            kind_config: ""
+          - name: api-manual-mode
+            runner: ubuntu-latest
+            filter: "manual-mode"
+            kind_config: ""
+          - name: api-management-handle
+            runner: ubuntu-latest
+            filter: "management-handle"
+            kind_config: ""
           - name: layout
             runner: ubuntu-latest
-            filter: "!(gateway || manager || webhooks || external-gateway || dual-version || manual-mode || management-handle)"
+            filter: "!(gateway || manager || webhooks || external-gateway || dual-version || manual-mode || management-handle || node-local-pools)"
+            kind_config: ""
+          - name: node-local-pools
+            runner: ubuntu-latest
+            filter: "node-local-pools"
+            kind_config: "test/e2e/kind-node-local-pools.yaml"
           - name: core-arm64
             runner: ubuntu-24.04-arm
             filter: "gateway || manager || webhooks || external-gateway"
+            kind_config: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -68,7 +86,7 @@ jobs:
         uses: azure/setup-kubectl@v5
 
       - name: Run Ginkgo e2e tests
-        run: make test-e2e GINKGO_LABEL_FILTER='${{ matrix.shard.filter }}' KIND_CLUSTER='garage-e2e-${{ matrix.shard.name }}'
+        run: make test-e2e GINKGO_LABEL_FILTER='${{ matrix.shard.filter }}' KIND_CLUSTER='garage-e2e-${{ matrix.shard.name }}' KIND_CONFIG_E2E='${{ matrix.shard.kind_config }}'
 
       - name: Collect debug info
         if: failure()
@@ -148,6 +166,7 @@ jobs:
           path: /tmp/e2e-debug/
           retention-days: 7
           if-no-files-found: warn
+
 
   e2e-cosi:
     name: COSI E2E Tests
@@ -300,4 +319,3 @@ jobs:
           path: /tmp/e2e-debug/
           retention-days: 7
           if-no-files-found: warn
-

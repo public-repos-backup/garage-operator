@@ -12,12 +12,14 @@ package v1beta1
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	v1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 )
@@ -33,9 +35,11 @@ const (
 	testStorage       = "storage"
 	testStoreCR       = "store"
 	test10Gi          = "10Gi"
-	testConsist       = "consistent"
+	testConsist       = consistencyModeConsistent
 	testRelabel       = "rpc_duration_.*"
 	testAdminEndpoint = "http://garage.garage.svc:3903"
+	testHandleName    = "handle"
+	testAdminSecret   = "admin"
 )
 
 // TestConvertTo_StorageCluster: v1beta1 storage CR -> v1beta2 storage tier.
@@ -194,11 +198,33 @@ func TestConvert_MonitoringMetricRelabelingsRoundTrip(t *testing.T) {
 
 // TestConvertTo_GatewayCluster: v1beta1 gateway=true CR with connectTo -> v1beta2 edge gateway.
 func TestConvertTo_GatewayCluster(t *testing.T) {
+	metadataSize := resource.MustParse("2Gi")
+	storageClass := "gateway-fast"
+	minAvailable := intstr.FromInt32(1)
+	metadata := &VolumeConfig{
+		Size:             &metadataSize,
+		StorageClassName: &storageClass,
+		AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+			testDiskNameLabelKey: testEdgeMetadataValue,
+		}},
+		Labels:      map[string]string{"claim.example.com/tier": gatewayValue},
+		Annotations: map[string]string{"claim.example.com/owner": testEdgeValue},
+	}
 	src := &GarageCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: testNS},
 		Spec: GarageClusterSpec{
 			Gateway:  true,
 			Replicas: 2,
+			Storage: StorageConfig{
+				Metadata: metadata,
+				PVCRetentionPolicy: &PVCRetentionPolicy{
+					WhenDeleted: testRetainValue, WhenScaled: testDeleteValue,
+				},
+			},
+			PodDisruptionBudget: &PodDisruptionBudgetConfig{
+				Enabled: true, MinAvailable: &minAvailable,
+			},
 			ConnectTo: &ConnectToConfig{
 				ClusterRef: &ClusterReference{Name: testStoreCR, Namespace: testNS},
 			},
@@ -216,6 +242,23 @@ func TestConvertTo_GatewayCluster(t *testing.T) {
 	}
 	if dst.Spec.Gateway.Replicas != 2 {
 		t.Errorf("gateway.replicas: got %d want 2", dst.Spec.Gateway.Replicas)
+	}
+	expectedMetadata := &v1beta2.VolumeConfig{}
+	if err := copyJSON(metadata, expectedMetadata); err != nil {
+		t.Fatalf("building expected gateway metadata: %v", err)
+	}
+	if !reflect.DeepEqual(dst.Spec.Gateway.Metadata, expectedMetadata) {
+		t.Fatalf("released v1beta1 gateway metadata contract was not projected:\n got: %#v\nwant: %#v", dst.Spec.Gateway.Metadata, expectedMetadata)
+	}
+	if dst.Spec.Gateway.PodDisruptionBudget == nil || !dst.Spec.Gateway.PodDisruptionBudget.Enabled ||
+		dst.Spec.Gateway.PodDisruptionBudget.MinAvailable == nil ||
+		dst.Spec.Gateway.PodDisruptionBudget.MinAvailable.IntVal != 1 {
+		t.Fatalf("v1beta1 gateway PodDisruptionBudget was not projected: %#v", dst.Spec.Gateway.PodDisruptionBudget)
+	}
+	if dst.Spec.Gateway.PVCRetentionPolicy == nil ||
+		dst.Spec.Gateway.PVCRetentionPolicy.WhenDeleted != testRetainValue ||
+		dst.Spec.Gateway.PVCRetentionPolicy.WhenScaled != testDeleteValue {
+		t.Fatalf("released v1beta1 gateway PVC retention policy was not projected: %#v", dst.Spec.Gateway.PVCRetentionPolicy)
 	}
 	if dst.Spec.ConnectTo == nil || dst.Spec.ConnectTo.ClusterRef == nil ||
 		dst.Spec.ConnectTo.ClusterRef.Name != testStoreCR {
@@ -264,10 +307,31 @@ func TestConvertFrom_StorageCluster(t *testing.T) {
 
 // TestConvertFrom_GatewayOnlyCluster: v1beta2 edge gateway -> v1beta1.
 func TestConvertFrom_GatewayOnlyCluster(t *testing.T) {
+	metadataSize := resource.MustParse("2Gi")
+	storageClass := "gateway-fast"
+	maxUnavailable := intstr.FromString("25%")
 	src := &v1beta2.GarageCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: testNS},
 		Spec: v1beta2.GarageClusterSpec{
-			Gateway: &v1beta2.GatewaySpec{Replicas: 2},
+			Gateway: &v1beta2.GatewaySpec{
+				Replicas: 2,
+				Metadata: &v1beta2.VolumeConfig{
+					Size:             &metadataSize,
+					StorageClassName: &storageClass,
+					AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						testDiskNameLabelKey: testEdgeMetadataValue,
+					}},
+					Labels:      map[string]string{"claim.example.com/tier": gatewayValue},
+					Annotations: map[string]string{"claim.example.com/owner": testEdgeValue},
+				},
+				PodDisruptionBudget: &v1beta2.PodDisruptionBudgetConfig{
+					Enabled: true, MaxUnavailable: &maxUnavailable,
+				},
+				PVCRetentionPolicy: &v1beta2.PVCRetentionPolicy{
+					WhenDeleted: testRetainValue, WhenScaled: testDeleteValue,
+				},
+			},
 			ConnectTo: &v1beta2.ConnectToConfig{
 				ClusterRef: &v1beta2.ClusterReference{Name: testStoreCR},
 			},
@@ -286,11 +350,104 @@ func TestConvertFrom_GatewayOnlyCluster(t *testing.T) {
 	if dst.Spec.ConnectTo == nil || dst.Spec.ConnectTo.ClusterRef == nil {
 		t.Errorf("connectTo not preserved")
 	}
+	if dst.Spec.Storage.Metadata == nil || dst.Spec.Storage.Metadata.Selector == nil ||
+		dst.Spec.Storage.Metadata.Selector.MatchLabels[testDiskNameLabelKey] != testEdgeMetadataValue {
+		t.Fatalf("v1beta2 gateway metadata was not projected into the released v1beta1 field: %#v", dst.Spec.Storage.Metadata)
+	}
+	if dst.Spec.PodDisruptionBudget == nil || dst.Spec.PodDisruptionBudget.MaxUnavailable == nil ||
+		dst.Spec.PodDisruptionBudget.MaxUnavailable.StrVal != "25%" {
+		t.Fatalf("gateway PDB was not projected into v1beta1: %#v", dst.Spec.PodDisruptionBudget)
+	}
+	if dst.Spec.Storage.PVCRetentionPolicy == nil ||
+		dst.Spec.Storage.PVCRetentionPolicy.WhenDeleted != testRetainValue ||
+		dst.Spec.Storage.PVCRetentionPolicy.WhenScaled != testDeleteValue {
+		t.Fatalf("gateway PVC retention was not projected into v1beta1: %#v", dst.Spec.Storage.PVCRetentionPolicy)
+	}
+	if dst.Annotations[v1beta2AnnotationGatewayTierPresent] != "" ||
+		dst.Annotations[v1beta2AnnotationGatewayTierData] != "" {
+		t.Fatalf("plain v1beta1-representable edge gateway received reserved conversion payload: %#v", dst.Annotations)
+	}
+	roundTripped := &v1beta2.GarageCluster{}
+	if err := dst.ConvertTo(roundTripped); err != nil {
+		t.Fatalf("ConvertTo: %v", err)
+	}
+	if !reflect.DeepEqual(roundTripped.Spec.Gateway, src.Spec.Gateway) {
+		t.Fatalf("plain edge gateway changed after payload-free round trip:\n got: %#v\nwant: %#v", roundTripped.Spec.Gateway, src.Spec.Gateway)
+	}
 }
 
-// TestConvertFrom_UnifiedCluster: v1beta2 unified CR (storage + gateway both set)
-// -> v1beta1 must be lossy and annotated.
-func TestConvertFrom_UnifiedCluster_Lossy(t *testing.T) {
+func TestConvertRoundTrip_RichEdgeGatewayPreservesV1Beta2OnlyFields(t *testing.T) {
+	original := &v1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "rich-edge", Namespace: testNS},
+		Spec: v1beta2.GarageClusterSpec{
+			Gateway: &v1beta2.GatewaySpec{
+				Replicas:      2,
+				RPCPublicAddr: "edge.example.net:3901",
+				Metadata:      &v1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("2Gi"))},
+				PodDisruptionBudget: &v1beta2.PodDisruptionBudgetConfig{
+					Enabled: true,
+				},
+				ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{Path: "/ready", Port: intstr.FromInt32(3903)},
+				}},
+				PodTemplate: v1beta2.PodTemplate{
+					NodeSelector:   map[string]string{testWorkloadLabelKey: testEdgeValue},
+					PodAnnotations: map[string]string{"example.net/gateway": stringTrue},
+					Env:            []corev1.EnvVar{{Name: garageAllowWorldReadableSecretsEnv, Value: stringTrue}},
+					EnvFrom: []corev1.EnvFromSource{{
+						ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "gateway-env"}},
+					}},
+				},
+			},
+			ConnectTo: &v1beta2.ConnectToConfig{
+				ClusterRef: &v1beta2.ClusterReference{Name: testStoreCR},
+			},
+		},
+	}
+
+	spoke := &GarageCluster{}
+	if err := spoke.ConvertFrom(original); err != nil {
+		t.Fatalf("ConvertFrom: %v", err)
+	}
+	if spoke.Annotations[v1beta2AnnotationGatewayTierData] == "" {
+		t.Fatal("rich edge gateway did not receive its lossless conversion payload")
+	}
+	if spoke.Spec.Storage.Metadata == nil || spoke.Spec.Storage.Metadata.Size == nil ||
+		spoke.Spec.Storage.Metadata.Size.Cmp(resource.MustParse("2Gi")) != 0 {
+		t.Fatalf("rich edge metadata was not exposed through the released v1beta1 field: %#v", spoke.Spec.Storage.Metadata)
+	}
+	spoke.Spec.Replicas = 3
+	spoke.Spec.NodeSelector = map[string]string{testWorkloadLabelKey: "edge-edited"}
+	spoke.Spec.Storage.Metadata.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{
+		testDiskNameLabelKey: "edited-through-v1",
+	}}
+	maxUnavailable := intstr.FromInt32(1)
+	spoke.Spec.PodDisruptionBudget = &PodDisruptionBudgetConfig{Enabled: true, MaxUnavailable: &maxUnavailable}
+
+	roundTripped := &v1beta2.GarageCluster{}
+	if err := spoke.ConvertTo(roundTripped); err != nil {
+		t.Fatalf("ConvertTo: %v", err)
+	}
+	expected := original.Spec.Gateway.DeepCopy()
+	expected.Replicas = 3
+	expected.NodeSelector = map[string]string{testWorkloadLabelKey: "edge-edited"}
+	expected.Metadata.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{
+		testDiskNameLabelKey: "edited-through-v1",
+	}}
+	expected.PodDisruptionBudget = &v1beta2.PodDisruptionBudgetConfig{Enabled: true, MaxUnavailable: &maxUnavailable}
+	if !reflect.DeepEqual(roundTripped.Spec.Gateway, expected) {
+		t.Fatalf("rich edge gateway changed:\n got: %#v\nwant: %#v", roundTripped.Spec.Gateway, expected)
+	}
+	if roundTripped.Annotations[v1beta2AnnotationGatewayTierData] != "" ||
+		roundTripped.Annotations[v1beta2AnnotationGatewayTierPresent] != "" {
+		t.Fatalf("gateway conversion transport annotations leaked into hub: %#v", roundTripped.Annotations)
+	}
+}
+
+// TestConvertFrom_UnifiedCluster: v1beta2 unified CR (storage + gateway both
+// set) renders an editable storage view and carries the gateway losslessly in
+// reserved conversion annotations.
+func TestConvertFrom_UnifiedCluster_PreservesGatewayPayload(t *testing.T) {
 	src := &v1beta2.GarageCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "uni", Namespace: testNS},
 		Spec: v1beta2.GarageClusterSpec{
@@ -310,10 +467,13 @@ func TestConvertFrom_UnifiedCluster_Lossy(t *testing.T) {
 		t.Fatalf("expected v1beta1 gateway=false (storage-form rendering)")
 	}
 	if dst.Spec.Replicas != 3 {
-		t.Errorf("replicas should come from storage tier on lossy convert; got %d want 3", dst.Spec.Replicas)
+		t.Errorf("replicas should come from editable storage tier; got %d want 3", dst.Spec.Replicas)
 	}
 	if dst.Annotations[v1beta2AnnotationGatewayTierPresent] == "" {
-		t.Errorf("expected lossy-conversion annotation to be set")
+		t.Errorf("expected gateway conversion marker to be set")
+	}
+	if dst.Annotations[v1beta2AnnotationGatewayTierData] == "" {
+		t.Errorf("expected gateway conversion payload to be set")
 	}
 }
 
@@ -515,11 +675,11 @@ func TestConvert_NilHubArg(t *testing.T) {
 // a v1beta2 handle (Storage/Gateway nil), so the operator still sees a handle.
 func TestConvert_ManagementHandleRoundTrip(t *testing.T) {
 	hub := &v1beta2.GarageCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "handle", Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: testHandleName, Namespace: testNS},
 		Spec: v1beta2.GarageClusterSpec{
 			ConnectTo: &v1beta2.ConnectToConfig{
 				AdminAPIEndpoint:    testAdminEndpoint,
-				AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "admin"}, Key: "admin-token"},
+				AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: testAdminSecret}, Key: garageAdminTokenDefaultKey},
 			},
 		},
 	}

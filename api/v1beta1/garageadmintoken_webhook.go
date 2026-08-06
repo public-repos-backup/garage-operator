@@ -20,11 +20,18 @@ import (
 	"context"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 )
+
+const garageAdminTokenDefaultKey = "admin-token"
 
 var garageadmintokenlog = logf.Log.WithName("garageadmintoken-resource")
 
@@ -35,14 +42,13 @@ func (r *GarageAdminToken) SetupWebhookWithManager(mgr ctrl.Manager) error {
 		Complete()
 }
 
-// +kubebuilder:webhook:path=/validate-garage-rajsingh-info-v1beta1-garageadmintoken,mutating=false,failurePolicy=fail,sideEffects=None,groups=garage.rajsingh.info,resources=garageadmintokens,verbs=create;update,versions=v1beta1,name=vgarageadmintoken.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-garage-rajsingh-info-v1beta1-garageadmintoken,mutating=false,failurePolicy=fail,sideEffects=None,groups=garage.rajsingh.info,resources=garageadmintokens,verbs=create;update;delete,versions=v1beta1,name=vgarageadmintoken.kb.io,admissionReviewVersions=v1
 
 var _ admission.Validator[*GarageAdminToken] = &GarageAdminTokenValidator{}
 
 // +kubebuilder:object:generate=false
 
 // GarageAdminTokenValidator handles validation for GarageAdminToken.
-// It carries a client to check GarageReferenceGrants for cross-namespace references.
 type GarageAdminTokenValidator struct {
 	Client client.Client
 }
@@ -56,16 +62,58 @@ func (v *GarageAdminTokenValidator) ValidateCreate(ctx context.Context, obj *Gar
 // ValidateUpdate implements admission.Validator so a webhook will be registered for the type.
 func (v *GarageAdminTokenValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *GarageAdminToken) (admission.Warnings, error) {
 	garageadmintokenlog.Info("validate update", "name", newObj.Name)
-	return v.validateGarageAdminToken(ctx, newObj)
+	warnings, err := v.validateGarageAdminToken(ctx, newObj)
+	if err != nil {
+		return warnings, err
+	}
+	oldTemplate, newTemplate := oldObj.Spec.SecretTemplate, newObj.Spec.SecretTemplate
+	identityChanged := !equality.Semantic.DeepEqual(oldObj.Spec.ClusterRef, newObj.Spec.ClusterRef)
+	if oldTemplate == nil || newTemplate == nil {
+		identityChanged = identityChanged || (oldTemplate == nil) != (newTemplate == nil)
+	} else {
+		identityChanged = identityChanged || oldTemplate.Name != newTemplate.Name ||
+			oldTemplate.TokenKey != newTemplate.TokenKey || oldTemplate.EndpointKey != newTemplate.EndpointKey ||
+			!equality.Semantic.DeepEqual(oldTemplate.IncludeEndpoint, newTemplate.IncludeEndpoint)
+	}
+	if identityChanged {
+		return warnings, fmt.Errorf("clusterRef and secretTemplate name/tokenKey/endpointKey are immutable; create a new GarageAdminToken instead of orphaning static bootstrap material")
+	}
+	return warnings, nil
 }
 
 // ValidateDelete implements admission.Validator so a webhook will be registered for the type.
 func (v *GarageAdminTokenValidator) ValidateDelete(ctx context.Context, obj *GarageAdminToken) (admission.Warnings, error) {
 	garageadmintokenlog.Info("validate delete", "name", obj.Name)
-	return nil, nil
+	if v.Client == nil {
+		return nil, fmt.Errorf("cannot prove the generated static bootstrap Secret is no longer referenced: webhook client is unavailable")
+	}
+	clusterNamespace := obj.Namespace
+	if obj.Spec.ClusterRef.Namespace != "" {
+		clusterNamespace = obj.Spec.ClusterRef.Namespace
+	}
+	cluster := &garagev1beta2.GarageCluster{}
+	err := v.Client.Get(ctx, types.NamespacedName{Name: obj.Spec.ClusterRef.Name, Namespace: clusterNamespace}, cluster)
+	if apierrors.IsNotFound(err) {
+		return admission.Warnings{"deleting the Kubernetes Secret cannot revoke static bearer bytes already loaded by a surviving Garage process"}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cannot prove the static bootstrap Secret is unused: %w", err)
+	}
+	secretName, tokenKey := garageAdminTokenEffectiveSecretIdentity(obj)
+	if cluster.Namespace == obj.Namespace && cluster.Spec.Admin != nil && cluster.Spec.Admin.AdminTokenSecretRef != nil {
+		ref := cluster.Spec.Admin.AdminTokenSecretRef
+		refKey := ref.Key
+		if refKey == "" {
+			refKey = garageAdminTokenDefaultKey
+		}
+		if ref.Name == secretName && refKey == tokenKey {
+			return nil, fmt.Errorf("garageCluster %s/%s still references generated Secret %s/%s:%s; rotate or remove spec.admin.adminTokenSecretRef before deletion", cluster.Namespace, cluster.Name, obj.Namespace, secretName, tokenKey)
+		}
+	}
+	return admission.Warnings{"deleting the Kubernetes Secret cannot revoke static bearer bytes already loaded by a Garage process; complete credential rotation before deletion"}, nil
 }
 
-func (v *GarageAdminTokenValidator) validateGarageAdminToken(ctx context.Context, obj *GarageAdminToken) (admission.Warnings, error) {
+func (v *GarageAdminTokenValidator) validateGarageAdminToken(_ context.Context, obj *GarageAdminToken) (admission.Warnings, error) {
 	var warnings admission.Warnings
 
 	if obj.Spec.ClusterRef.Name == "" {
@@ -77,13 +125,42 @@ func (v *GarageAdminTokenValidator) validateGarageAdminToken(ctx context.Context
 	if targetNS == "" {
 		targetNS = obj.Namespace
 	}
-	if err := checkReferenceGrant(ctx, v.Client, "GarageAdminToken", obj.Namespace, "GarageCluster", targetNS, obj.Spec.ClusterRef.Name); err != nil {
-		return warnings, err
+	if targetNS != obj.Namespace {
+		return warnings, fmt.Errorf("clusterRef.namespace must match metadata.namespace: GarageAdminToken provisions a local static bootstrap Secret, and GarageCluster credential refs cannot consume it across namespaces")
 	}
 
 	if obj.Spec.ExpiresAt != nil && obj.Spec.NeverExpires {
 		return warnings, fmt.Errorf("expiresAt and neverExpires are mutually exclusive")
 	}
+	if obj.Spec.ExpiresAt != nil {
+		return warnings, fmt.Errorf("expiresAt is unsupported for static bootstrap material; Garage does not assign or revoke this token")
+	}
+	if obj.Spec.Name != "" {
+		return warnings, fmt.Errorf("spec.name is unsupported for static bootstrap material because no Garage Admin-token row is created")
+	}
+	_, tokenKey := garageAdminTokenEffectiveSecretIdentity(obj)
+	endpointKey := "admin-endpoint"
+	if obj.Spec.SecretTemplate != nil && obj.Spec.SecretTemplate.EndpointKey != "" {
+		endpointKey = obj.Spec.SecretTemplate.EndpointKey
+	}
+	if tokenKey == endpointKey {
+		return warnings, fmt.Errorf("secretTemplate.tokenKey and endpointKey must be different")
+	}
+	warnings = admission.Warnings{"GarageAdminToken creates immutable static bootstrap material only; deletion is refused while the referenced GarageCluster consumes the Secret, and removing the source does not revoke bearer bytes already loaded by Garage"}
 
 	return warnings, nil
+}
+
+func garageAdminTokenEffectiveSecretIdentity(obj *GarageAdminToken) (string, string) {
+	name := obj.Name
+	key := garageAdminTokenDefaultKey
+	if obj.Spec.SecretTemplate != nil {
+		if obj.Spec.SecretTemplate.Name != "" {
+			name = obj.Spec.SecretTemplate.Name
+		}
+		if obj.Spec.SecretTemplate.TokenKey != "" {
+			key = obj.Spec.SecretTemplate.TokenKey
+		}
+	}
+	return name, key
 }

@@ -109,6 +109,149 @@ wait_for_condition() {
     return 0
 }
 
+wait_for_resource_deleted() {
+    local resource=$1
+    local name=$2
+    local timeout=$3
+    local namespace=${4:-$NAMESPACE}
+    local deadline
+    local remaining
+    deadline=$(($(date +%s) + timeout))
+
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if remaining=$(kubectl get "$resource" "$name" -n "$namespace" \
+            --ignore-not-found -o name 2>/dev/null); then
+            if [ -z "$remaining" ]; then
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+
+    return 1
+}
+
+wait_for_labeled_resources_deleted() {
+    local resource=$1
+    local selector=$2
+    local timeout=$3
+    local namespace=${4:-$NAMESPACE}
+    local deadline
+    local remaining
+    deadline=$(($(date +%s) + timeout))
+
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if remaining=$(kubectl get "$resource" -n "$namespace" -l "$selector" -o name 2>/dev/null); then
+            if [ -z "$remaining" ]; then
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+
+    log_error "Timed out waiting for $resource with selector '$selector' to be deleted"
+    kubectl get "$resource" -n "$namespace" -l "$selector" -o wide 2>/dev/null || true
+    return 1
+}
+
+# The scenarios in this script reuse both Kubernetes clusters for several
+# independent Garage stores. Between scenarios, both sites are intentionally
+# destroyed as one whole-store operation. Declare Destroy on both parents
+# before touching either site, delete API children while the Admin API is still
+# live, then remove one Kubernetes site at a time. This is explicit external
+# serialization; the in-memory layout coordinator does not lock across the two
+# controller managers.
+teardown_whole_federated_store() {
+    local cluster_label="garage.rajsingh.info/cluster=garage"
+    local cluster_name
+    local parent
+    local resource
+
+    for cluster_name in "$CLUSTER1_NAME" "$CLUSTER2_NAME"; do
+        if ! use_cluster "$cluster_name"; then
+            log_error "$cluster_name: failed to select Kubernetes context"
+            return 1
+        fi
+        if ! parent=$(kubectl get garagecluster garage -n "$NAMESPACE" \
+            --ignore-not-found -o name 2>/dev/null); then
+            log_error "$cluster_name: failed to inspect the previous GarageCluster"
+            return 1
+        fi
+        if [ -n "$parent" ]; then
+            if ! kubectl patch garagecluster garage -n "$NAMESPACE" --type=merge \
+                -p '{"spec":{"deletionPolicy":"Destroy"}}'; then
+                log_error "$cluster_name: failed to acknowledge whole-store Destroy"
+                return 1
+            fi
+        fi
+    done
+
+    # Finalize resources that call the Admin API before stopping any Garage
+    # process. Both clusters still serve the same ring at this point.
+    for cluster_name in "$CLUSTER1_NAME" "$CLUSTER2_NAME"; do
+        if ! use_cluster "$cluster_name"; then
+            log_error "$cluster_name: failed to select Kubernetes context for API-child cleanup"
+            return 1
+        fi
+        if ! kubectl delete garagekey --all -n "$NAMESPACE" --ignore-not-found=true \
+            --wait=true --timeout=120s; then
+            log_error "$cluster_name: GarageKey cleanup did not complete while the store was live"
+            return 1
+        fi
+        if ! kubectl delete garagebucket --all -n "$NAMESPACE" --ignore-not-found=true \
+            --wait=true --timeout=120s; then
+            log_error "$cluster_name: GarageBucket cleanup did not complete while the store was live"
+            return 1
+        fi
+    done
+
+    for cluster_name in "$CLUSTER1_NAME" "$CLUSTER2_NAME"; do
+        if ! use_cluster "$cluster_name"; then
+            log_error "$cluster_name: failed to select Kubernetes context for site teardown"
+            return 1
+        fi
+        if ! kubectl delete garagecluster garage -n "$NAMESPACE" \
+            --ignore-not-found=true --wait=false; then
+            log_error "$cluster_name: failed to request GarageCluster deletion"
+            return 1
+        fi
+        if ! wait_for_resource_deleted garagecluster garage 300; then
+            log_error "$cluster_name: GarageCluster did not finish whole-store Destroy teardown"
+            kubectl get garagecluster,garagenode,statefulset,daemonset,deployment,pod,service,configmap,secret,poddisruptionbudget,pvc \
+                -n "$NAMESPACE" -o wide 2>/dev/null || true
+            return 1
+        fi
+        # Parent finalization requests child deletion, but Kubernetes owner GC
+        # is asynchronous. Do not reuse the stable name "garage" until every
+        # old-UID-owned workload and immutable/config-facing resource is gone;
+        # otherwise the next scenario can collide with an old Service or
+        # content-addressed config object after the parent itself disappeared.
+        for resource in \
+            garagenode statefulset daemonset deployment replicaset pod \
+            service configmap secret poddisruptionbudget; do
+            if ! wait_for_labeled_resources_deleted "$resource" "$cluster_label" 180; then
+                log_error "$cluster_name: old-store managed resources remained after their parent was deleted"
+                return 1
+            fi
+        done
+
+        # Storage PVCs intentionally default to Retain. Delete only this test
+        # store's labeled claims, and only after no Pod can still hold the
+        # pvc-protection finalizer. Never issue an unbounded raw PVC deletion.
+        if ! kubectl delete pvc -n "$NAMESPACE" -l "$cluster_label" \
+            --ignore-not-found=true --wait=false; then
+            log_error "$cluster_name: failed to request retained test PVC cleanup"
+            return 1
+        fi
+        if ! wait_for_labeled_resources_deleted pvc "$cluster_label" 180; then
+            log_error "$cluster_name: retained test PVC cleanup did not complete"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
 kubectl_apply_with_retries() {
     local attempts=${1:-30}
     local delay=${2:-2}
@@ -1664,22 +1807,10 @@ test_self_connection_skip() {
 test_manual_mode_multicluster_setup() {
     log_test "Setting up Manual mode multi-cluster test..."
 
-    # Delete existing GarageClusters from previous tests
-    use_cluster "$CLUSTER1_NAME"
-    kubectl delete garagecluster garage -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete garagebucket --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete garagekey --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete garagenode --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete pvc --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-
-    use_cluster "$CLUSTER2_NAME"
-    kubectl delete garagecluster garage -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete garagebucket --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete garagekey --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete garagenode --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete pvc --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-
-    sleep 10  # Allow cleanup
+    if ! teardown_whole_federated_store; then
+        test_fail "Previous federated store did not finish serialized whole-store teardown"
+        return 1
+    fi
 
     test_pass "Manual mode multi-cluster test setup complete"
     return 0
@@ -1976,37 +2107,12 @@ EOF
 test_manual_mode_cleanup_multicluster() {
     log_test "Testing Manual mode multi-cluster cleanup..."
 
-    # Delete nodes in cluster 1
-    use_cluster "$CLUSTER1_NAME"
-    kubectl delete garagenode node-1a node-2a -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-
-    # Delete nodes in cluster 2
-    use_cluster "$CLUSTER2_NAME"
-    kubectl delete garagenode node-1b node-2b -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-
-    sleep 10
-
-    # Verify StatefulSets are cleaned up
-    use_cluster "$CLUSTER1_NAME"
-    local c1_sts=$(kubectl get statefulset -n "$NAMESPACE" -l "garage.rajsingh.info/node" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-
-    use_cluster "$CLUSTER2_NAME"
-    local c2_sts=$(kubectl get statefulset -n "$NAMESPACE" -l "garage.rajsingh.info/node" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-
-    if [ "$c1_sts" -eq 0 ] && [ "$c2_sts" -eq 0 ]; then
-        test_pass "Manual mode nodes and StatefulSets cleaned up"
-    else
-        test_fail "Some StatefulSets not cleaned up (c1: $c1_sts, c2: $c2_sts)"
+    if ! teardown_whole_federated_store; then
+        test_fail "Manual federated store did not finish serialized whole-store teardown"
+        return 1
     fi
 
-    # Delete clusters
-    use_cluster "$CLUSTER1_NAME"
-    kubectl delete garagecluster garage -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-
-    use_cluster "$CLUSTER2_NAME"
-    kubectl delete garagecluster garage -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-
-    test_pass "Manual mode multi-cluster cleanup complete"
+    test_pass "Manual mode clusters, nodes, and StatefulSets cleaned up"
     return 0
 }
 
@@ -2024,19 +2130,10 @@ test_single_replica_federation() {
 
     # Delete existing GarageClusters
     log_info "Cleaning up existing GarageClusters..."
-    use_cluster "$CLUSTER1_NAME"
-    kubectl delete garagecluster garage -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete garagebucket --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete garagekey --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete pvc --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-
-    use_cluster "$CLUSTER2_NAME"
-    kubectl delete garagecluster garage -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete garagebucket --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete garagekey --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    kubectl delete pvc --all -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-
-    sleep 10  # Allow cleanup
+    if ! teardown_whole_federated_store; then
+        test_fail "Single-replica setup: previous federated store did not finish serialized teardown"
+        return 1
+    fi
 
     # Get cluster 2 service endpoint for remoteClusters config
     # In kind, we use the internal service DNS

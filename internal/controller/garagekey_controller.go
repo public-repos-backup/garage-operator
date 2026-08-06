@@ -382,7 +382,7 @@ func (r *GarageKeyReconciler) createOrAdoptDeterministic(ctx context.Context, ke
 		// needs either importKey or a resolvable RPC secret. Make that actionable
 		// rather than surfacing a bare "secret not found".
 		if cluster.IsManagementHandle() {
-			return nil, "", fmt.Errorf("cannot derive key material on a management handle: set spec.importKey with existing credentials, or set spec.network.rpcSecretRef on the GarageCluster to the external cluster's RPC secret (%w)", err)
+			return nil, "", fmt.Errorf("cannot derive key material on a management handle: set spec.importKey with existing credentials, or set spec.network.rpcSecretRef/spec.connectTo.rpcSecretRef on the GarageCluster to the external cluster's RPC secret (%w)", err)
 		}
 		return nil, "", fmt.Errorf("failed to read RPC secret for key derivation: %w", err)
 	}

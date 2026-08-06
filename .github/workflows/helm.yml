@@ -107,6 +107,48 @@ jobs:
       - name: Template chart
         run: helm template ${{ env.CHART_NAME }} charts/${{ env.CHART_NAME }} --namespace garage-operator-system
 
+      - name: Verify leader-election safety guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          rendered="$(helm template ${{ env.CHART_NAME }} charts/${{ env.CHART_NAME }} --namespace garage-operator-system)"
+          grep -q -- '--leader-elect=true' <<<"$rendered"
+          for values_file in values-dev.yaml values-e2e.yaml values-e2e-webhooks.yaml values-cosi-e2e.yaml; do
+            rendered="$(helm template ${{ env.CHART_NAME }} charts/${{ env.CHART_NAME }} \
+              --namespace garage-operator-system \
+              -f "charts/${{ env.CHART_NAME }}/${values_file}")"
+            grep -q -- '--leader-elect=true' <<<"$rendered"
+          done
+          grep -q -- '- --leader-elect' config/manager/manager.yaml
+          grep -q -- '- --leader-elect' config/default/manager_webhook_patch.yaml
+          grep -A8 '^  - pods$' config/rbac/role.yaml | grep -q '^  - create$'
+          grep -A8 '^  - pods$' charts/${{ env.CHART_NAME }}/templates/clusterrole.yaml | grep -q '^  - create$'
+          grep -A8 '^  - pods$' charts/${{ env.CHART_NAME }}/templates/namespace-rbac.yaml | grep -q '^  - create$'
+          grep -q -- '/validate-garage-rajsingh-info-garagecluster-scale' <<<"$rendered"
+          grep -q -- 'garageclusters/scale' <<<"$rendered"
+          grep -q -- '/validate-garage-rajsingh-info-garagecluster-scale' config/webhook/manifests.yaml
+          grep -q -- 'garageclusters/scale' config/webhook/manifests.yaml
+          grep -q -- 'statusReplicasPath: .status.scaleReplicas' config/crd/bases/garage.rajsingh.info_garageclusters.yaml
+          grep -q -- 'labelSelectorPath: .status.scaleSelector' config/crd/bases/garage.rajsingh.info_garageclusters.yaml
+          if helm template ${{ env.CHART_NAME }} charts/${{ env.CHART_NAME }} \
+            --set leaderElection.enabled=false >/dev/null 2>&1; then
+            echo "chart silently accepted disabled leader election" >&2
+            exit 1
+          fi
+          unsafe="$(helm template ${{ env.CHART_NAME }} charts/${{ env.CHART_NAME }} \
+            --set leaderElection.enabled=false \
+            --set leaderElection.unsafeAllowDisabled=true \
+            --set replicaCount=1)"
+          grep -q -- '--leader-elect=false' <<<"$unsafe"
+          grep -q -- '--unsafe-allow-no-leader-election' <<<"$unsafe"
+          if helm template ${{ env.CHART_NAME }} charts/${{ env.CHART_NAME }} \
+            --set leaderElection.enabled=false \
+            --set leaderElection.unsafeAllowDisabled=true \
+            --set replicaCount=2 >/dev/null 2>&1; then
+            echo "chart accepted multiple replicas without leader election" >&2
+            exit 1
+          fi
+
   publish:
     name: Publish Chart
     runs-on: ubuntu-latest
