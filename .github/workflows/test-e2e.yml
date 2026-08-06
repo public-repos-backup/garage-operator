@@ -23,7 +23,7 @@ jobs:
     # and dual-version topology changes intentionally wait through Garage's
     # production proof windows, while each management-handle block starts a
     # real Garage. Isolation preserves cleanup/debug margin under this cap.
-    timeout-minutes: 45
+    timeout-minutes: 58
     strategy:
       fail-fast: false
       matrix:
@@ -138,7 +138,7 @@ jobs:
   e2e-cluster:
     name: Single-Cluster E2E Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 58
     steps:
       - name: Checkout
         uses: actions/checkout@v7

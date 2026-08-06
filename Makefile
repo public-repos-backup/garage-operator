@@ -161,7 +161,15 @@ GINKGO_LABEL_FILTER ?=
 # its goroutine dump, so a hung spec is indistinguishable from a slow one. Going
 # through Go's own timeout instead yields a full stack trace naming the stuck
 # spec.
-E2E_GO_TIMEOUT ?= 40m
+#
+# Sized against a measured floor, not guessed: removing a node that holds
+# positive capacity is a drain, and the barrier must outlast Garage's
+# delayed-resync window (BLOCK_GC_DELAY + 10s, ../garage src/block/manager.rs)
+# before it can conclude no block is coming back. That makes one spec in the
+# catch-all shard ~13m on its own, and the shard ~27m. At the previous 40m the
+# margin was thin enough that a loaded runner tipped it over, which reports as an
+# unattributed "test timed out" rather than as the slow spec.
+E2E_GO_TIMEOUT ?= 50m
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
