@@ -854,9 +854,11 @@ func (c *Client) GetClusterLayoutHistory(ctx context.Context) (*LayoutHistoryRes
 // assigns it. A node that is gone never advances, so a genuinely dead peer still
 // reports unsettled and still requires the explicit skip-dead-nodes recovery.
 func (h *LayoutHistoryResponse) DataMigrationSettled() bool {
-	// Garage omits the trackers entirely while only one version is active. If a
-	// version reports Draining and they are still absent, we cannot prove
-	// anything — stay conservative.
+	// Garage attaches the trackers iff more than one version is live, and a
+	// Draining entry is by definition a live non-current version, so any caller
+	// that got here has them. Silence from an unexpected Garage proves nothing —
+	// stay conservative rather than read it as done. Reading tracker absence as
+	// a per-node verdict is what wedged the node cycle in #304.
 	if len(h.UpdateTrackers) == 0 {
 		return false
 	}
