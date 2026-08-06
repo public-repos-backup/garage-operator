@@ -607,9 +607,26 @@ func (r *GarageClusterReconciler) fmRebuildLayout(ctx context.Context, cluster *
 		return ctrl.Result{RequeueAfter: 5 * time.Second}
 	}
 
-	gc, err := GetGarageClient(ctx, r.Client, cluster, r.ClusterDomain)
+	// Pin to one storage Pod rather than dialing the cluster Service.
+	//
+	// The purge deleted cluster_layout everywhere, so there is no committed layout
+	// yet — which is exactly the state the shared client cannot serve. Its dynamic
+	// token cannot be re-proved (that needs the admin-token table, which needs a
+	// layout, which needs this client), and the load-balanced Service must never
+	// carry a substituted credential: a Pod that predates the last static rotation
+	// rejects it with a 403, intermittently, depending on which Pod is picked.
+	//
+	// staticGarageClientForPod reads the bearer out of the target Pod's own spec,
+	// so it is by construction the credential that process accepted at startup.
+	// This is the same bootstrap client reconcileOperatorAdminToken uses before a
+	// dynamic token exists, which is the situation a purge recreates.
+	podSet, err := getOperatorAdminPodSet(ctx, r.safetyReader(), cluster)
 	if err != nil {
-		return waiting("Admin API client unavailable: %v", err), nil
+		return waiting("managed storage Pod set is not provable yet: %v", err), nil
+	}
+	gc, err := r.staticGarageClientForPod(ctx, &podSet.Pods[0], getAdminPort(cluster))
+	if err != nil {
+		return waiting("exact-Pod bootstrap Admin client unavailable: %v", err), nil
 	}
 	// The node-local-pool rollout exclusion cannot legitimately apply here, and
 	// waiting on it deadlocks. It is asserted whenever StorageRolloutReady's

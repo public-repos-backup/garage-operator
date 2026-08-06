@@ -23,7 +23,7 @@ jobs:
     # and dual-version topology changes intentionally wait through Garage's
     # production proof windows, while each management-handle block starts a
     # real Garage. Isolation preserves cleanup/debug margin under this cap.
-    timeout-minutes: 45
+    timeout-minutes: 58
     strategy:
       fail-fast: false
       matrix:
@@ -54,9 +54,18 @@ jobs:
             runner: ubuntu-latest
             filter: "management-handle"
             kind_config: ""
+          # factor-migration is split out of the catch-all because it is a
+          # destructive whole-cluster purge with its own multi-minute barriers.
+          # Together with the drain in auto-mode-pernode (a single ~13m spec,
+          # bounded by Garage's BLOCK_GC_DELAY) it pushed the catch-all past the
+          # 40m Go timeout on a loaded runner.
+          - name: factor-migration
+            runner: ubuntu-latest
+            filter: "factor-migration"
+            kind_config: ""
           - name: layout
             runner: ubuntu-latest
-            filter: "!(gateway || manager || webhooks || external-gateway || dual-version || manual-mode || management-handle || node-local-pools)"
+            filter: "!(gateway || manager || webhooks || external-gateway || dual-version || manual-mode || management-handle || node-local-pools || factor-migration)"
             kind_config: ""
           - name: node-local-pools
             runner: ubuntu-latest
@@ -129,7 +138,7 @@ jobs:
   e2e-cluster:
     name: Single-Cluster E2E Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 58
     steps:
       - name: Checkout
         uses: actions/checkout@v7
