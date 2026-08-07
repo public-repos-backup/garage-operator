@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -100,5 +101,54 @@ func TestSettledLayoutHistoryPassesWithNoDrainingVersion(t *testing.T) {
 	}
 	if err := requireSettledLayoutHistoryResponse(history); err != nil {
 		t.Fatalf("a single-version history is settled: %v", err)
+	}
+}
+
+// issue304LayoutHistory is the GetClusterLayoutHistory body reported in #304,
+// verbatim: a completed node cycle whose layout has collapsed back to one live
+// version, so Garage reports the previous version Historical and omits the
+// per-node update trackers entirely.
+const issue304LayoutHistory = `{
+  "currentVersion": 2,
+  "minAck": 2,
+  "versions": [
+    { "version": 2, "status": "Current",    "storageNodes": 4, "gatewayNodes": 0 },
+    { "version": 1, "status": "Historical", "storageNodes": 3, "gatewayNodes": 0 }
+  ],
+  "updateTrackers": null
+}`
+
+// A graceful node cycle wedged permanently in Syncing (#304) because the
+// Syncing → Draining gate asked whether the sibling's own update tracker had
+// caught up. Garage emits updateTrackers only while more than one layout
+// version is live (../garage src/api/admin/layout.rs), and the sibling
+// finishing its sync is exactly the event that collapses the history back to
+// one — so the evidence the gate read was destroyed by the event it existed to
+// detect, and the lookup missed forever.
+//
+// The gate now asks about the history instead of about one node, which holds
+// because the two are the same question upstream. `layout.versions` carries
+// only live versions (retired ones move to `old_versions`), Draining means a
+// live non-current version and Historical means version < min_stored, and the
+// trackers are attached iff `versions.len() > 1`. Absent trackers therefore
+// mean precisely "no version is Draining" — not "unknown" — which is why the
+// conservative tracker-absence branches in DataMigrationSettled and
+// waitForStorageRoleDrain are unreachable against a supported Garage rather
+// than merely unlikely. The reporter's caveat, that a node which never joined
+// also has no tracker, is answered before this gate: reconcileCycle requires
+// the sibling's Status.InLayout against its exact current Pod UID.
+func TestCycleSettledLayoutHistoryDoesNotWedgeOnCollapsedLayout(t *testing.T) {
+	var history garage.LayoutHistoryResponse
+	if err := json.Unmarshal([]byte(issue304LayoutHistory), &history); err != nil {
+		t.Fatalf("decoding the reported payload: %v", err)
+	}
+	if history.UpdateTrackers != nil {
+		t.Fatalf("a null updateTrackers must decode to a nil map, got %v", history.UpdateTrackers)
+	}
+	if draining := history.GetDrainingVersions(); len(draining) != 0 {
+		t.Fatalf("a collapsed history reports no Draining version, got %v", draining)
+	}
+	if err := requireCycleSettledLayoutHistory(&history); err != nil {
+		t.Fatalf("the cycle must leave Syncing once the layout collapses: %v", err)
 	}
 }

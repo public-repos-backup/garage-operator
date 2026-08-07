@@ -832,21 +832,6 @@ func (c *Client) GetClusterLayoutHistory(ctx context.Context) (*LayoutHistoryRes
 	return &history, nil
 }
 
-// NodeSyncedToCurrent reports whether the named node has caught its layout sync
-// tracker up to the current layout version — i.e. all partitions it owns under
-// the current layout are in sync on it. This is the per-node equivalent of
-// Garage's sync_map_min reaching the active version: a node is safe to rely on
-// for replication (and safe to swap a peer out behind) only once its sync
-// tracker is no longer behind the current version. Returns false when the node
-// has no tracker entry yet (not joined / never synced).
-func (h *LayoutHistoryResponse) NodeSyncedToCurrent(nodeID string) bool {
-	t, ok := h.UpdateTrackers[nodeID]
-	if !ok {
-		return false
-	}
-	return t.Sync >= h.CurrentVersion
-}
-
 // DataMigrationSettled reports whether every node Garage is tracking has
 // completed a full table sync at the current layout version — i.e. the data
 // movement a draining version exists to cover is finished, and only Garage's
@@ -869,9 +854,11 @@ func (h *LayoutHistoryResponse) NodeSyncedToCurrent(nodeID string) bool {
 // assigns it. A node that is gone never advances, so a genuinely dead peer still
 // reports unsettled and still requires the explicit skip-dead-nodes recovery.
 func (h *LayoutHistoryResponse) DataMigrationSettled() bool {
-	// Garage omits the trackers entirely while only one version is active. If a
-	// version reports Draining and they are still absent, we cannot prove
-	// anything — stay conservative.
+	// Garage attaches the trackers iff more than one version is live, and a
+	// Draining entry is by definition a live non-current version, so any caller
+	// that got here has them. Silence from an unexpected Garage proves nothing —
+	// stay conservative rather than read it as done. Reading tracker absence as
+	// a per-node verdict is what wedged the node cycle in #304.
 	if len(h.UpdateTrackers) == 0 {
 		return false
 	}
