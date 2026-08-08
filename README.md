@@ -466,7 +466,7 @@ kind, so the field is named for the storage it provides rather than the
 workload it happens to use.
 Each named pool has its own capacity, HostPaths, selector, Pod template, and
 optional per-node RPC address template. Explicitly declaring
-`spec.storage.nodeLocalPools` opts into this new alpha-quality API. Node-local
+`spec.storage.nodeLocalPools` enables the node-local pool API. Node-local
 pools require Kubernetes 1.27+ for the
 Pod scheduling-gate safety fence; other cluster shapes retain the chart's
 Kubernetes 1.25 minimum. The controller verifies the server version, performs a
