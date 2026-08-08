@@ -502,6 +502,9 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// finalizers drain roles, then their activation labels/resources are
 	// cleaned up.
 	if err := r.reconcileNodeLocalPools(ctx, cluster, nodeLocalPoolConfigHashes); err != nil {
+		if stderrors.Is(err, errLayoutMutationPending) {
+			return r.updateStatusAfterNodeLocalPoolContention(ctx, cluster, err)
+		}
 		return r.updateStatus(ctx, cluster, PhaseFailed, err)
 	}
 	if storageDrainConditionActive(cluster) {
@@ -3583,6 +3586,48 @@ func (r *GarageClusterReconciler) reconcileManagementHandle(ctx context.Context,
 		Reason:  garagev1beta1.ReasonReconcileSuccess,
 		Message: "external Garage Admin API reachable; managing buckets/keys/layout via spec.connectTo",
 	})
+}
+
+// updateStatusAfterNodeLocalPoolContention handles the expected overlap between
+// a GarageNode health pass and the parent controller's node-local activation
+// revalidation. The losing reconciler must retry without presenting the healthy
+// cluster as Failed. If this generation had already converged, preserve that
+// durable condition and refresh the ordinary live status projection. During an
+// actual membership transition, publish an explicit waiting condition instead.
+func (r *GarageClusterReconciler) updateStatusAfterNodeLocalPoolContention(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	cause error,
+) (ctrl.Result, error) {
+	logf.FromContext(ctx).V(1).Info(
+		"Node-local pool reconciliation is waiting for the active Garage layout operation",
+		"error", cause.Error(),
+	)
+
+	condition := findNodeLocalPoolsReadyCondition(cluster)
+	converged := condition != nil &&
+		condition.Status == metav1.ConditionTrue &&
+		condition.ObservedGeneration == cluster.Generation
+	if !converged {
+		if err := r.setNodeLocalPoolsCondition(
+			ctx,
+			cluster,
+			metav1.ConditionFalse,
+			garagev1beta1.ReasonNodeLocalPoolWaitingForLayoutSync,
+			"waiting for the active Garage layout operation before continuing node-local-pool reconciliation",
+		); err != nil {
+			return ctrl.Result{}, fmt.Errorf("recording node-local-pool layout contention: %w", err)
+		}
+	}
+
+	result, err := r.updateStatusFromCluster(ctx, cluster)
+	if err != nil {
+		return result, err
+	}
+	if result.RequeueAfter == 0 || result.RequeueAfter > RequeueAfterError {
+		result.RequeueAfter = RequeueAfterError
+	}
+	return result, nil
 }
 
 func (r *GarageClusterReconciler) updateStatus(ctx context.Context, cluster *garagev1beta2.GarageCluster, phase string, err error) (ctrl.Result, error) {
