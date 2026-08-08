@@ -19,7 +19,7 @@ A Kubernetes operator for [Garage](https://garagehq.deuxfleurs.fr/) - distribute
 
 - **Declarative cluster lifecycle** — StatefulSet, config, and layout managed via CRDs
 - **Unified storage + gateway tiers in one CR** (v1beta2) — combine durable storage pods and persistent-identity S3 gateways in a single `GarageCluster`
-- **Experimental node-local pools** — bind Garage identities to selected Kubernetes Nodes and HostPath disks, including multi-disk layouts
+- **Node-local pools** — bind Garage identities to selected Kubernetes Nodes and HostPath disks, including multi-disk layouts
 - **Bucket & key management** — create buckets, quotas, and S3 credentials with kubectl
 - **Multi-cluster federation** — span storage across Kubernetes clusters with automatic node discovery
 - **Persistent-identity gateway pods** — StatefulSet with a small metadata PVC; gateway pods keep the same Garage node identity across restarts and participate in the cluster layout with `capacity: null` (matching upstream `garage layout assign --gateway`)
@@ -40,7 +40,7 @@ A Kubernetes operator for [Garage](https://garagehq.deuxfleurs.fr/) - distribute
 ## Install
 
 Requires Kubernetes 1.25+, or **1.27+ if you use
-[node-local pools](#experimental-node-local-pools-daemonset-backed)**, which
+[node-local pools](#node-local-pools-daemonset-backed)**, which
 depend on Pod scheduling gates for their activation fence.
 
 The Helm chart enables admission and conversion webhooks by default, so install
@@ -67,7 +67,7 @@ helm install garage-operator oci://ghcr.io/rajsinghtech/charts/garage-operator \
 Released container images and Helm charts are signed with [cosign](https://docs.sigstore.dev/) keyless signing (the GitHub Actions OIDC identity — no long-lived keys), and carry SLSA build provenance. The image additionally carries an SPDX SBOM. All three are stored in GHCR as OCI referrers of the artifact digest.
 
 ```bash
-IMAGE=ghcr.io/rajsinghtech/garage-operator:v0.6.29
+IMAGE=ghcr.io/rajsinghtech/garage-operator:v0.7.0
 
 # Signature
 cosign verify "$IMAGE" \
@@ -89,6 +89,7 @@ The Garage version is yours to choose — `GarageCluster.spec.image`, `GarageNod
 
 | Operator | Garage minimum | Garage tested in CI | Notes |
 |---|---|---|---|
+| 0.7.x | **v2.0.0** | v2.3.0, v2.2.0 | Admin API v2; node-local pools require Kubernetes 1.27+ |
 | 0.6.x | **v2.0.0** | v2.3.0, v2.2.0 | Admin API v2 only |
 
 `dxflrs/garage:v2.3.0` is the built-in default when `spec.image` is unset, so an unpinned cluster runs the newest tested version. CI exercises two versions on purpose: the Ginkgo suite runs v2.3.0 and the topology suites (multi-cluster, external gateway, IPv6, single-cluster) run v2.2.0, which is what backs the "v2.x range" claim rather than a single number.
@@ -452,7 +453,7 @@ Removal is governed by `spec.layoutManagement.autoApply`:
 - `autoApply: true` — stale entries are removed and the new layout is applied, then normal Garage history convergence is observed. The operator never runs the cluster-wide `skip-dead-nodes` recovery automatically.
 - `autoApply: false` (**default**) — exact pending IDs are surfaced on `status.pendingGatewayTombstones` and the `GatewayTombstones` condition, but are not staged. Remove those exact roles with the Garage CLI or enable `autoApply`. `garage.rajsingh.info/force-layout-apply` does not approve tombstones.
 
-## Experimental node-local pools (DaemonSet-backed)
+## Node-local pools (DaemonSet-backed)
 
 Add `spec.storage.nodeLocalPools` to run node-local, HostPath-backed storage
 alongside the existing default operator-managed PVC group or hand-managed
@@ -465,7 +466,7 @@ kind, so the field is named for the storage it provides rather than the
 workload it happens to use.
 Each named pool has its own capacity, HostPaths, selector, Pod template, and
 optional per-node RPC address template. Explicitly declaring
-`spec.storage.nodeLocalPools` opts into this new alpha-quality API. Node-local
+`spec.storage.nodeLocalPools` enables the node-local pool API. Node-local
 pools require Kubernetes 1.27+ for the
 Pod scheduling-gate safety fence; other cluster shapes retain the chart's
 Kubernetes 1.25 minimum. The controller verifies the server version, performs a

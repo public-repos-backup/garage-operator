@@ -2,7 +2,7 @@
 
 ## Node-local pools (v0.7.0)
 
-Node-local pools are an experimental, explicitly selected v1beta2 API under
+Node-local pools are an explicitly selected v1beta2 API under
 `spec.storage.nodeLocalPools`. Released v0.6.29 does not contain the feature, so existing
 v1beta1/v1beta2 clusters that do not declare node-local pools require no API migration.
 Existing Manual SMB, Ceph, PVC, and external GarageNodes remain valid and can

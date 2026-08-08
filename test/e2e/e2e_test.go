@@ -3753,7 +3753,10 @@ spec:
 	})
 
 	Context("Per-node networking features", Ordered, func() {
-		var initialConfigName string
+		var (
+			initialConfigName string
+			netNodeRPCAddr    string
+		)
 
 		mountedNodeConfig := func(g Gomega) (string, string) {
 			cmd := exec.Command("kubectl", "get", "statefulset", netNodeName,
@@ -3790,7 +3793,8 @@ spec:
 		}
 
 		It("should mount an immutable per-node ConfigMap revision with rpc_public_addr when spec.network.rpcPublicAddr is set", func() {
-			const staticAddr = "203.0.113.10:3901"
+			netNodeRPCAddr = fmt.Sprintf("%s-0.%s-headless.%s.svc.cluster.local:3901",
+				netNodeName, clusterName, testNamespace)
 
 			By("creating GarageNode with spec.network.rpcPublicAddr")
 			nodeYAML := fmt.Sprintf(`
@@ -3810,13 +3814,13 @@ spec:
     data:
       size: 1Gi
   network:
-    rpcPublicAddr: %s
+    rpcPublicAddr: %q
   resources:
     limits:
       memory: 256Mi
     requests:
       memory: 128Mi
-`, netNodeName, testNamespace, clusterName, staticAddr)
+`, netNodeName, testNamespace, clusterName, netNodeRPCAddr)
 
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(nodeYAML)
@@ -3826,9 +3830,9 @@ spec:
 			By("waiting for the StatefulSet to mount its exact per-node ConfigMap revision")
 			verifyConfigMap := func(g Gomega) {
 				configName, configBody := mountedNodeConfig(g)
-				g.Expect(configBody).To(ContainSubstring(`rpc_public_addr = "`+staticAddr+`"`),
+				g.Expect(configBody).To(ContainSubstring(`rpc_public_addr = "`+netNodeRPCAddr+`"`),
 					"garage.toml in %s should contain rpc_public_addr = %q, got: %s",
-					configName, staticAddr, configBody)
+					configName, netNodeRPCAddr, configBody)
 				initialConfigName = configName
 			}
 			Eventually(verifyConfigMap, 2*time.Minute, 5*time.Second).Should(Succeed())
@@ -3857,7 +3861,7 @@ spec:
     data:
       size: 1Gi
   network:
-    rpcPublicAddr: "203.0.113.10:3901"
+    rpcPublicAddr: %q
   publicEndpoint:
     type: NodePort
     nodePort:
@@ -3869,7 +3873,7 @@ spec:
       memory: 256Mi
     requests:
       memory: 128Mi
-`, netNodeName, testNamespace, clusterName)
+`, netNodeName, testNamespace, clusterName, netNodeRPCAddr)
 
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(patchYAML)
@@ -3918,7 +3922,7 @@ spec:
       size: 1Gi
     metadataFsync: true
   network:
-    rpcPublicAddr: "203.0.113.10:3901"
+    rpcPublicAddr: %q
   publicEndpoint:
     type: NodePort
     nodePort:
@@ -3930,7 +3934,7 @@ spec:
       memory: 256Mi
     requests:
       memory: 128Mi
-`, netNodeName, testNamespace, clusterName)
+`, netNodeName, testNamespace, clusterName, netNodeRPCAddr)
 
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(patchYAML)
@@ -3969,7 +3973,7 @@ spec:
       size: 1Gi
     metadataFsync: true
   network:
-    rpcPublicAddr: "203.0.113.10:3901"
+    rpcPublicAddr: %q
   publicEndpoint:
     type: NodePort
     nodePort:
@@ -3982,7 +3986,7 @@ spec:
       memory: 256Mi
     requests:
       memory: 128Mi
-`, netNodeName, testNamespace, clusterName)
+`, netNodeName, testNamespace, clusterName, netNodeRPCAddr)
 
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(patchYAML)

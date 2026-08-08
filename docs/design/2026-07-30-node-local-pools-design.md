@@ -1,6 +1,6 @@
 # Additive node-local pools
 
-**Status:** experimental/alpha release design for
+**Status:** v0.7.0 release design for
 [#298](https://github.com/rajsinghtech/garage-operator/issues/298) and
 [#297](https://github.com/rajsinghtech/garage-operator/pull/297).
 
