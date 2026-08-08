@@ -7848,6 +7848,7 @@ spec:
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("proving rejoin remains fail closed while Garage drains the prior layout version")
+		barrierMessage := ""
 		Eventually(func(g Gomega) {
 			cmd := exec.Command("kubectl", "get", "garagenode", removedGarageNode, "-n", testNamespace,
 				"-o", `jsonpath={.metadata.generation}|{.status.conditions[?(@.type=="Ready")].observedGeneration}|{.status.connected}|{.status.inLayout}|{.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].message}`)
@@ -7859,28 +7860,41 @@ spec:
 			g.Expect(parts[2:5]).To(Equal([]string{"false", "false", "False"}))
 			g.Expect(parts[5]).To(ContainSubstring("layout version(s)"))
 			g.Expect(parts[5]).To(ContainSubstring("still draining"))
+			barrierMessage = parts[5]
 		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		const adminToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-		// Corroborate the barrier against Garage while the operator is still
-		// asserting it, immediately after the check above — not behind the rejoin
-		// below. The two advance on independent clocks: the operator releases once
-		// data movement is done, while Garage retires a version only once its
-		// bookkeeping catches up, and either can finish first. Demanding both a
-		// committed rejoin and a still-visible Draining version in one poll asserts
-		// an overlap nothing guarantees, which is a flake, not a property.
-		By("corroborating the reported barrier against a directly observed draining version")
+		barrierMatch := regexp.MustCompile(
+			`layout version\(s\) ([0-9]+(?:, [0-9]+)*) are still draining \(current version ([0-9]+)\)`,
+		).FindStringSubmatch(barrierMessage)
+		Expect(barrierMatch).To(HaveLen(3), "could not parse GarageNode layout barrier: %q", barrierMessage)
+		reportedDrainingVersions := strings.Split(barrierMatch[1], ", ")
+		reportedCurrentVersion := barrierMatch[2]
+
+		// The GarageNode condition and the Admin API cannot be sampled atomically.
+		// Garage may retire the reported version after the operator publishes the
+		// barrier but before this probe starts. A Historical entry therefore proves
+		// the same claim as a still-Draining entry: the named prior version existed,
+		// and its data movement finished between the two observations.
+		By("corroborating the reported barrier against Garage layout history")
 		Eventually(func(g Gomega) {
 			_, barrierHistory := readGarageLayoutSnapshot(
 				g, testNamespace, "node-local-rejoin-draining-snapshot", clusterName, adminToken,
 			)
-			historyStatuses := make([]string, 0, len(barrierHistory.Versions))
+			g.Expect(fmt.Sprintf("%d", barrierHistory.CurrentVersion)).To(Equal(reportedCurrentVersion),
+				"Garage advanced to an unexpected layout version after reporting the rejoin barrier")
+			historyStatuses := make(map[string]string, len(barrierHistory.Versions))
 			for _, version := range barrierHistory.Versions {
-				historyStatuses = append(historyStatuses, version.Status)
+				historyStatuses[fmt.Sprintf("%d", version.Version)] = version.Status
 			}
-			g.Expect(historyStatuses).To(ContainElement("Draining"),
-				"GarageNode reported a history barrier without a directly observed draining version")
+			for _, version := range reportedDrainingVersions {
+				status, ok := historyStatuses[version]
+				g.Expect(ok).To(BeTrue(),
+					"GarageNode reported layout version %s as draining, but Garage history does not contain it", version)
+				g.Expect(status).To(BeElementOf("Draining", "Historical"),
+					"GarageNode reported layout version %s as draining, but Garage history marks it %q", version, status)
+			}
 		}, time.Minute, 5*time.Second).Should(Succeed())
 
 		By("verifying the rejoin Apply committed the retained disk identity")
