@@ -695,9 +695,139 @@ func TestLaunchScrubCommand_RequestBody(t *testing.T) {
 	}
 }
 
+func TestRetryBlockResyncPartitionsWildcardHashesByErrorOwner(t *testing.T) {
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+	hashNoLongerErrored := strings.Repeat("c", 64)
+	callOrder := make([]string, 0, 2)
+	retriedByNode := make(map[string][]string)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v2/ListBlockErrors":
+			if r.Method != http.MethodGet || r.URL.Query().Get("node") != "*" {
+				t.Fatalf("unexpected ListBlockErrors request: %s %s", r.Method, r.URL.String())
+			}
+			_, _ = fmt.Fprintf(w, `{"success":{"node-b":[{"blockHash":%q}],"node-a":[{"blockHash":%q},{"blockHash":%q},{"blockHash":%q}]},"error":{}}`,
+				hashA, hashB, hashA, hashA)
+		case pathRetryBlockResync:
+			nodeID := r.URL.Query().Get("node")
+			if r.Method != http.MethodPost || nodeID == "" || nodeID == "*" {
+				t.Fatalf("specific hashes must target one error-owning node, got: %s %s", r.Method, r.URL.String())
+			}
+			var body struct {
+				BlockHashes []string `json:"blockHashes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode RetryBlockResync request: %v", err)
+			}
+			callOrder = append(callOrder, nodeID)
+			retriedByNode[nodeID] = body.BlockHashes
+			_, _ = fmt.Fprintf(w, `{"success":{%q:{"count":%d}},"error":{}}`, nodeID, len(body.BlockHashes))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	result, err := NewClient(srv.URL, "token").RetryBlockResync(context.Background(), "*", false,
+		[]string{strings.ToUpper(hashA), hashB, hashA, hashNoLongerErrored})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 3 {
+		t.Fatalf("retry count = %d, want 3 node-local error records", result.Count)
+	}
+	if got := strings.Join(callOrder, ","); got != "node-a,node-b" {
+		t.Fatalf("retry call order = %q, want deterministic node-a,node-b", got)
+	}
+	if got := strings.Join(retriedByNode["node-a"], ","); got != hashA+","+hashB {
+		t.Fatalf("node-a hashes = %q, want only its unique requested errors", got)
+	}
+	if got := strings.Join(retriedByNode["node-b"], ","); got != hashA {
+		t.Fatalf("node-b hashes = %q, want only its requested error", got)
+	}
+}
+
+func TestRetryBlockResyncWildcardSpecificHashesFailsClosed(t *testing.T) {
+	hash := strings.Repeat("d", 64)
+	t.Run("invalid hash is rejected before an API request", func(t *testing.T) {
+		requests := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			requests++
+		}))
+		defer srv.Close()
+
+		_, err := NewClient(srv.URL, "token").RetryBlockResync(context.Background(), "*", false, []string{"not-a-hash"})
+		if err == nil || !strings.Contains(err.Error(), "64 hexadecimal") {
+			t.Fatalf("invalid hash error = %v", err)
+		}
+		if requests != 0 {
+			t.Fatalf("invalid input made %d API request(s), want 0", requests)
+		}
+	})
+
+	t.Run("per-node listing failure prevents every retry", func(t *testing.T) {
+		retryCalls := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == pathRetryBlockResync {
+				retryCalls++
+			}
+			_, _ = io.WriteString(w, `{"success":{"node-a":[]},"error":{"node-b":"not connected"}}`)
+		}))
+		defer srv.Close()
+
+		_, err := NewClient(srv.URL, "token").RetryBlockResync(context.Background(), "*", false, []string{hash})
+		if err == nil || !strings.Contains(err.Error(), "node-b: not connected") {
+			t.Fatalf("listing failure error = %v", err)
+		}
+		if retryCalls != 0 {
+			t.Fatalf("partial error inventory triggered %d retry call(s), want 0", retryCalls)
+		}
+	})
+
+	t.Run("empty successful inventory is rejected", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"success":{},"error":{}}`)
+		}))
+		defer srv.Close()
+
+		_, err := NewClient(srv.URL, "token").RetryBlockResync(context.Background(), "*", false, []string{hash})
+		if err == nil || !strings.Contains(err.Error(), "no successful nodes") {
+			t.Fatalf("empty inventory error = %v", err)
+		}
+	})
+}
+
+func TestRetryBlockResyncAllStillUsesGarageWildcard(t *testing.T) {
+	handled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handled = true
+		if r.Method != http.MethodPost || r.URL.Path != pathRetryBlockResync || r.URL.Query().Get("node") != "*" {
+			t.Fatalf("unexpected wildcard retry request: %s %s", r.Method, r.URL.String())
+		}
+		var body map[string]bool
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !body["all"] {
+			t.Fatalf("wildcard retry body = %#v, err=%v", body, err)
+		}
+		_, _ = io.WriteString(w, `{"success":{"node-a":{"count":2},"node-b":{"count":1}},"error":{}}`)
+	}))
+	defer srv.Close()
+
+	result, err := NewClient(srv.URL, "token").RetryBlockResync(context.Background(), "*", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled || result.Count != 3 {
+		t.Fatalf("wildcard retry handled=%v count=%d, want true/3", handled, result.Count)
+	}
+}
+
 const (
 	pathGetClusterLayout   = "/v2/GetClusterLayout"
 	pathApplyClusterLayout = "/v2/ApplyClusterLayout"
+	pathRetryBlockResync   = "/v2/RetryBlockResync"
 )
 
 // TestApplyStagedLayoutChanges exercises the coordinated apply path. Garage
