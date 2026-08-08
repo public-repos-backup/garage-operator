@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -631,6 +632,88 @@ var _ = Describe("GarageCluster Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.RequeueAfter).To(Equal(RequeueAfterShort),
 				"absence of optional Admin auth must not be treated as a transient health failure")
+		})
+
+		It("keeps a converged node-local cluster Ready when a sibling layout reconcile owns the mutex", func() {
+			const clusterName = "node-local-layout-contention"
+			clusterKey := types.NamespacedName{Name: clusterName, Namespace: testNamespace}
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: testNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					Storage: &garagev1beta2.StorageSpec{LayoutPolicy: LayoutPolicyManual},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cluster) })
+
+			transitionTime := metav1.Now()
+			cluster.Status.Phase = PhaseFailed
+			cluster.Status.Conditions = []metav1.Condition{
+				{
+					Type:               garagev1beta1.ConditionNodeLocalPoolsReady,
+					Status:             metav1.ConditionTrue,
+					Reason:             garagev1beta1.ReasonNodeLocalPoolsConverged,
+					Message:            "node-local-pool members are connected",
+					ObservedGeneration: cluster.Generation,
+					LastTransitionTime: transitionTime,
+				},
+				{
+					Type:               garagev1beta1.ConditionStorageRolloutReady,
+					Status:             metav1.ConditionTrue,
+					Reason:             garagev1beta1.ReasonStorageRolloutConverged,
+					Message:            "all managed identities are ready",
+					ObservedGeneration: cluster.Generation,
+					LastTransitionTime: transitionTime,
+				},
+				{
+					Type:               PhaseReady,
+					Status:             metav1.ConditionFalse,
+					Reason:             garagev1beta1.ReasonReconcileFailed,
+					Message:            "another reconciler is changing Garage layout",
+					ObservedGeneration: cluster.Generation,
+					LastTransitionTime: transitionTime,
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, cluster)).To(Succeed())
+
+			node := &garagev1beta1.GarageNode{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-worker", Namespace: testNamespace},
+				Spec: garagev1beta1.GarageNodeSpec{
+					Backing:            garagev1beta1.NodeBackingNodeLocalPool,
+					Capacity:           ptrQuantity(resource.MustParse("100Gi")),
+					ClusterRef:         garagev1beta1.ClusterReference{Name: clusterName},
+					NodeLocalPoolName:  "local",
+					KubernetesNodeName: "worker",
+				},
+			}
+			Expect(k8sClient.Create(ctx, node)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+			node.Status.NodeID = testTerminalNodeID
+			node.Status.Connected = true
+			node.Status.InLayout = true
+			node.Status.ObservedGeneration = node.Generation
+			Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+
+			reconciler := &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			result, err := reconciler.updateStatusAfterNodeLocalPoolContention(
+				ctx,
+				cluster,
+				fmt.Errorf("%w: another reconciler is changing Garage layout", errLayoutMutationPending),
+			)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(RequeueAfterError))
+
+			updated := &garagev1beta2.GarageCluster{}
+			Expect(k8sClient.Get(ctx, clusterKey, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal(PhaseRunning))
+			ready := meta.FindStatusCondition(updated.Status.Conditions, PhaseReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionTrue))
+			Expect(ready.Reason).To(Equal("ClusterReady"))
+			poolReady := meta.FindStatusCondition(updated.Status.Conditions, garagev1beta1.ConditionNodeLocalPoolsReady)
+			Expect(poolReady).NotTo(BeNil())
+			Expect(poolReady.Status).To(Equal(metav1.ConditionTrue))
+			Expect(poolReady.Reason).To(Equal(garagev1beta1.ReasonNodeLocalPoolsConverged))
 		})
 
 		It("counts unlabeled clusterRef-matched GarageNodes toward readiness in Auto mode (#237)", func() {
