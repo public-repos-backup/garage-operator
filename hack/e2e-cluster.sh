@@ -1237,10 +1237,36 @@ test_pvc_creation() {
 test_operator_restart() {
     log_test "Testing operator restart resilience..."
 
+    # Deployment readiness and webhook endpoint readiness do not prove that a
+    # newly elected manager has started its controller workers. Capture a
+    # status field that the GarageNode reconciler refreshes on every connected
+    # observation, then require the replacement manager to advance it before
+    # creating resources for the next test section.
+    local probe_node="garage-storage-0"
+    local before_last_seen
+    before_last_seen=$(kubectl get garagenode "$probe_node" -n "$NAMESPACE" -o jsonpath='{.status.lastSeen}' 2>/dev/null || true)
+
     # Restart operator
     kubectl rollout restart deployment/garage-operator -n "$NAMESPACE"
     kubectl rollout status deployment/garage-operator -n "$NAMESPACE" --timeout=60s
     NAMESPACE="$NAMESPACE" "$ROOT_DIR/hack/wait-for-operator-webhook.sh"
+
+    local controller_ready="false"
+    local controller_deadline=$((SECONDS + 120))
+    while [ $SECONDS -lt $controller_deadline ]; do
+        local after_last_seen
+        after_last_seen=$(kubectl get garagenode "$probe_node" -n "$NAMESPACE" -o jsonpath='{.status.lastSeen}' 2>/dev/null || true)
+        if [ -n "$after_last_seen" ] && [ "$after_last_seen" != "$before_last_seen" ]; then
+            log_info "GarageNode controller observed $probe_node after restart"
+            controller_ready="true"
+            break
+        fi
+        sleep 2
+    done
+    if [ "$controller_ready" != "true" ]; then
+        test_fail "GarageNode controller did not reconcile $probe_node after operator restart"
+        return 1
+    fi
 
     # Wait for cluster to become healthy (operator reconciles after restart)
     # This may take longer if the cluster was recovering from a previous test

@@ -1740,9 +1740,19 @@ type RetryBlockResyncResult struct {
 
 // RetryBlockResync clears the resync backoff for blocks, causing immediate retry.
 // Pass all=true to retry all errored blocks, or provide specific block hashes.
+// A wildcard retry of specific hashes is first partitioned by the nodes that
+// currently report each error. Garage rejects a hash on every node where that
+// hash is not errored, so sending the same hash list to node="*" cannot work in
+// a healthy replicated cluster. Hashes that are no longer reported are treated
+// as an idempotent no-op.
+//
 // Returns the count summed across all responding nodes; a per-node failure
 // surfaces as a non-nil error (the HTTP status is always 200 for this endpoint).
 func (c *Client) RetryBlockResync(ctx context.Context, nodeID string, all bool, hashes []string) (*RetryBlockResyncResult, error) {
+	if nodeID == "*" && !all {
+		return c.retryBlockResyncByErrorOwner(ctx, hashes)
+	}
+
 	query := map[string]string{"node": nodeID}
 	var body any
 	if all {
@@ -1766,6 +1776,66 @@ func (c *Client) RetryBlockResync(ctx context.Context, nodeID string, all bool, 
 		agg.Count += r.Count
 	}
 	return &agg, nil
+}
+
+func (c *Client) retryBlockResyncByErrorOwner(ctx context.Context, hashes []string) (*RetryBlockResyncResult, error) {
+	requested := make(map[string]struct{}, len(hashes))
+	for _, hash := range hashes {
+		canonical := strings.ToLower(strings.TrimSpace(hash))
+		decoded, err := hex.DecodeString(canonical)
+		if err != nil || len(decoded) != 32 {
+			return nil, fmt.Errorf("invalid block hash %q: expected 64 hexadecimal characters", hash)
+		}
+		requested[canonical] = struct{}{}
+	}
+	if len(requested) == 0 {
+		return nil, fmt.Errorf("at least one block hash is required")
+	}
+
+	blockErrors, err := c.ListBlockErrors(ctx, "*")
+	if err != nil {
+		return nil, fmt.Errorf("listing block errors before retry: %w", err)
+	}
+	if err := aggregateNodeErrors(blockErrors.Error); err != nil {
+		return nil, fmt.Errorf("listing block errors before retry: %w", err)
+	}
+	if len(blockErrors.Success) == 0 {
+		return nil, fmt.Errorf("listing block errors before retry returned no successful nodes")
+	}
+
+	hashesByNode := make(map[string][]string)
+	for nodeID, nodeErrors := range blockErrors.Success {
+		seen := make(map[string]struct{})
+		for _, blockErr := range nodeErrors {
+			canonical := strings.ToLower(strings.TrimSpace(blockErr.BlockHash))
+			if _, wanted := requested[canonical]; !wanted {
+				continue
+			}
+			if _, duplicate := seen[canonical]; duplicate {
+				continue
+			}
+			seen[canonical] = struct{}{}
+			hashesByNode[nodeID] = append(hashesByNode[nodeID], canonical)
+		}
+	}
+
+	nodeIDs := make([]string, 0, len(hashesByNode))
+	for nodeID := range hashesByNode {
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	sort.Strings(nodeIDs)
+
+	var aggregate RetryBlockResyncResult
+	for _, nodeID := range nodeIDs {
+		nodeHashes := hashesByNode[nodeID]
+		sort.Strings(nodeHashes)
+		result, err := c.RetryBlockResync(ctx, nodeID, false, nodeHashes)
+		if err != nil {
+			return nil, fmt.Errorf("retrying block resync on node %s: %w", nodeID, err)
+		}
+		aggregate.Count += result.Count
+	}
+	return &aggregate, nil
 }
 
 // PurgeBlocksResult is the per-node response payload from PurgeBlocks.
