@@ -67,7 +67,7 @@ helm install garage-operator oci://ghcr.io/rajsinghtech/charts/garage-operator \
 Released container images and Helm charts are signed with [cosign](https://docs.sigstore.dev/) keyless signing (the GitHub Actions OIDC identity — no long-lived keys), and carry SLSA build provenance. The image additionally carries an SPDX SBOM. All three are stored in GHCR as OCI referrers of the artifact digest.
 
 ```bash
-IMAGE=ghcr.io/rajsinghtech/garage-operator:v0.6.29
+IMAGE=ghcr.io/rajsinghtech/garage-operator:v0.7.0
 
 # Signature
 cosign verify "$IMAGE" \
@@ -89,6 +89,7 @@ The Garage version is yours to choose — `GarageCluster.spec.image`, `GarageNod
 
 | Operator | Garage minimum | Garage tested in CI | Notes |
 |---|---|---|---|
+| 0.7.x | **v2.0.0** | v2.3.0, v2.2.0 | Admin API v2; experimental node-local pools require Kubernetes 1.27+ |
 | 0.6.x | **v2.0.0** | v2.3.0, v2.2.0 | Admin API v2 only |
 
 `dxflrs/garage:v2.3.0` is the built-in default when `spec.image` is unset, so an unpinned cluster runs the newest tested version. CI exercises two versions on purpose: the Ginkgo suite runs v2.3.0 and the topology suites (multi-cluster, external gateway, IPv6, single-cluster) run v2.2.0, which is what backs the "v2.x range" claim rather than a single number.

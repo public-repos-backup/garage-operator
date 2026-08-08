@@ -51,19 +51,22 @@ jobs:
         with:
           subject-path: dist/install.yaml
 
-      - name: Generate changelog
-        id: changelog
-        uses: orhun/git-cliff-action@v4
-        with:
-          args: --latest --strip header
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPO: ${{ github.repository }}
+      - name: Select curated release notes
+        id: release_notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="docs/releases/${{ steps.version.outputs.VERSION }}.md"
+          if [[ ! -s "$notes" ]]; then
+            echo "::error::missing curated release notes at $notes"
+            exit 1
+          fi
+          echo "path=$notes" >> "$GITHUB_OUTPUT"
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          body: ${{ steps.changelog.outputs.content }}
+          body_path: ${{ steps.release_notes.outputs.path }}
           files: |
             dist/install.yaml
         env:
