@@ -4,7 +4,7 @@ A Kubernetes operator for managing [Garage](https://garagehq.deuxfleurs.fr/) - a
 
 ## Prerequisites
 
-- Kubernetes 1.25+. The experimental
+- Kubernetes 1.25+. The
   [`spec.storage.nodeLocalPools`](../../docs/node-local-pools.md) feature
   requires Kubernetes 1.27+ for Pod scheduling gates and fails closed on older
   or incompatible servers; clusters that do not use it retain the 1.25 floor.

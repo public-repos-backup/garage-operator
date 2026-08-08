@@ -1,4 +1,4 @@
-# Node-local pools (experimental, DaemonSet-backed)
+# Node-local pools (DaemonSet-backed)
 
 Use `spec.storage.nodeLocalPools` for node-local disks. A pool runs one Garage
 pod on each selected Kubernetes Node and keeps Garage identity and block data
@@ -94,8 +94,8 @@ local-disk profiles.
   fails closed. Disabling or omitting them removes the update, deletion, and
   v1beta1 conversion safety boundary and is unsupported for pools.
 - Use the v1beta2 `GarageCluster` API.
-- Treat the feature as alpha. Declaring `spec.storage.nodeLocalPools` is the
-  explicit opt-in; earlier unreleased field names have no compatibility promise.
+- Declaring `spec.storage.nodeLocalPools` is the explicit opt-in. Earlier
+  unreleased field names have no compatibility promise.
 - Create the Secret referenced by `spec.admin.adminTokenSecretRef`.
 - Give every pool a dedicated, non-empty Node label selector.
 - Pre-create and mount metadata/data directories on every selected Node, then
