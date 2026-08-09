@@ -1429,10 +1429,16 @@ func requireClusterStorageDrainSafety(
 	}
 	observation, err := getter(ctx, garageClient)
 	if err != nil {
-		reset := resetBlockResyncEvidence(previous)
+		// A federated Admin API read can fail transiently while every exact
+		// process and repair worker remains unchanged. Preserve those durable
+		// worker IDs and retry the observation; clearing only the quiet/completed
+		// timestamps prevents stale evidence from authorizing deletion. A real
+		// process restart is still detected by the managed-Pod fingerprint below
+		// or by the recorded worker ID disappearing on the next successful read.
+		retry := resetBlockResyncObservation(previous)
 		if updateErr := updateClusterStorageDrainProof(
-			ctx, kubeClient, cluster, storageDrainRevisionFromStatus(cluster.Status.StorageDrain), reset,
-			"Cannot prove Garage object-block migration complete: "+err.Error(),
+			ctx, kubeClient, cluster, storageDrainRevisionFromStatus(cluster.Status.StorageDrain), retry,
+			"Garage block-proof observation is temporarily unavailable; retained exact repair workers and will retry: "+err.Error(),
 		); updateErr != nil {
 			return updateErr
 		}
@@ -1440,10 +1446,13 @@ func requireClusterStorageDrainSafety(
 	}
 	observation, err = scopeBlockResyncObservation(previous, observation)
 	if err != nil {
-		reset := resetBlockResyncEvidence(previous)
+		// Keep the exact worker evidence while a source or destination is
+		// temporarily unobservable. Once it returns, UID and worker-ID checks
+		// below distinguish the same live process from a real restart.
+		retry := resetBlockResyncObservation(previous)
 		if updateErr := updateClusterStorageDrainProof(
-			ctx, kubeClient, cluster, storageDrainRevisionFromStatus(cluster.Status.StorageDrain), reset,
-			"Cannot prove Garage source-to-destination block migration complete: "+err.Error(),
+			ctx, kubeClient, cluster, storageDrainRevisionFromStatus(cluster.Status.StorageDrain), retry,
+			"Garage source-to-destination proof is temporarily unobservable; retained exact repair workers and will retry: "+err.Error(),
 		); updateErr != nil {
 			return updateErr
 		}
