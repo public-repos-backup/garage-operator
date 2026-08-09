@@ -1276,9 +1276,92 @@ func TestStorageDrainTargetsAreMonotonicAndObservationResetPreservesIntent(t *te
 	if next.QuietSince != nil || next.LayoutVersion != 0 {
 		t.Fatalf("new removal target reused old evidence: %+v", next)
 	}
+	next.LayoutVersion = 7
+	next.RepairBaselines = map[string]uint64{testRemovedNodeID: 58}
+	next.RepairWorkerIDs = map[string]uint64{testRemovedNodeID: 59}
+	next.ResyncErrorBaselines = map[string]uint64{testRemovedNodeID + "/1": 0}
+	next.QueueLength = 123
+	next.ErrorCount = 4
+	next.QuietSince = &quietSince
+	next.CompletedAt = &quietSince
 	reset := resetBlockResyncObservation(next)
 	if got := strings.Join(reset.RemovedStorageNodeIDs, ","); got != "removed-a,removed-b" {
 		t.Fatalf("observation failure erased removal intent: %q", got)
+	}
+	if reset.LayoutVersion != 7 || reset.RepairBaselines[testRemovedNodeID] != 58 ||
+		reset.RepairWorkerIDs[testRemovedNodeID] != 59 ||
+		reset.ResyncErrorBaselines[testRemovedNodeID+"/1"] != 0 {
+		t.Fatalf("observation retry discarded exact durable worker evidence: %+v", reset)
+	}
+	if reset.QueueLength != 123 || reset.ErrorCount != 4 {
+		t.Fatalf("observation retry rewrote the last durable counters: %+v", reset)
+	}
+	if reset.QuietSince != nil || reset.CompletedAt != nil {
+		t.Fatalf("observation retry retained terminal timing evidence: %+v", reset)
+	}
+}
+
+func TestStorageDrainObservationRetryRetainsExactRepairWorkers(t *testing.T) {
+	now := time.Now()
+	proof := testDrainIntent(t, testRemovedNodeID, now.Add(-time.Minute))
+	proof.LayoutVersion = 7
+	proof.VerificationNodeIDs = []string{testRemovedNodeID}
+	proof.RepairBaselines = map[string]uint64{testRemovedNodeID: 58}
+	proof.RepairWorkerIDs = map[string]uint64{testRemovedNodeID: 59}
+	proof.ResyncErrorBaselines = map[string]uint64{testRemovedNodeID + "/1": 0}
+	quietSince := metav1.NewTime(now.Add(-time.Second))
+	proof.QuietSince = &quietSince
+	proof.CompletedAt = &quietSince
+
+	cluster := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testGarageValue, Namespace: testGarageValue, UID: testClusterUID, Generation: 1,
+		},
+		Spec: garagev1beta2.GarageClusterSpec{Storage: &garagev1beta2.StorageSpec{}},
+		Status: garagev1beta2.GarageClusterStatus{
+			StorageDrain: v1beta2StorageDrainStatus(proof),
+		},
+	}
+	markGarageClusterDrainReady(cluster)
+	scheme := deletionTestScheme(t)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).
+		WithStatusSubresource(&garagev1beta2.GarageCluster{}).Build()
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), cluster); err != nil {
+		t.Fatal(err)
+	}
+
+	err := requireClusterStorageDrainSafety(
+		context.Background(), fakeClient, fakeClient, NewLayoutMutationCoordinator(),
+		cluster, testDrainActor(), nil,
+		func(context.Context, *garage.Client) (*blockResyncObservation, error) {
+			return nil, fmt.Errorf("temporary federated ListWorkers timeout")
+		},
+		nil,
+		func(context.Context, *garage.Client) (*garage.ClusterHealth, error) {
+			return &garage.ClusterHealth{
+				Status: healthStatusHealthy, StorageNodes: 1, StorageNodesUp: 1,
+				Partitions: 256, PartitionsQuorum: 256, PartitionsAllOK: 256,
+			}, nil
+		},
+		time.Second,
+	)
+	if err == nil || !strings.Contains(err.Error(), "cannot prove Garage object-block migration complete") {
+		t.Fatalf("temporary observation failure did not keep the drain pending: %v", err)
+	}
+
+	fresh := &garagev1beta2.GarageCluster{}
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), fresh); err != nil {
+		t.Fatal(err)
+	}
+	retried := clusterStorageDrainProof(fresh.Status.StorageDrain)
+	if retried == nil || retried.LayoutVersion != 7 ||
+		retried.RepairBaselines[testRemovedNodeID] != 58 ||
+		retried.RepairWorkerIDs[testRemovedNodeID] != 59 ||
+		retried.ResyncErrorBaselines[testRemovedNodeID+"/1"] != 0 {
+		t.Fatalf("temporary observation failure discarded exact worker evidence: %+v", retried)
+	}
+	if retried.QuietSince != nil || retried.CompletedAt != nil {
+		t.Fatalf("temporary observation failure retained terminal timing evidence: %+v", retried)
 	}
 }
 
