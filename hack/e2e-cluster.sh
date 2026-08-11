@@ -225,6 +225,82 @@ delete_test_garagenode() {
     wait_for_resource_deleted garagenode "$node_name" 60
 }
 
+assert_external_garagenode_fails_closed() {
+    local node_name=$1
+    local expected_node_id=$2
+    local description=$3
+    local phase=""
+    local generation=""
+    local ready_status=""
+    local ready_reason=""
+    local ready_observed_generation=""
+    local status_node_id=""
+    local in_layout=""
+    local role_matches="-1"
+    local staged_matches="-1"
+    local status_converged=false
+    local layout_proven=false
+    local end_time=$((SECONDS + 60))
+
+    while [ "$SECONDS" -lt "$end_time" ]; do
+        local snapshot
+        snapshot=$(kubectl get garagenode "$node_name" -n "$NAMESPACE" -o json 2>/dev/null | \
+            jq -r '
+                (.status.conditions // [] | map(select(.type == "Ready")) | last // {}) as $ready |
+                [
+                    .status.phase // "",
+                    (.metadata.generation // ""),
+                    $ready.status // "",
+                    $ready.reason // "",
+                    ($ready.observedGeneration // ""),
+                    .status.nodeId // "",
+                    (.status.inLayout // false)
+                ] | map(tostring) | join("|")
+            ' 2>/dev/null || true)
+        IFS='|' read -r phase generation ready_status ready_reason \
+            ready_observed_generation status_node_id in_layout <<< "$snapshot"
+        if [ "$phase" = "Failed" ] && [ -n "$generation" ] && \
+            [ "$ready_status" = "False" ] && [ "$ready_reason" = "ReconcileFailed" ] && \
+            [ "$ready_observed_generation" = "$generation" ] && \
+            [ -z "$status_node_id" ] && [ "$in_layout" = "false" ]; then
+            status_converged=true
+            break
+        fi
+        sleep 3
+    done
+
+    if [ "$status_converged" = true ]; then
+        end_time=$((SECONDS + 60))
+        while [ "$SECONDS" -lt "$end_time" ]; do
+            local layout_snapshot layout_info
+            layout_info=$(garage_admin_get "/v2/GetClusterLayout" 2>/dev/null || true)
+            layout_snapshot=$(jq -r --arg id "$expected_node_id" '
+                [
+                    ([.roles[]? | select(.id == $id)] | length),
+                    ([.stagedRoleChanges[]? | select(.id == $id)] | length)
+                ] | map(tostring) | join("|")
+            ' <<< "$layout_info" 2>/dev/null || true)
+            IFS='|' read -r role_matches staged_matches <<< "$layout_snapshot"
+            if [ "$role_matches" = "0" ] && [ "$staged_matches" = "0" ]; then
+                layout_proven=true
+                break
+            fi
+            sleep 3
+        done
+    fi
+
+    if ! delete_test_garagenode "$node_name"; then
+        test_fail "$description fixture could not be cleaned up"
+        return 1
+    fi
+    if [ "$status_converged" = true ] && [ "$layout_proven" = true ]; then
+        test_pass "$description failed closed without publishing its fake identity"
+        return 0
+    fi
+    test_fail "$description did not fail closed (phase: ${phase:-missing}, generation: ${ready_observed_generation:-missing}/${generation:-missing}, Ready: ${ready_status:-missing}/${ready_reason:-missing}, status nodeId: ${status_node_id:-empty}, inLayout: ${in_layout:-missing}, layout matches: ${role_matches:-unavailable}, staged matches: ${staged_matches:-unavailable})"
+    return 1
+}
+
 garage_admin_status() {
     local path=$1
     local port=34905
@@ -2300,11 +2376,10 @@ EOF
 # ============================================================================
 
 test_garagenode_creation() {
-    log_test "Testing GarageNode custom resource creation (external gateway identity)..."
+    log_test "Testing unreachable external GarageNode fails closed..."
 
-    # This fixture only proves that an external GarageNode is reconciled. Keep it
-    # zero-capacity so it cannot become an unconnected positive-capacity layout
-    # member and block the later storage scaling tests.
+    # This deliberately unreachable identity must never be published into the
+    # shared Garage layout.
     cat <<EOF | kubectl apply -f -
 apiVersion: garage.rajsingh.info/v1beta1
 kind: GarageNode
@@ -2321,44 +2396,9 @@ spec:
     address: "192.168.1.100"
     port: 3901
 EOF
-
-    # Require the exact desired identity to be committed to the layout and
-    # observed at the current generation. A non-empty phase includes Failed and
-    # is not evidence that reconciliation succeeded.
-    local phase=""
-    local observed_generation=""
-    local generation=""
-    local node_id=""
-    local zone=""
-    local in_layout=""
-    local end_time=$((SECONDS + 90))
-    while [ $SECONDS -lt $end_time ]; do
-        local snapshot
-        snapshot=$(kubectl get garagenode custom-node -n "$NAMESPACE" -o json 2>/dev/null | \
-            jq -r '[.status.phase // "", (.status.observedGeneration // ""), .metadata.generation, .status.nodeId // "", .status.zone // "", (.status.inLayout // false)] | map(tostring) | join("|")' 2>/dev/null || true)
-        IFS='|' read -r phase observed_generation generation node_id zone in_layout <<< "$snapshot"
-        if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
-            [ "$observed_generation" = "$generation" ] && \
-            [ "$node_id" = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ] && \
-            [ "$zone" = "custom-zone" ] && [ "$in_layout" = "true" ]; then
-            break
-        fi
-        sleep 3
-    done
-
-    if ! delete_test_garagenode custom-node; then
-        test_fail "GarageNode external fixture could not be cleaned up"
-        return 1
-    fi
-    if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
-        [ "$observed_generation" = "$generation" ] && \
-        [ "$node_id" = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ] && \
-        [ "$zone" = "custom-zone" ] && [ "$in_layout" = "true" ]; then
-        test_pass "External GarageNode reached Ready with its exact identity and layout role"
-        return 0
-    fi
-    test_fail "External GarageNode did not converge (phase: ${phase:-missing}, observedGeneration: ${observed_generation:-missing}/${generation:-missing}, nodeId: ${node_id:-missing}, zone: ${zone:-missing}, inLayout: ${in_layout:-missing})"
-    return 1
+    assert_external_garagenode_fails_closed custom-node \
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+        "Unreachable external GarageNode"
 }
 
 # ============================================================================
@@ -2469,6 +2509,14 @@ test_quota_status_reporting() {
 test_local_alias_creation() {
     log_test "Testing bucket with local alias..."
 
+    local test_key_id
+    test_key_id=$(kubectl get garagekey test-key -n "$NAMESPACE" \
+        -o jsonpath='{.status.accessKeyId}' 2>/dev/null)
+    if [ -z "$test_key_id" ]; then
+        test_fail "Local alias prerequisite GarageKey/test-key has no accessKeyId"
+        return 1
+    fi
+
     cat <<EOF | kubectl apply -f -
 apiVersion: garage.rajsingh.info/v1beta1
 kind: GarageBucket
@@ -2489,16 +2537,18 @@ EOF
         local alias_deadline=$((SECONDS + 60))
         while [ "$SECONDS" -lt "$alias_deadline" ]; do
             alias_count=$(kubectl get garagebucket alias-test-bucket -n "$NAMESPACE" -o json 2>/dev/null | \
-                jq -r '[.status.localAliases[]? | select(.keyName == "test-key" and .alias == "my-local-alias")] | length' 2>/dev/null || echo "0")
+                jq -r --arg key_id "$test_key_id" \
+                '[.status.localAliases[]? | select(.keyId == $key_id and .alias == "my-local-alias")] | length' \
+                2>/dev/null || echo "0")
             if [ "$alias_count" -ge 1 ] 2>/dev/null; then
-                test_pass "Local alias my-local-alias is reported for test-key"
+                test_pass "Local alias my-local-alias is reported for GarageKey/test-key's exact access key"
                 kubectl delete garagebucket alias-test-bucket -n "$NAMESPACE" 2>/dev/null || true
                 return 0
             fi
             sleep 3
         done
     fi
-    test_fail "Local alias my-local-alias was not reported for test-key"
+    test_fail "Local alias my-local-alias was not reported for GarageKey/test-key's exact access key"
     kubectl delete garagebucket alias-test-bucket -n "$NAMESPACE" 2>/dev/null || true
     return 1
 }
@@ -2615,27 +2665,30 @@ EOF
     local pf_port=34904
     kubectl port-forward svc/garage ${pf_port}:3903 -n "$NAMESPACE" &>/dev/null &
     local pf_pid=$!
-    local expiration=""
     local key_info=""
+    local permanent=false
     local expiration_deadline=$((SECONDS + 60))
     while [ "$SECONDS" -lt "$expiration_deadline" ]; do
         key_info=$(curl -fsS --connect-timeout 5 --max-time 10 --get \
             -H "Authorization: Bearer ${admin_token}" \
             --data-urlencode "id=${access_key_id}" \
             "http://localhost:${pf_port}/v2/GetKeyInfo" 2>/dev/null || true)
-        expiration=$(echo "$key_info" | jq -r '.expiration // ""' 2>/dev/null || true)
-        [ "$expiration" = "never" ] && break
+        if jq -e '.expiration == null and .expired == false' \
+            <<< "$key_info" >/dev/null 2>&1; then
+            permanent=true
+            break
+        fi
         sleep 3
     done
     kill "$pf_pid" 2>/dev/null || true
     wait "$pf_pid" 2>/dev/null || true
 
     kubectl delete garagekey permanent-key -n "$NAMESPACE" 2>/dev/null || true
-    if [ "$expiration" = "never" ]; then
-        test_pass "Garage reports the permanent key expiration as never"
+    if [ "$permanent" = true ]; then
+        test_pass "Garage reports the permanent key as unexpired with no expiration"
         return 0
     fi
-    test_fail "Garage did not report expiration=never for the permanent key (observed: ${expiration:-missing})"
+    test_fail "Garage did not report expiration=null and expired=false for the permanent key (response: ${key_info:-missing})"
     return 1
 }
 
@@ -2644,7 +2697,7 @@ EOF
 # ============================================================================
 
 test_gateway_node() {
-    log_test "Testing gateway-only GarageNode (external)..."
+    log_test "Testing unreachable external gateway GarageNode fails closed..."
 
     cat <<EOF | kubectl apply -f -
 apiVersion: garage.rajsingh.info/v1beta1
@@ -2662,43 +2715,9 @@ spec:
     address: "192.168.1.101"
     port: 3901
 EOF
-
-    # Require the exact desired gateway identity to reach the current
-    # generation and enter the committed layout.
-    local phase=""
-    local observed_generation=""
-    local generation=""
-    local node_id=""
-    local zone=""
-    local in_layout=""
-    local end_time=$((SECONDS + 90))
-    while [ $SECONDS -lt $end_time ]; do
-        local snapshot
-        snapshot=$(kubectl get garagenode gateway-node -n "$NAMESPACE" -o json 2>/dev/null | \
-            jq -r '[.status.phase // "", (.status.observedGeneration // ""), .metadata.generation, .status.nodeId // "", .status.zone // "", (.status.inLayout // false)] | map(tostring) | join("|")' 2>/dev/null || true)
-        IFS='|' read -r phase observed_generation generation node_id zone in_layout <<< "$snapshot"
-        if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
-            [ "$observed_generation" = "$generation" ] && \
-            [ "$node_id" = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210" ] && \
-            [ "$zone" = "gateway-zone" ] && [ "$in_layout" = "true" ]; then
-            break
-        fi
-        sleep 3
-    done
-
-    if ! delete_test_garagenode gateway-node; then
-        test_fail "Gateway node fixture could not be cleaned up"
-        return 1
-    fi
-    if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
-        [ "$observed_generation" = "$generation" ] && \
-        [ "$node_id" = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210" ] && \
-        [ "$zone" = "gateway-zone" ] && [ "$in_layout" = "true" ]; then
-        test_pass "External gateway reached Ready with its exact identity and layout role"
-        return 0
-    fi
-    test_fail "External gateway did not converge (phase: ${phase:-missing}, observedGeneration: ${observed_generation:-missing}/${generation:-missing}, nodeId: ${node_id:-missing}, zone: ${zone:-missing}, inLayout: ${in_layout:-missing})"
-    return 1
+    assert_external_garagenode_fails_closed gateway-node \
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210" \
+        "Unreachable external gateway"
 }
 
 # ============================================================================
@@ -3034,6 +3053,14 @@ EOF
 test_bucket_key_permissions() {
     log_test "Testing bucket with keyPermissions defined on bucket..."
 
+    local test_key_id
+    test_key_id=$(kubectl get garagekey test-key -n "$NAMESPACE" \
+        -o jsonpath='{.status.accessKeyId}' 2>/dev/null)
+    if [ -z "$test_key_id" ]; then
+        test_fail "Bucket permission prerequisite GarageKey/test-key has no accessKeyId"
+        return 1
+    fi
+
     cat <<EOF | kubectl apply -f -
 apiVersion: garage.rajsingh.info/v1beta1
 kind: GarageBucket
@@ -3057,7 +3084,9 @@ EOF
         local permissions_deadline=$((SECONDS + 60))
         while [ "$SECONDS" -lt "$permissions_deadline" ]; do
             matching_permissions=$(kubectl get garagebucket permissions-bucket -n "$NAMESPACE" -o json 2>/dev/null | \
-                jq -r '[.status.keys[]? | select(.name == "test-key" and .permissions.read == true and .permissions.write == true and .permissions.owner == true)] | length' 2>/dev/null || echo "0")
+                jq -r --arg key_id "$test_key_id" \
+                '[.status.keys[]? | select(.keyId == $key_id and .permissions.read == true and .permissions.write == true and .permissions.owner == true)] | length' \
+                2>/dev/null || echo "0")
             if [ "$matching_permissions" -ge 1 ] 2>/dev/null; then
                 test_pass "Bucket reports read, write, and owner permissions for test-key"
                 kubectl delete garagebucket permissions-bucket -n "$NAMESPACE" 2>/dev/null || true
@@ -3107,14 +3136,11 @@ test_connect_nodes_annotation() {
     local pod_ip=""
     local node_deadline=$((SECONDS + 60))
     while [ "$SECONDS" -lt "$node_deadline" ]; do
-        local node_snapshot pod_name
-        node_snapshot=$(kubectl get garagecluster garage -n "$NAMESPACE" \
-            -o 'jsonpath={.status.nodes[0].nodeId}{"|"}{.status.nodes[0].podName}' 2>/dev/null)
-        IFS='|' read -r node_id pod_name <<< "$node_snapshot"
-        if [ -n "$pod_name" ]; then
-            pod_ip=$(kubectl get pod "$pod_name" -n "$NAMESPACE" \
-                -o jsonpath='{.status.podIP}' 2>/dev/null)
-        fi
+        node_id=$(kubectl get garagenode garage-storage-0 -n "$NAMESPACE" \
+            -o jsonpath='{.status.nodeId}' 2>/dev/null)
+        pod_ip=$(kubectl get pods -n "$NAMESPACE" \
+            -l garage.rajsingh.info/node=garage-storage-0 \
+            -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
         [ -n "$node_id" ] && [ -n "$pod_ip" ] && break
         sleep 3
     done
@@ -3197,7 +3223,7 @@ test_force_layout_apply_annotation() {
 # ============================================================================
 
 test_node_with_tags() {
-    log_test "Testing GarageNode with custom tags (external gateway identity)..."
+    log_test "Testing unreachable tagged external GarageNode fails closed..."
 
     cat <<EOF | kubectl apply -f -
 apiVersion: garage.rajsingh.info/v1beta1
@@ -3219,42 +3245,9 @@ spec:
     address: "192.168.1.102"
     port: 3901
 EOF
-
-    # Poll for the operator to commit the exact custom tags at the current
-    # generation. Tags copied onto a Failed status are not success evidence.
-    local phase=""
-    local observed_generation=""
-    local generation=""
-    local in_layout=""
-    local status_tags=""
-    local end_time=$((SECONDS + 90))
-    while [ $SECONDS -lt $end_time ]; do
-        local snapshot
-        snapshot=$(kubectl get garagenode tagged-node -n "$NAMESPACE" -o json 2>/dev/null | \
-            jq -r '[.status.phase // "", (.status.observedGeneration // ""), .metadata.generation, (.status.inLayout // false), ((.status.tags // []) | sort | join(","))] | map(tostring) | join("|")' 2>/dev/null || true)
-        IFS='|' read -r phase observed_generation generation in_layout status_tags <<< "$snapshot"
-        if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
-            [ "$observed_generation" = "$generation" ] && [ "$in_layout" = "true" ] && \
-            [ "$status_tags" = "rack-a,ssd,tier-1" ]; then
-            break
-        fi
-        sleep 3
-    done
-
-    if ! delete_test_garagenode tagged-node; then
-        test_fail "Tagged GarageNode fixture could not be cleaned up"
-        return 1
-    fi
-
-    if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
-        [ "$observed_generation" = "$generation" ] && [ "$in_layout" = "true" ] && \
-        [ "$status_tags" = "rack-a,ssd,tier-1" ]; then
-        test_pass "Node committed all custom tags at its current generation and was cleaned up"
-        return 0
-    fi
-
-    test_fail "Node did not commit the requested custom tags (phase: ${phase:-missing}, observedGeneration: ${observed_generation:-missing}/${generation:-missing}, inLayout: ${in_layout:-missing}, tags: ${status_tags:-missing})"
-    return 1
+    assert_external_garagenode_fails_closed tagged-node \
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" \
+        "Unreachable tagged external GarageNode"
 }
 
 # ============================================================================
