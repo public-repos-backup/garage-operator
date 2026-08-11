@@ -2332,10 +2332,10 @@ test_single_replica_federation() {
     while [ "$SECONDS" -lt "$layout_deadline" ]; do
         c1_logs=$(kubectl --context "kind-$CLUSTER1_NAME" logs \
             -l app.kubernetes.io/name=garage-operator -n "$NAMESPACE" \
-            --since-time="$reconciliation_since" 2>/dev/null || true)
+            --since-time="$reconciliation_since" --tail=-1 2>/dev/null || true)
         c2_logs=$(kubectl --context "kind-$CLUSTER2_NAME" logs \
             -l app.kubernetes.io/name=garage-operator -n "$NAMESPACE" \
-            --since-time="$reconciliation_since" 2>/dev/null || true)
+            --since-time="$reconciliation_since" --tail=-1 2>/dev/null || true)
         c1_layout_version=$(kubectl --context "kind-$CLUSTER1_NAME" get garagecluster garage \
             -n "$NAMESPACE" -o jsonpath='{.status.layoutVersion}' 2>/dev/null || true)
         c2_layout_version=$(kubectl --context "kind-$CLUSTER2_NAME" get garagecluster garage \
