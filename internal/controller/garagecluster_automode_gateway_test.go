@@ -267,6 +267,71 @@ var _ = Describe("GarageCluster unified-gateway Auto-mode (#209)", func() {
 		Expect(got).NotTo(HaveKey(clusterNN.Name + "-gateway-1"))
 	})
 
+	It("hands an exact retained gateway PVC incarnation to the recreated Auto slot", func() {
+		reconcileAllGatewayNodes()
+		slot := clusterNN.Name + "-gateway-1"
+		oldNode := &garagev1beta1.GarageNode{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: slot, Namespace: testNamespace}, oldNode)).To(Succeed())
+
+		claim := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        metadataVolName + "-" + slot + "-0",
+				Namespace:   testNamespace,
+				Annotations: map[string]string{managedPVCNodeUIDAnnotation: string(oldNode.UID)},
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, claim)).To(Succeed())
+		oldNode.Status.ManagedPVCs = []garagev1beta1.ManagedNodePVCStatus{{Name: claim.Name, UID: claim.UID}}
+		Expect(k8sClient.Status().Update(ctx, oldNode)).To(Succeed())
+
+		Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+		cluster.Spec.Gateway.Replicas = 1
+		Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+		Expect(reconciler.reconcileAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: slot, Namespace: testNamespace}, &garagev1beta1.GarageNode{}))
+		}).Should(BeTrue())
+
+		Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+		Expect(cluster.Status.AutoModePVCHandoffs).To(ConsistOf(garagev1beta2.AutoModePVCHandoffStatus{
+			SlotName: slot, PVCName: claim.Name, PVCUID: string(claim.UID), PreviousGarageNodeUID: string(oldNode.UID),
+		}))
+
+		cluster.Spec.Gateway.Replicas = 2
+		Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+		Expect(reconciler.reconcileAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
+
+		replacement := &garagev1beta1.GarageNode{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: slot, Namespace: testNamespace}, replacement)).To(Succeed())
+		Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+		Expect(cluster.Status.AutoModePVCHandoffs).To(HaveLen(1))
+		handoff := cluster.Status.AutoModePVCHandoffs[0]
+		Expect(handoff.ReplacementGarageNodeUID).To(Equal(string(replacement.UID)))
+		Expect(managedNodePVCNonceMatchesNode(replacement, handoff.ReplacementReservationHash)).To(BeTrue())
+
+		forged := replacement.DeepCopy()
+		forged.UID = types.UID("forged-replacement-uid")
+		_, err := retainedAutoModePVCHandoff(cluster, forged, claim)
+		Expect(err).To(MatchError(ContainSubstring("does not authorize GarageNode UID")))
+
+		nodeReconciler := &GarageNodeReconciler{Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme()}
+		Expect(nodeReconciler.ensureManagedNodePVCProvenance(ctx, claim, replacement, cluster)).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(replacement), replacement)).To(Succeed())
+		Expect(replacement.Status.ManagedPVCs).To(ConsistOf(garagev1beta1.ManagedNodePVCStatus{Name: claim.Name, UID: claim.UID}))
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(claim), claim)).To(Succeed())
+		Expect(claim.Annotations).To(HaveKeyWithValue(managedPVCNodeUIDAnnotation, string(replacement.UID)))
+
+		Expect(reconciler.reconcileAutoModeGatewayNodes(ctx, cluster)).To(Succeed())
+		Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
+		Expect(cluster.Status.AutoModePVCHandoffs).To(BeEmpty())
+	})
+
 	It("propagates gateway rpcPublicAddr onto the node network override", func() {
 		Expect(k8sClient.Get(ctx, clusterNN, cluster)).To(Succeed())
 		cluster.Spec.Gateway.RPCPublicAddr = testGatewayRPCAddr

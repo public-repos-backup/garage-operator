@@ -4315,6 +4315,7 @@ func mergeComputedClusterStatus(
 	merged.StorageDrain = freshStatus.StorageDrain
 	merged.StorageRollout = freshStatus.StorageRollout
 	merged.FactorMigration = freshStatus.FactorMigration
+	merged.AutoModePVCHandoffs = freshStatus.AutoModePVCHandoffs
 
 	protectedConditions := map[string]struct{}{
 		garagev1beta1.ConditionStorageDrainReady:   {},
@@ -6688,6 +6689,17 @@ func (r *GarageClusterReconciler) addRemoteNodesToLayoutLocked(
 		return nil
 	}
 
+	// A local GarageNode can have staged its own role before federation discovers
+	// enough remote capacity to satisfy the replication factor. Garage rejects
+	// that first Apply, leaving the exact local assignment in its global staging
+	// area. Prove and include those sibling assignments in this transaction so
+	// the remote import can complete the bootstrap without treating a known
+	// operator-owned change as an arbitrary external writer's mutation.
+	intendedRoles, err = r.includeLocalGarageNodeStagingIntent(ctx, cluster, layout, intendedRoles)
+	if err != nil {
+		return err
+	}
+
 	// Stage changes with zone redundancy parameters from cluster spec
 	log.Info("Adding remote nodes to layout", "cluster", remote.Name, "count", len(newRoles))
 
@@ -6716,6 +6728,73 @@ func (r *GarageClusterReconciler) addRemoteNodesToLayoutLocked(
 
 	log.Info("Applied federated layout", "cluster", remote.Name, "nodesAdded", len(newRoles))
 	return nil
+}
+
+// includeLocalGarageNodeStagingIntent admits only exact role assignments for
+// live GarageNodes owned by this GarageCluster. Federation may need to commit
+// such a role together with a newly imported remote role when the local role's
+// earlier Apply failed solely because the remote capacity was not present yet.
+// Removals, unknown identities, and drift remain outside this transaction.
+func (r *GarageClusterReconciler) includeLocalGarageNodeStagingIntent(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	layout *garage.ClusterLayout,
+	intended []garage.NodeRoleChange,
+) ([]garage.NodeRoleChange, error) {
+	if layout == nil || len(layout.StagedRoleChanges) == 0 {
+		return intended, nil
+	}
+
+	seen := make(map[string]bool, len(intended))
+	for i := range intended {
+		seen[intended[i].ID] = true
+	}
+
+	nodes := &garagev1beta1.GarageNodeList{}
+	if err := r.safetyReader().List(ctx, nodes, client.InNamespace(cluster.Namespace)); err != nil {
+		return nil, fmt.Errorf("listing GarageNodes to validate federated bootstrap staging: %w", err)
+	}
+	byID := make(map[string]*garagev1beta1.GarageNode)
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		if node.Spec.ClusterRef.Name != cluster.Name ||
+			(node.Spec.ClusterRef.Namespace != "" && node.Spec.ClusterRef.Namespace != cluster.Namespace) ||
+			!node.DeletionTimestamp.IsZero() {
+			continue
+		}
+		id := canonicalGarageNodeID(node.Status.NodeID)
+		if id == "" {
+			id = canonicalGarageNodeID(node.Spec.NodeID)
+		}
+		if id != "" {
+			byID[id] = node
+		}
+	}
+
+	nodeReconciler := &GarageNodeReconciler{Client: r.Client, APIReader: r.APIReader}
+	for i := range layout.StagedRoleChanges {
+		staged := layout.StagedRoleChanges[i]
+		if seen[staged.ID] {
+			continue
+		}
+		node := byID[canonicalGarageNodeID(staged.ID)]
+		if node == nil || staged.Remove {
+			return nil, fmt.Errorf(
+				"%w: staged node %s is not an assignable live GarageNode owned by this federated cluster",
+				errLayoutMutationPending, shortID(staged.ID),
+			)
+		}
+		expected, err := nodeReconciler.desiredGarageNodeRoleChange(ctx, node, cluster, staged.ID)
+		if err != nil || !sameStagedRoleChange(staged, expected) {
+			return nil, fmt.Errorf(
+				"%w: staged role for GarageNode %s does not match its desired operator state during federated bootstrap",
+				errLayoutMutationPending, node.Name,
+			)
+		}
+		intended = append(intended, expected)
+		seen[expected.ID] = true
+	}
+	return intended, nil
 }
 
 // getRemoteAdminToken retrieves the admin token for a remote cluster.

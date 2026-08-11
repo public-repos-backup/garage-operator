@@ -1445,6 +1445,13 @@ type GarageClusterStatus struct {
 	// +optional
 	StorageDrain *StorageDrainStatus `json:"storageDrain,omitempty"`
 
+	// AutoModePVCHandoffs mirrors the hub version's controller-owned retained
+	// PVC identity handoffs so conversion cannot erase an in-flight replacement.
+	// +optional
+	// +listType=map
+	// +listMapKey=pvcName
+	AutoModePVCHandoffs []AutoModePVCHandoffStatus `json:"autoModePvcHandoffs,omitempty"`
+
 	// FactorMigration is mirrored from the storage version so v1beta1 status
 	// conversion and delete admission cannot erase or overlook an in-flight
 	// replication-factor migration.
@@ -1496,6 +1503,17 @@ type GarageClusterStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// AutoModePVCHandoffStatus mirrors the v1beta2 retained Auto-mode PVC handoff
+// for lossless status conversion.
+type AutoModePVCHandoffStatus struct {
+	SlotName                   string `json:"slotName"`
+	PVCName                    string `json:"pvcName"`
+	PVCUID                     string `json:"pvcUid"`
+	PreviousGarageNodeUID      string `json:"previousGarageNodeUid"`
+	ReplacementReservationHash string `json:"replacementReservationHash,omitempty"`
+	ReplacementGarageNodeUID   string `json:"replacementGarageNodeUid,omitempty"`
 }
 
 // FactorMigrationStatus mirrors the v1beta2 coordinated replication-factor

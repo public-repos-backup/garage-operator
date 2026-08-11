@@ -432,6 +432,7 @@ func main() {
 		provisioner := cosi.NewProvisioner(mgr.GetClient(), cosiNamespace, clusterDomain)
 		if err := (&cosi.BucketReconciler{
 			Client:          mgr.GetClient(),
+			APIReader:       mgr.GetAPIReader(),
 			Scheme:          mgr.GetScheme(),
 			DriverName:      cosiDriverName,
 			Namespace:       cosiNamespace,

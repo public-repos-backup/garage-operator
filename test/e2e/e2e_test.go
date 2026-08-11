@@ -5783,7 +5783,7 @@ spec:
 			}, 2*time.Minute, 10*time.Second).Should(Succeed())
 		})
 
-		It("should render credentials whose endpoint comes from connectTo, not a managed Service", func() {
+		It("should render credentials without inferring S3 from the external Admin endpoint", func() {
 			keyYAML := fmt.Sprintf(`
 apiVersion: garage.rajsingh.info/v1beta1
 kind: GarageKey
@@ -5798,6 +5798,8 @@ spec:
         name: %s
       read: true
       write: true
+  secretTemplate:
+    includeEndpoint: false
 `, keyName, testNamespace, handleName, bucketName)
 
 			Eventually(func(g Gomega) {
@@ -5816,13 +5818,13 @@ spec:
 				g.Expect(o).NotTo(BeEmpty(), "access-key-id missing from secret")
 			}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-			By("verifying the endpoint is derived from connectTo.adminApiEndpoint's host")
+			By("verifying no endpoint is inferred from connectTo.adminApiEndpoint")
 			c := exec.Command("kubectl", "get", "secret", keyName, "-n", testNamespace,
-				"-o", `go-template={{ index .data "endpoint" | base64decode }}`)
+				"-o", `go-template={{ if index .data "endpoint" }}present{{ end }}`)
 			o, err := utils.Run(c)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(o).To(Equal(s3Endpoint),
-				"endpoint must point at the external cluster, not a nonexistent managed Service")
+			Expect(o).To(BeEmpty(),
+				"management-handle credentials must not derive an S3 endpoint from the Admin API URL")
 
 			By("verifying the key exists on the external cluster's Admin API")
 			accessKeyID := readSecretValue(testNamespace, keyName, "access-key-id")
@@ -5860,6 +5862,8 @@ metadata:
 spec:
   clusterRef:
     name: %s
+  secretTemplate:
+    includeEndpoint: false
 `, deniedKeyName, testNamespace, handleName)
 
 			Eventually(func(g Gomega) {

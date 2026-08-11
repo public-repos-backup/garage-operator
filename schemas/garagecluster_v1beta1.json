@@ -4072,6 +4072,45 @@
           },
           "type": "array"
         },
+        "autoModePvcHandoffs": {
+          "description": "AutoModePVCHandoffs mirrors the hub version's controller-owned retained\nPVC identity handoffs so conversion cannot erase an in-flight replacement.",
+          "items": {
+            "description": "AutoModePVCHandoffStatus mirrors the v1beta2 retained Auto-mode PVC handoff\nfor lossless status conversion.",
+            "properties": {
+              "previousGarageNodeUid": {
+                "type": "string"
+              },
+              "pvcName": {
+                "type": "string"
+              },
+              "pvcUid": {
+                "type": "string"
+              },
+              "replacementGarageNodeUid": {
+                "type": "string"
+              },
+              "replacementReservationHash": {
+                "type": "string"
+              },
+              "slotName": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "previousGarageNodeUid",
+              "pvcName",
+              "pvcUid",
+              "slotName"
+            ],
+            "type": "object",
+            "additionalProperties": false
+          },
+          "type": "array",
+          "x-kubernetes-list-map-keys": [
+            "pvcName"
+          ],
+          "x-kubernetes-list-type": "map"
+        },
         "blockErrorDetails": {
           "description": "BlockErrorDetails provides detailed information about block errors",
           "properties": {

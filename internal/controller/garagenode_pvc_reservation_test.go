@@ -44,6 +44,53 @@ func managedPVCTestScheme(t *testing.T) *runtime.Scheme {
 	return scheme
 }
 
+func TestRetainedAutoModePVCHandoffAuthorizesStorageAndGatewayExactUIDs(t *testing.T) {
+	for _, tier := range []string{tierStorage, tierGateway} {
+		t.Run(tier, func(t *testing.T) {
+			controller := true
+			cluster := &garagev1beta2.GarageCluster{ObjectMeta: metav1.ObjectMeta{
+				Name: "store", Namespace: "default", UID: "cluster-uid",
+			}}
+			nonce, hash, err := newManagedNodePVCNonce()
+			if err != nil {
+				t.Fatal(err)
+			}
+			node := &garagev1beta1.GarageNode{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "store-" + tier + "-1", Namespace: "default", UID: "new-node-uid",
+					Labels: map[string]string{
+						labelAutoNodeSlot: "store-" + tier + "-1", labelAppManagedBy: managedByOperatorValue,
+						labelTier: tier,
+					},
+					Annotations: map[string]string{autoModePVCHandoffNonceAnnotation: nonce},
+					OwnerReferences: []metav1.OwnerReference{{
+						UID: cluster.UID, Controller: &controller,
+					}},
+				},
+				Spec: garagev1beta1.GarageNodeSpec{ClusterRef: garagev1beta1.ClusterReference{Name: cluster.Name}},
+			}
+			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+				Name: "metadata-" + node.Name + "-0", Namespace: node.Namespace, UID: "pvc-uid",
+				Annotations: map[string]string{managedPVCNodeUIDAnnotation: "old-node-uid"},
+			}}
+			cluster.Status.AutoModePVCHandoffs = []garagev1beta2.AutoModePVCHandoffStatus{{
+				SlotName: node.Labels[labelAutoNodeSlot], PVCName: pvc.Name, PVCUID: string(pvc.UID),
+				PreviousGarageNodeUID: "old-node-uid", ReplacementReservationHash: hash,
+				ReplacementGarageNodeUID: string(node.UID),
+			}}
+
+			if handoff, err := retainedAutoModePVCHandoff(cluster, node, pvc); err != nil || handoff == nil {
+				t.Fatalf("exact %s handoff was not authorized: handoff=%#v err=%v", tier, handoff, err)
+			}
+			forged := node.DeepCopy()
+			forged.UID = "forged-node-uid"
+			if _, err := retainedAutoModePVCHandoff(cluster, forged, pvc); err == nil {
+				t.Fatalf("%s handoff authorized the wrong GarageNode UID", tier)
+			}
+		})
+	}
+}
+
 func TestManagedPVCReservationRecoversAfterCreateStatusCrash(t *testing.T) {
 	ctx := context.Background()
 	nonce, hash, err := newManagedNodePVCNonce()

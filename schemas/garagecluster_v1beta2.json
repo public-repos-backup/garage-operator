@@ -8129,6 +8129,50 @@
           },
           "type": "array"
         },
+        "autoModePvcHandoffs": {
+          "description": "AutoModePVCHandoffs are controller-owned, exact-UID authorizations for\nretained Auto-mode claims whose GarageNode slot was scaled down and later\nrecreated. Entries are removed after the replacement binds the exact PVC.",
+          "items": {
+            "description": "AutoModePVCHandoffStatus authorizes one exact retained PVC incarnation to\nmove from a deleted Auto-mode GarageNode to its replacement. The parent\nGarageCluster status is the trust boundary: predictable object names and\nuser-writable labels or annotations are never sufficient to adopt a claim.",
+            "properties": {
+              "previousGarageNodeUid": {
+                "description": "PreviousGarageNodeUID is the exact deleted GarageNode incarnation that\nreserved the claim.",
+                "type": "string"
+              },
+              "pvcName": {
+                "description": "PVCName and PVCUID identify the exact retained claim incarnation.",
+                "type": "string"
+              },
+              "pvcUid": {
+                "type": "string"
+              },
+              "replacementGarageNodeUid": {
+                "description": "ReplacementGarageNodeUID is the only new GarageNode incarnation allowed\nto consume this handoff.",
+                "type": "string"
+              },
+              "replacementReservationHash": {
+                "description": "ReplacementReservationHash is a one-way commitment to the nonce placed\non the controller-created replacement GarageNode. It closes the crash gap\nbetween Create and recording the replacement object's API-server UID.",
+                "type": "string"
+              },
+              "slotName": {
+                "description": "SlotName is the stable Auto-mode slot (for example, cluster-gateway-1).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "previousGarageNodeUid",
+              "pvcName",
+              "pvcUid",
+              "slotName"
+            ],
+            "type": "object",
+            "additionalProperties": false
+          },
+          "type": "array",
+          "x-kubernetes-list-map-keys": [
+            "pvcName"
+          ],
+          "x-kubernetes-list-type": "map"
+        },
         "blockErrorDetails": {
           "description": "BlockErrorDetails provides detailed information about block errors.",
           "properties": {

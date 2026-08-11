@@ -4583,6 +4583,37 @@ spec:
                       type: string
                   type: object
                 type: array
+              autoModePvcHandoffs:
+                description: |-
+                  AutoModePVCHandoffs mirrors the hub version's controller-owned retained
+                  PVC identity handoffs so conversion cannot erase an in-flight replacement.
+                items:
+                  description: |-
+                    AutoModePVCHandoffStatus mirrors the v1beta2 retained Auto-mode PVC handoff
+                    for lossless status conversion.
+                  properties:
+                    previousGarageNodeUid:
+                      type: string
+                    pvcName:
+                      type: string
+                    pvcUid:
+                      type: string
+                    replacementGarageNodeUid:
+                      type: string
+                    replacementReservationHash:
+                      type: string
+                    slotName:
+                      type: string
+                  required:
+                  - previousGarageNodeUid
+                  - pvcName
+                  - pvcUid
+                  - slotName
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - pvcName
+                x-kubernetes-list-type: map
               blockErrorDetails:
                 description: BlockErrorDetails provides detailed information about
                   block errors
@@ -14751,6 +14782,54 @@ spec:
                       type: string
                   type: object
                 type: array
+              autoModePvcHandoffs:
+                description: |-
+                  AutoModePVCHandoffs are controller-owned, exact-UID authorizations for
+                  retained Auto-mode claims whose GarageNode slot was scaled down and later
+                  recreated. Entries are removed after the replacement binds the exact PVC.
+                items:
+                  description: |-
+                    AutoModePVCHandoffStatus authorizes one exact retained PVC incarnation to
+                    move from a deleted Auto-mode GarageNode to its replacement. The parent
+                    GarageCluster status is the trust boundary: predictable object names and
+                    user-writable labels or annotations are never sufficient to adopt a claim.
+                  properties:
+                    previousGarageNodeUid:
+                      description: |-
+                        PreviousGarageNodeUID is the exact deleted GarageNode incarnation that
+                        reserved the claim.
+                      type: string
+                    pvcName:
+                      description: PVCName and PVCUID identify the exact retained
+                        claim incarnation.
+                      type: string
+                    pvcUid:
+                      type: string
+                    replacementGarageNodeUid:
+                      description: |-
+                        ReplacementGarageNodeUID is the only new GarageNode incarnation allowed
+                        to consume this handoff.
+                      type: string
+                    replacementReservationHash:
+                      description: |-
+                        ReplacementReservationHash is a one-way commitment to the nonce placed
+                        on the controller-created replacement GarageNode. It closes the crash gap
+                        between Create and recording the replacement object's API-server UID.
+                      type: string
+                    slotName:
+                      description: SlotName is the stable Auto-mode slot (for example,
+                        cluster-gateway-1).
+                      type: string
+                  required:
+                  - previousGarageNodeUid
+                  - pvcName
+                  - pvcUid
+                  - slotName
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - pvcName
+                x-kubernetes-list-type: map
               blockErrorDetails:
                 description: BlockErrorDetails provides detailed information about
                   block errors.

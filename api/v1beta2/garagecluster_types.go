@@ -1590,6 +1590,32 @@ type StorageRolloutPersistentVolumeClaimStatus struct {
 	UID string `json:"uid"`
 }
 
+// AutoModePVCHandoffStatus authorizes one exact retained PVC incarnation to
+// move from a deleted Auto-mode GarageNode to its replacement. The parent
+// GarageCluster status is the trust boundary: predictable object names and
+// user-writable labels or annotations are never sufficient to adopt a claim.
+type AutoModePVCHandoffStatus struct {
+	// SlotName is the stable Auto-mode slot (for example, cluster-gateway-1).
+	SlotName string `json:"slotName"`
+
+	// PVCName and PVCUID identify the exact retained claim incarnation.
+	PVCName string `json:"pvcName"`
+	PVCUID  string `json:"pvcUid"`
+
+	// PreviousGarageNodeUID is the exact deleted GarageNode incarnation that
+	// reserved the claim.
+	PreviousGarageNodeUID string `json:"previousGarageNodeUid"`
+
+	// ReplacementReservationHash is a one-way commitment to the nonce placed
+	// on the controller-created replacement GarageNode. It closes the crash gap
+	// between Create and recording the replacement object's API-server UID.
+	ReplacementReservationHash string `json:"replacementReservationHash,omitempty"`
+
+	// ReplacementGarageNodeUID is the only new GarageNode incarnation allowed
+	// to consume this handoff.
+	ReplacementGarageNodeUID string `json:"replacementGarageNodeUid,omitempty"`
+}
+
 // StorageDrainActorStatus identifies the one Kubernetes object authorized to
 // advance a storage-drain transaction. UID is the ownership boundary: names
 // and namespaces can be reused after deletion.
@@ -1844,6 +1870,14 @@ type GarageClusterStatus struct {
 	// exact actor completes its Kubernetes handoff.
 	// +optional
 	StorageDrain *StorageDrainStatus `json:"storageDrain,omitempty"`
+
+	// AutoModePVCHandoffs are controller-owned, exact-UID authorizations for
+	// retained Auto-mode claims whose GarageNode slot was scaled down and later
+	// recreated. Entries are removed after the replacement binds the exact PVC.
+	// +optional
+	// +listType=map
+	// +listMapKey=pvcName
+	AutoModePVCHandoffs []AutoModePVCHandoffStatus `json:"autoModePvcHandoffs,omitempty"`
 
 	// ScrubStatus contains the status of data scrub operations.
 	// +optional

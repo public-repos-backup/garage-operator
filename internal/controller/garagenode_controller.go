@@ -63,11 +63,12 @@ import (
 const finalizeOrphanedTimeout = 5 * time.Second
 
 const (
-	garageNodeFinalizer         = "garagenode.garage.rajsingh.info/finalizer"
-	managedPVCNodeUIDAnnotation = "garage.rajsingh.info/garage-node-uid"
-	managedPVCNonceAnnotation   = "garage.rajsingh.info/pvc-reservation-nonce"
-	managedPVCFinalizer         = "garagenode.garage.rajsingh.info/pvc-reservation"
-	nodeValue                   = "node"
+	garageNodeFinalizer               = "garagenode.garage.rajsingh.info/finalizer"
+	managedPVCNodeUIDAnnotation       = "garage.rajsingh.info/garage-node-uid"
+	managedPVCNonceAnnotation         = "garage.rajsingh.info/pvc-reservation-nonce"
+	autoModePVCHandoffNonceAnnotation = "garage.rajsingh.info/auto-mode-pvc-handoff-nonce"
+	managedPVCFinalizer               = "garagenode.garage.rajsingh.info/pvc-reservation"
+	nodeValue                         = "node"
 )
 
 // errUnsafeLayoutRoleRemoval marks a finalization failure that must not consume
@@ -1696,6 +1697,34 @@ func (r *GarageNodeReconciler) ensureManagedNodePVCProvenance(
 	record, recorded, err := managedNodePVCReservation(node, pvc.Name)
 	if err != nil {
 		return err
+	}
+	handoff, handoffErr := retainedAutoModePVCHandoff(cluster, node, pvc)
+	if handoffErr != nil {
+		return handoffErr
+	}
+	if handoff != nil {
+		if recorded && record.UID != "" && record.UID != pvc.UID {
+			return fmt.Errorf("refusing retained Auto-mode PVC %s/%s UID %s because replacement GarageNode status records UID %s", pvc.Namespace, pvc.Name, pvc.UID, record.UID)
+		}
+		if err := r.ensureManagedNodePVCReplacementBarrier(ctx, pvc, node); err != nil {
+			return err
+		}
+		if !recorded || record.UID == "" {
+			if err := r.persistManagedNodePVCUID(ctx, node, pvc); err != nil {
+				return err
+			}
+		}
+		if pvc.Annotations[managedPVCNodeUIDAnnotation] != string(node.UID) {
+			patch := client.MergeFrom(pvc.DeepCopy())
+			if pvc.Annotations == nil {
+				pvc.Annotations = map[string]string{}
+			}
+			pvc.Annotations[managedPVCNodeUIDAnnotation] = string(node.UID)
+			if err := r.Patch(ctx, pvc, patch); err != nil {
+				return fmt.Errorf("transferring retained Auto-mode PVC %s/%s to GarageNode UID %s: %w", pvc.Namespace, pvc.Name, node.UID, err)
+			}
+		}
+		return nil
 	}
 	if recorded && record.UID != "" {
 		if pvc.UID == "" || pvc.UID != record.UID {

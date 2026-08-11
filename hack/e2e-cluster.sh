@@ -3625,6 +3625,19 @@ test_cluster_deletion() {
 test_recreate_after_deletion() {
     log_test "Testing cluster recreation after deletion..."
 
+    # The default Retain policy deliberately leaves managed claims behind after
+    # deleting the entire GarageCluster. The old parent and GarageNode status —
+    # the controller-owned proof of those exact PVC UIDs — is gone, so a new
+    # same-name cluster must not infer ownership from predictable names or
+    # writable annotations. This test exercises a genuinely fresh recreation;
+    # remove the isolated fixture's retained claims explicitly first.
+    if ! kubectl delete pvc -n "$NAMESPACE" \
+        -l 'garage.rajsingh.info/cluster=garage,app.kubernetes.io/managed-by=garage-operator' \
+        --ignore-not-found --wait=true --timeout=120s; then
+        test_fail "Cluster recreation could not remove the deleted fixture's retained PVCs"
+        return 1
+    fi
+
     # Re-apply test resources
     kubectl apply -f hack/test-resources.yaml
 

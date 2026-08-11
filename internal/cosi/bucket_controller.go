@@ -23,8 +23,11 @@ import (
 	"slices"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,12 +40,15 @@ import (
 // +kubebuilder:rbac:groups=objectstorage.k8s.io,resources=buckets,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=objectstorage.k8s.io,resources=buckets/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=objectstorage.k8s.io,resources=buckets/finalizers,verbs=update
+// +kubebuilder:rbac:groups=objectstorage.k8s.io,resources=bucketclaims,verbs=get
+// +kubebuilder:rbac:groups=objectstorage.k8s.io,resources=bucketclaims/status,verbs=get;update;patch
 
 // BucketReconciler reconciles cosiv1alpha2.Bucket objects whose Spec.DriverName
 // matches DriverName. It manages the protection finalizer and delegates
 // Garage-side bucket lifecycle to Provisioner.
 type BucketReconciler struct {
 	client.Client
+	APIReader   client.Reader
 	Scheme      *runtime.Scheme
 	DriverName  string
 	Namespace   string // namespace for shadow GarageBucket resources
@@ -50,6 +56,13 @@ type BucketReconciler struct {
 	// WatchNamespaces limits new provisioning to BucketClaims in the manager's
 	// configured namespace scope. Empty means cluster-wide.
 	WatchNamespaces []string
+}
+
+func (r *BucketReconciler) safetyReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 func (r *BucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -171,21 +184,96 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (rec
 		return r.fail(ctx, bucket, err)
 	}
 
-	bucket.Status.ReadyToUse = ptr.To(true)
-	bucket.Status.BucketID = result.BucketID
-	bucket.Status.Protocols = []cosiv1alpha2.ObjectProtocol{cosiv1alpha2.ObjectProtocolS3}
-	bucket.Status.BucketInfo = map[string]string{
-		string(cosiv1alpha2.BucketInfoVar_S3_BucketId):        result.GlobalAlias,
-		string(cosiv1alpha2.BucketInfoVar_S3_Endpoint):        result.Endpoint,
-		string(cosiv1alpha2.BucketInfoVar_S3_Region):          result.Region,
-		string(cosiv1alpha2.BucketInfoVar_S3_AddressingStyle): "path",
+	desiredStatus := cosiv1alpha2.BucketStatus{
+		ReadyToUse: ptr.To(true),
+		BucketID:   result.BucketID,
+		Protocols:  []cosiv1alpha2.ObjectProtocol{cosiv1alpha2.ObjectProtocolS3},
+		BucketInfo: map[string]string{
+			string(cosiv1alpha2.BucketInfoVar_S3_BucketId):        result.GlobalAlias,
+			string(cosiv1alpha2.BucketInfoVar_S3_Endpoint):        result.Endpoint,
+			string(cosiv1alpha2.BucketInfoVar_S3_Region):          result.Region,
+			string(cosiv1alpha2.BucketInfoVar_S3_AddressingStyle): "path",
+		},
 	}
-	bucket.Status.Error = nil
-	if err := r.Status().Update(ctx, bucket); err != nil {
+	if !equality.Semantic.DeepEqual(bucket.Status, desiredStatus) {
+		bucket.Status = desiredStatus
+		if err := r.Status().Update(ctx, bucket); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+	claimReady, err := r.syncBoundBucketClaimReady(ctx, bucket)
+	if err != nil {
 		return reconcile.Result{}, err
+	}
+	if !claimReady {
+		return reconcile.Result{RequeueAfter: time.Second}, nil
 	}
 	logger.Info("Bucket ready", "bucketId", result.BucketID)
 	return reconcile.Result{}, nil
+}
+
+// syncBoundBucketClaimReady closes a gap in the pinned upstream COSI
+// controller: BucketClaimReconciler does not watch Bucket status changes and
+// relies on error backoff while provisioning is pending. A long provisioning
+// or restart-recovery window can therefore leave a successfully provisioned
+// BucketClaim false for many minutes. Mirror only a successful Bucket status
+// into the exact UID-bound, already-bound claim; the upstream controller keeps
+// ownership of binding, deletion, and all failure states.
+func (r *BucketReconciler) syncBoundBucketClaimReady(
+	ctx context.Context, bucket *cosiv1alpha2.Bucket,
+) (bool, error) {
+	ref := bucket.Spec.BucketClaimRef
+	if ref.Name == "" || ref.Namespace == "" || ref.UID == "" {
+		return false, fmt.Errorf("cannot publish Bucket readiness without an exact BucketClaim reference")
+	}
+
+	ready := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		claim := &cosiv1alpha2.BucketClaim{}
+		key := types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}
+		if err := r.safetyReader().Get(ctx, key, claim); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Claim deletion races with Bucket deletion. There is no readiness
+				// consumer left to wake, and the Bucket finalizer will handle cleanup.
+				ready = true
+				return nil
+			}
+			return err
+		}
+		if claim.UID != ref.UID {
+			return fmt.Errorf("bucket %s references BucketClaim %s UID %s, current UID is %s",
+				bucket.Name, key, ref.UID, claim.UID)
+		}
+		if !claim.DeletionTimestamp.IsZero() {
+			ready = true
+			return nil
+		}
+		if claim.Status.BoundBucketName == "" {
+			// Binding is owned by the upstream controller. Requeue this Bucket
+			// briefly and publish readiness once that exact binding exists.
+			return nil
+		}
+		if claim.Status.BoundBucketName != bucket.Name {
+			return fmt.Errorf("bucket claim %s UID %s is bound to %q, not Bucket %q",
+				key, claim.UID, claim.Status.BoundBucketName, bucket.Name)
+		}
+		if ptr.Deref(claim.Status.ReadyToUse, false) &&
+			slices.Equal(claim.Status.Protocols, bucket.Status.Protocols) &&
+			claim.Status.Error == nil {
+			ready = true
+			return nil
+		}
+
+		claim.Status.ReadyToUse = ptr.To(true)
+		claim.Status.Protocols = append([]cosiv1alpha2.ObjectProtocol(nil), bucket.Status.Protocols...)
+		claim.Status.Error = nil
+		if err := r.Status().Update(ctx, claim); err != nil {
+			return err
+		}
+		ready = true
+		return nil
+	})
+	return ready, err
 }
 
 func (r *BucketReconciler) watchesNamespace(namespace string) bool {
