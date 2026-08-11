@@ -2385,7 +2385,10 @@ test_single_replica_federation() {
     local c2_phase=""
     local c1_connected=0
     local c2_connected=0
-    local phase_deadline=$((SECONDS + 60))
+    # Status publication may follow the successful shared apply on the
+    # controller's periodic requeue. Use the script-wide convergence timeout
+    # so a requeue landing just beyond one minute cannot create a false failure.
+    local phase_deadline=$((SECONDS + TIMEOUT))
     while [ "$SECONDS" -lt "$phase_deadline" ]; do
         c1_phase=$(kubectl --context "kind-$CLUSTER1_NAME" get garagecluster garage \
             -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
