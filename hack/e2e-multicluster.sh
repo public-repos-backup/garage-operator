@@ -2311,59 +2311,73 @@ test_single_replica_federation() {
     log_info "  Verified Cluster 1 targets Cluster 2 pod $c2_pod_ip"
     log_info "  Verified Cluster 2 targets Cluster 1 pod $c1_pod_ip"
 
-    # The key test: Verify the operator ATTEMPTS to apply layout despite having only 1 node < replicationFactor
-    # Without the fix, operator would block at "Waiting for more nodes" and never try
-    # With the fix, operator attempts apply (Garage may reject if federation hasn't connected yet)
+    # The key test: Verify an operator ATTEMPTS to apply the shared Garage layout
+    # despite each Kubernetes cluster having only 1 node < replicationFactor.
+    # Either site may win the apply race because both operators mutate the same
+    # Garage layout. The losing site can briefly hold stale Kubernetes status
+    # while its GarageNode reconciler owns that process's layout lock, so wait
+    # for evidence of progress from either site instead of requiring both
+    # controller logs/status objects to independently report the shared apply.
     log_test "Testing operator attempts layout apply with single replica (replicationFactor=2, remoteClusters configured)..."
 
-    sleep 15  # Allow reconciliation
+    # With the fix, one operator logs a federated apply attempt/success or one
+    # status observes the resulting committed layout. Without the fix, both
+    # operators remain at "Waiting for more nodes" indefinitely.
+    local c1_logs=""
+    local c2_logs=""
+    local c1_layout_version=""
+    local c2_layout_version=""
+    local layout_progress=""
+    local layout_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$layout_deadline" ]; do
+        c1_logs=$(kubectl --context "kind-$CLUSTER1_NAME" logs \
+            -l app.kubernetes.io/name=garage-operator -n "$NAMESPACE" \
+            --since-time="$reconciliation_since" 2>/dev/null || true)
+        c2_logs=$(kubectl --context "kind-$CLUSTER2_NAME" logs \
+            -l app.kubernetes.io/name=garage-operator -n "$NAMESPACE" \
+            --since-time="$reconciliation_since" 2>/dev/null || true)
+        c1_layout_version=$(kubectl --context "kind-$CLUSTER1_NAME" get garagecluster garage \
+            -n "$NAMESPACE" -o jsonpath='{.status.layoutVersion}' 2>/dev/null || true)
+        c2_layout_version=$(kubectl --context "kind-$CLUSTER2_NAME" get garagecluster garage \
+            -n "$NAMESPACE" -o jsonpath='{.status.layoutVersion}' 2>/dev/null || true)
 
-    # Check operator logs for the key behavior indicator
-    # With fix: "Applying layout despite insufficient nodes (remoteClusters configured"
-    # Without fix: "Waiting for more nodes before applying layout"
-    local c1_logs
-    local c2_logs
-    c1_logs=$(kubectl --context "kind-$CLUSTER1_NAME" logs \
-        -l app.kubernetes.io/name=garage-operator -n "$NAMESPACE" \
-        --since-time="$reconciliation_since" 2>/dev/null)
-    c2_logs=$(kubectl --context "kind-$CLUSTER2_NAME" logs \
-        -l app.kubernetes.io/name=garage-operator -n "$NAMESPACE" \
-        --since-time="$reconciliation_since" 2>/dev/null)
+        if grep -q "Applied federated layout" <<<"$c1_logs"; then
+            layout_progress="Cluster 1 committed the shared federated layout"
+            break
+        fi
+        if grep -q "Applied federated layout" <<<"$c2_logs"; then
+            layout_progress="Cluster 2 committed the shared federated layout"
+            break
+        fi
+        if grep -q "Applying layout despite insufficient nodes" <<<"$c1_logs"; then
+            layout_progress="Cluster 1 operator attempted the shared layout apply"
+            break
+        fi
+        if grep -q "Applying layout despite insufficient nodes" <<<"$c2_logs"; then
+            layout_progress="Cluster 2 operator attempted the shared layout apply"
+            break
+        fi
+        if [[ "$c1_layout_version" =~ ^[0-9]+$ ]] && [ "$c1_layout_version" -gt 0 ]; then
+            layout_progress="Cluster 1 observed committed shared layout version $c1_layout_version"
+            break
+        fi
+        if [[ "$c2_layout_version" =~ ^[0-9]+$ ]] && [ "$c2_layout_version" -gt 0 ]; then
+            layout_progress="Cluster 2 observed committed shared layout version $c2_layout_version"
+            break
+        fi
+        sleep 3
+    done
 
-    if echo "$c1_logs" | grep -q "Applying layout despite insufficient nodes"; then
-        test_pass "Single-replica test: Cluster 1 operator correctly attempts layout apply with remoteClusters"
-    elif echo "$c1_logs" | grep -q "Waiting for more nodes before applying layout"; then
-        test_fail "Single-replica test: Cluster 1 DEADLOCK BUG - operator waiting for nodes instead of attempting apply"
+    if [ -n "$layout_progress" ]; then
+        test_pass "Single-replica test: $layout_progress"
+    elif grep -q "Waiting for more nodes before applying layout" <<<"$c1_logs" &&
+        grep -q "Waiting for more nodes before applying layout" <<<"$c2_logs"; then
+        test_fail "Single-replica test: DEADLOCK BUG - both operators waited for nodes instead of attempting the shared layout"
         log_error "The multi-cluster federation fix is not working!"
         return 1
     else
-        # May have already applied if federation connected fast enough
-        local c1_layout_version
-        c1_layout_version=$(kubectl --context "kind-$CLUSTER1_NAME" get garagecluster garage \
-            -n "$NAMESPACE" -o jsonpath='{.status.layoutVersion}' 2>/dev/null)
-        if [ -n "$c1_layout_version" ] && [ "$c1_layout_version" -gt 0 ] 2>/dev/null; then
-            test_pass "Single-replica test: Cluster 1 layout already applied (version $c1_layout_version)"
-        else
-            test_fail "Single-replica test: Cluster 1 neither attempted nor applied the layout"
-            return 1
-        fi
-    fi
-
-    if echo "$c2_logs" | grep -q "Applying layout despite insufficient nodes"; then
-        test_pass "Single-replica test: Cluster 2 operator correctly attempts layout apply with remoteClusters"
-    elif echo "$c2_logs" | grep -q "Waiting for more nodes before applying layout"; then
-        test_fail "Single-replica test: Cluster 2 DEADLOCK BUG - operator waiting for nodes instead of attempting apply"
+        test_fail "Single-replica test: no shared layout attempt or commit observed (c1 version: ${c1_layout_version:-missing}, c2 version: ${c2_layout_version:-missing})"
         return 1
-    else
-        local c2_layout_version
-        c2_layout_version=$(kubectl --context "kind-$CLUSTER2_NAME" get garagecluster garage \
-            -n "$NAMESPACE" -o jsonpath='{.status.layoutVersion}' 2>/dev/null)
-        if [ -n "$c2_layout_version" ] && [ "$c2_layout_version" -gt 0 ] 2>/dev/null; then
-            test_pass "Single-replica test: Cluster 2 layout already applied (version $c2_layout_version)"
-        else
-            test_fail "Single-replica test: Cluster 2 neither attempted nor applied the layout"
-            return 1
-        fi
     fi
 
     # Require both clusters to reach Running and see the opposite Garage peer.
