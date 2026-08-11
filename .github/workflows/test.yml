@@ -98,7 +98,9 @@ jobs:
         with:
           repo: yannh/kubeconform
           tag: v0.8.0
-          asset-name: kubeconform-linux-amd64.tar.gz
+          # v3 also filters extracted filenames by this value. Keep it broad
+          # enough to match both the release archive and its kubeconform binary.
+          asset-name: kubeconform
           digest: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
 
       - name: Validate generated schemas against all samples
