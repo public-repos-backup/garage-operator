@@ -171,6 +171,20 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return ctrl.Result{}, err
 	}
+	// Finalization can persist a storage-drain transaction and immediately be
+	// requeued by an older informer event. Re-read deleting objects directly from
+	// the API server so a stale cached snapshot cannot forget that transaction and
+	// release workloads while Garage's role-removal layout is still draining.
+	if !cluster.DeletionTimestamp.IsZero() && r.APIReader != nil {
+		authoritative := &garagev1beta2.GarageCluster{}
+		if err := r.APIReader.Get(ctx, req.NamespacedName, authoritative); err != nil {
+			if errors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("re-reading deleting GarageCluster from the API server: %w", err)
+		}
+		adoptGarageClusterSnapshot(cluster, authoritative)
+	}
 	if cluster.DeletionTimestamp.IsZero() && cluster.Spec.ConnectTo != nil && cluster.Spec.ConnectTo.ClusterRef != nil {
 		if cluster.Spec.ConnectTo.ClusterRef.KubeConfigSecretRef != nil {
 			return r.updateStatus(ctx, cluster, PhaseFailed, fmt.Errorf(

@@ -246,6 +246,7 @@ if docker container inspect "$GARAGE_CONTAINER" >/dev/null 2>&1; then
 fi
 GARAGE_CONTAINER_ID=$(docker run -d \
     --name "$GARAGE_CONTAINER" \
+    --user "$(id -u):$(id -g)" \
     --network "$DOCKER_NETWORK" \
     --ip "$GARAGE_STATIC_IP" \
     -v "$TMPDIR_GARAGE/garage.toml:/etc/garage.toml:ro" \
