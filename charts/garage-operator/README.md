@@ -13,7 +13,10 @@ A Kubernetes operator for managing [Garage](https://garagehq.deuxfleurs.fr/) - a
 - cert-manager for admission and conversion webhook certificates, unless
   `webhooks.enabled=false`. That disabled mode is limited to local development
   or simple v1beta2-only installs; it is unsupported for `nodeLocalPools` and
-  removes the admission boundary for prepared storage deletion.
+  removes the admission boundary for prepared storage deletion. It also
+  rejects controller-managed persistent claims. `EmptyDir` remains available;
+  explicit `existingClaim` volumes can be mounted, but PVC-backed rollout and
+  recovery remain fenced until admission is enabled.
 - (Optional) Prometheus Operator for ServiceMonitor and PrometheusRule resources
 
 > `appVersion` tracks the **operator** version, not Garage. The Garage version
@@ -61,6 +64,7 @@ See [values.yaml](values.yaml) for the full list of configurable parameters.
 | `replicaCount` | Number of operator replicas | `1` |
 | `image.repository` | Container image repository | `ghcr.io/rajsinghtech/garage-operator` |
 | `image.tag` | Image tag (defaults to chart appVersion) | `""` |
+| `image.digest` | Immutable `sha256:` image digest (takes precedence over tag) | `""` |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `defaultGarageImage` | Default Garage image for GarageCluster/GarageNode resources that omit `spec.image` | `""` |
 | `resources.limits.cpu` | CPU limit | `500m` |
@@ -96,8 +100,8 @@ See [values.yaml](values.yaml) for the full list of configurable parameters.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `webhooks.enabled` | Enable admission and conversion webhooks; required for `nodeLocalPools` and admission-protected storage deletion | `true` |
-| `webhooks.failurePolicy` | Webhook failure policy | `Fail` |
+| `webhooks.enabled` | Enable admission and conversion webhooks; required for `nodeLocalPools`, managed persistent claims, and admission-protected storage deletion | `true` |
+| `webhooks.failurePolicy` | Ordinary webhook failure policy; managed-PVC identity protection always uses `Fail` | `Fail` |
 | `webhooks.certManager.enabled` | Use cert-manager for certificates | `true` |
 
 ### Namespace Scoping & COSI
@@ -108,6 +112,7 @@ See [values.yaml](values.yaml) for the full list of configurable parameters.
 | `watchAnyNamespace` | Force cluster-wide watching when `watchNamespaces` is set | `false` |
 | `cosi.enabled` | Enable the optional COSI driver | `false` |
 | `cosi.driverName` | COSI driver name used by BucketClass/BucketAccessClass | `garage.rajsingh.info` |
+| `cosi.namespace` | Namespace for COSI shadow GarageBucket/GarageKey resources; cross-namespace target clusters require a GarageReferenceGrant | release namespace |
 | `extraObjects` | Extra templated Kubernetes objects to render with the chart | `[]` |
 
 ## Usage

@@ -132,6 +132,9 @@ func (r *GarageClusterReconciler) requireStorageRolloutPersistentVolumeClaimProt
 	cluster *garagev1beta2.GarageCluster,
 	record nodeLocalPoolRolloutRecord,
 ) error {
+	if err := r.requireStorageRolloutPVCAdmission(record); err != nil {
+		return err
+	}
 	if err := r.validateStorageRolloutPersistentVolumeClaims(ctx, cluster.Namespace, record); err != nil {
 		return err
 	}
@@ -173,11 +176,21 @@ func statefulSetWorkloadRecreationSafe(statefulSet *appsv1.StatefulSet) bool {
 	return statefulSet.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted != appsv1.DeletePersistentVolumeClaimRetentionPolicyType
 }
 
+func (r *GarageClusterReconciler) requireStorageRolloutPVCAdmission(record nodeLocalPoolRolloutRecord) error {
+	if r.ManagedPVCAdmissionDisabled && len(record.PersistentVolumeClaims) > 0 {
+		return errors.NewBadRequest("PVC-backed storage rollout and recovery require enabled admission webhooks to protect exact claim identities")
+	}
+	return nil
+}
+
 func (r *GarageClusterReconciler) protectStorageRolloutPersistentVolumeClaims(
 	ctx context.Context,
 	cluster *garagev1beta2.GarageCluster,
 	record nodeLocalPoolRolloutRecord,
 ) error {
+	if err := r.requireStorageRolloutPVCAdmission(record); err != nil {
+		return err
+	}
 	if len(record.PersistentVolumeClaims) == 0 {
 		return nil
 	}
@@ -735,6 +748,9 @@ func (r *GarageClusterReconciler) rollForwardStorageRollout(
 	if err != nil || record == nil {
 		return err
 	}
+	if err := r.requireStorageRolloutPVCAdmission(*record); err != nil {
+		return err
+	}
 	layoutOwner, err := resolveGarageLayoutOwner(ctx, r.nodeLocalPoolReader(), cluster)
 	if err != nil {
 		return fmt.Errorf("resolving canonical Garage layout owner for rollout recovery: %w", err)
@@ -849,7 +865,8 @@ func (r *GarageClusterReconciler) rollForwardStorageRollout(
 		nodeReconciler := &GarageNodeReconciler{
 			Client: r.Client, APIReader: r.APIReader, Scheme: r.Scheme,
 			ClusterDomain: r.ClusterDomain, DefaultImage: r.DefaultImage,
-			ClusterScoped: r.ClusterScoped, LayoutMutations: r.LayoutMutations,
+			ManagedPVCAdmissionDisabled: r.ManagedPVCAdmissionDisabled,
+			ClusterScoped:               r.ClusterScoped, LayoutMutations: r.LayoutMutations,
 		}
 		if nodeHasConfigOverrides(node) {
 			if err := nodeReconciler.reconcileNodeConfigMap(ctx, node, cluster); err != nil {
@@ -914,6 +931,9 @@ func (r *GarageClusterReconciler) ensureStorageRolloutWorkload(
 	cluster *garagev1beta2.GarageCluster,
 	record nodeLocalPoolRolloutRecord,
 ) (bool, error) {
+	if err := r.requireStorageRolloutPVCAdmission(record); err != nil {
+		return false, err
+	}
 	node, kubernetesNode, err := r.readStorageRolloutActorIdentity(ctx, cluster, record)
 	if err != nil {
 		return false, err
@@ -999,7 +1019,8 @@ func (r *GarageClusterReconciler) ensureStorageRolloutWorkload(
 		nodeReconciler := &GarageNodeReconciler{
 			Client: r.Client, APIReader: r.APIReader, Scheme: r.Scheme,
 			ClusterDomain: r.ClusterDomain, DefaultImage: r.DefaultImage,
-			ClusterScoped: r.ClusterScoped, LayoutMutations: r.LayoutMutations,
+			ManagedPVCAdmissionDisabled: r.ManagedPVCAdmissionDisabled,
+			ClusterScoped:               r.ClusterScoped, LayoutMutations: r.LayoutMutations,
 		}
 		if nodeHasConfigOverrides(node) {
 			if err := nodeReconciler.reconcileNodeConfigMap(ctx, node, cluster); err != nil {
@@ -1372,6 +1393,9 @@ func (r *GarageClusterReconciler) unfenceAdoptedStorageRolloutWorkload(
 	cluster *garagev1beta2.GarageCluster,
 	record nodeLocalPoolRolloutRecord,
 ) error {
+	if err := r.requireStorageRolloutPVCAdmission(record); err != nil {
+		return err
+	}
 	node, _, err := r.readStorageRolloutActorIdentity(ctx, cluster, record)
 	if err != nil {
 		return err
@@ -1537,7 +1561,8 @@ func (r *GarageClusterReconciler) unfenceAdoptedStorageRolloutWorkload(
 			nodeReconciler := &GarageNodeReconciler{
 				Client: r.Client, APIReader: r.APIReader, Scheme: r.Scheme,
 				ClusterDomain: r.ClusterDomain, DefaultImage: r.DefaultImage,
-				ClusterScoped: r.ClusterScoped, LayoutMutations: r.LayoutMutations,
+				ManagedPVCAdmissionDisabled: r.ManagedPVCAdmissionDisabled,
+				ClusterScoped:               r.ClusterScoped, LayoutMutations: r.LayoutMutations,
 			}
 			if nodeHasConfigOverrides(node) {
 				if err := nodeReconciler.reconcileNodeConfigMap(ctx, node, cluster); err != nil {

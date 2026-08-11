@@ -113,11 +113,13 @@ var _ = Describe("BucketReconciler", func() {
 			By("creating the COSI Bucket resource")
 			bucket := &cosiv1alpha2.Bucket{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: bucketName,
+					Name:       bucketName,
+					Finalizers: []string{cosiv1alpha2.ProtectionFinalizer},
 				},
 				Spec: cosiv1alpha2.BucketSpec{
 					DriverName:     cosiTestDriver,
 					DeletionPolicy: cosiv1alpha2.BucketDeletionPolicyDelete,
+					Protocols:      []cosiv1alpha2.ObjectProtocol{cosiv1alpha2.ObjectProtocolS3},
 					Parameters: map[string]string{
 						paramClusterRef:       cosiClusterName,
 						paramClusterNamespace: cosiGarageNS,
@@ -125,6 +127,7 @@ var _ = Describe("BucketReconciler", func() {
 					BucketClaimRef: cosiv1alpha2.BucketClaimReference{
 						Name:      "test-claim",
 						Namespace: cosiTestNamespace,
+						UID:       types.UID("11111111-1111-1111-1111-111111111111"),
 					},
 				},
 			}
@@ -148,6 +151,7 @@ var _ = Describe("BucketReconciler", func() {
 			Expect(err).NotTo(HaveOccurred())
 			withFinalizer := &cosiv1alpha2.Bucket{}
 			Expect(k8sClient.Get(ctx, nn, withFinalizer)).To(Succeed())
+			Expect(withFinalizer.Finalizers).To(ContainElement(GarageProtectionFinalizer))
 			Expect(withFinalizer.Finalizers).To(ContainElement(cosiv1alpha2.ProtectionFinalizer))
 
 			By("second reconcile provisions bucket")
@@ -160,9 +164,11 @@ var _ = Describe("BucketReconciler", func() {
 			Expect(updated.Status.ReadyToUse).NotTo(BeNil())
 			Expect(*updated.Status.ReadyToUse).To(BeTrue())
 			Expect(updated.Status.BucketID).NotTo(BeEmpty())
+			Expect(updated.Status.BucketInfo).To(HaveKeyWithValue(string(cosiv1alpha2.BucketInfoVar_S3_Endpoint), cosiS3Endpoint))
+			Expect(updated.Status.BucketInfo).To(HaveKeyWithValue(string(cosiv1alpha2.BucketInfoVar_S3_AddressingStyle), "path"))
 
 			By("verifying protection finalizer is present")
-			Expect(updated.Finalizers).To(ContainElement(cosiv1alpha2.ProtectionFinalizer))
+			Expect(updated.Finalizers).To(ContainElement(GarageProtectionFinalizer))
 
 			By("verifying a shadow GarageBucket was created")
 			gbList := &garagev1beta1.GarageBucketList{}
@@ -220,7 +226,7 @@ var _ = Describe("BucketReconciler", func() {
 			// No finalizer should be added, status should be unchanged
 			updated := &cosiv1alpha2.Bucket{}
 			Expect(k8sClient.Get(ctx, nn, updated)).To(Succeed())
-			Expect(updated.Finalizers).NotTo(ContainElement(cosiv1alpha2.ProtectionFinalizer))
+			Expect(updated.Finalizers).NotTo(ContainElement(GarageProtectionFinalizer))
 		})
 	})
 })

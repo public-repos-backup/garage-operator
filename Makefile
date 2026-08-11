@@ -105,9 +105,13 @@ dev-run: install ## Run operator locally against the dev cluster (without deploy
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+	@find config/crd/bases -maxdepth 1 -type f -name '*.yaml' -delete
+	@find config/rbac -maxdepth 1 -type f -name 'role.yaml' -delete
+	@find config/webhook -maxdepth 1 -type f -name 'manifests.yaml' -delete
 	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./api/..." paths="./internal/..." paths="./cmd/..." output:crd:artifacts:config=config/crd/bases
 	@python3 hack/preserve-crd-compat-versions.py
 	@if [ -d "$(HELM_CHART_DIR)/crd-bases" ]; then \
+		find "$(HELM_CHART_DIR)/crd-bases" -maxdepth 1 -type f -name '*.yaml' -delete && \
 		cp config/crd/bases/*.yaml $(HELM_CHART_DIR)/crd-bases/ && \
 		echo "CRDs synced to Helm chart"; \
 	fi
@@ -121,10 +125,12 @@ schemas: ## Generate JSON schemas from CRDs for editor validation (also runs as 
 validate-manifests: schemas ## Validate sample manifests against JSON schemas (requires kubeconform)
 	@command -v kubeconform >/dev/null 2>&1 || { echo "kubeconform not found. Install with: brew install kubeconform"; exit 1; }
 	kubeconform -strict -summary \
+		-kubernetes-version 1.25.0 \
 		-schema-location default \
 		-schema-location 'schemas/{{ .ResourceKind }}_{{ .ResourceAPIVersion }}.json' \
 		-ignore-filename-pattern 'kustomization.yaml' \
-		config/samples/*.yaml
+		config/samples/*.yaml \
+		config/samples/cosi/garagecluster-e2e.yaml
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -140,7 +146,11 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v '/e2e$$') -coverprofile cover.out
+
+.PHONY: test-race
+test-race: setup-envtest ## Run non-E2E tests with the Go race detector.
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test -race $$(go list ./... | grep -v '/e2e$$') -count=1 -timeout=15m
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
@@ -156,6 +166,17 @@ KIND_CONFIG_E2E ?=
 # GINKGO_LABEL_FILTER selects a subset of e2e specs by Ginkgo label (empty = all).
 # CI sets this per matrix shard to split the suite across parallel Kind clusters.
 GINKGO_LABEL_FILTER ?=
+# Records the exact kube-system UID of the cluster created by setup-test-e2e.
+# cleanup-test-e2e refuses deletion unless the live cluster matches this record.
+KIND_OWNERSHIP_FILE ?= $(LOCALBIN)/.kind-e2e-owner-$(KIND_CLUSTER)
+# Dedicated kubeconfig isolates every E2E mutation from the user's mutable
+# current context. It is retained with the ownership record after a failed run
+# so cleanup can still authenticate the exact cluster it created.
+KIND_KUBECONFIG_FILE ?= $(LOCALBIN)/.kind-e2e-kubeconfig-$(KIND_CLUSTER)
+# A test run requires proof that its owned cluster was actually removed. Direct
+# cleanup remains idempotent when no ownership record exists.
+REQUIRE_E2E_CLEANUP ?= false
+E2E_DEBUG_DIR ?= /tmp/e2e-debug
 # E2E_GO_TIMEOUT must stay BELOW the CI job's timeout-minutes. When the job
 # timeout fires first the runner SIGKILLs the process group and Go never prints
 # its goroutine dump, so a hung spec is indistinguishable from a slow one. Going
@@ -172,31 +193,98 @@ GINKGO_LABEL_FILTER ?=
 E2E_GO_TIMEOUT ?= 50m
 
 .PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
+setup-test-e2e: ## Set up an isolated Kind cluster for e2e tests
 	@command -v $(KIND) >/dev/null 2>&1 || { \
 		echo "Kind is not installed. Please install Kind manually."; \
 		exit 1; \
 	}
-	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
-		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			if [ -n "$(KIND_CONFIG_E2E)" ]; then \
-				$(KIND) create cluster --name $(KIND_CLUSTER) --config "$(KIND_CONFIG_E2E)" $(if $(KIND_NODE_IMAGE),--image "$(KIND_NODE_IMAGE)"); \
-			else \
-				$(KIND) create cluster --name $(KIND_CLUSTER) $(if $(KIND_NODE_IMAGE),--image "$(KIND_NODE_IMAGE)"); \
-			fi ;; \
-	esac
+	@mkdir -p "$(dir $(KIND_OWNERSHIP_FILE))"
+	@clusters="$$( $(KIND) get clusters 2>/dev/null )" || { \
+			echo "ERROR: could not enumerate Kind clusters; preserving any existing ownership state"; \
+			exit 1; \
+		}; \
+	if grep -Fqx -- "$(KIND_CLUSTER)" <<<"$$clusters"; then \
+			echo "ERROR: refusing to reuse pre-existing Kind cluster '$(KIND_CLUSTER)'"; \
+			exit 1; \
+		else \
+				rm -f "$(KIND_OWNERSHIP_FILE)" "$(KIND_KUBECONFIG_FILE)"; \
+				echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
+				if [ -n "$(KIND_CONFIG_E2E)" ]; then \
+					if ! $(KIND) create cluster --name $(KIND_CLUSTER) --kubeconfig "$(KIND_KUBECONFIG_FILE)" --config "$(KIND_CONFIG_E2E)" $(if $(KIND_NODE_IMAGE),--image "$(KIND_NODE_IMAGE)"); then exit 1; fi; \
+				else \
+					if ! $(KIND) create cluster --name $(KIND_CLUSTER) --kubeconfig "$(KIND_KUBECONFIG_FILE)" $(if $(KIND_NODE_IMAGE),--image "$(KIND_NODE_IMAGE)"); then exit 1; fi; \
+				fi; \
+				if ! cluster_uid="$$( KUBECONFIG="$(KIND_KUBECONFIG_FILE)" $(KUBECTL) --context "kind-$(KIND_CLUSTER)" get namespace kube-system \
+					-o jsonpath='{.metadata.uid}' )"; then \
+					echo "ERROR: could not query ownership of newly created Kind cluster '$(KIND_CLUSTER)'"; \
+					KUBECONFIG="$(KIND_KUBECONFIG_FILE)" $(KIND) delete cluster --name $(KIND_CLUSTER) || true; \
+					exit 1; \
+				fi; \
+			if [ -z "$$cluster_uid" ]; then \
+				echo "ERROR: could not record ownership of Kind cluster '$(KIND_CLUSTER)'"; \
+					KUBECONFIG="$(KIND_KUBECONFIG_FILE)" $(KIND) delete cluster --name $(KIND_CLUSTER); \
+				exit 1; \
+			fi; \
+			ownership_tmp="$$(mktemp "$(KIND_OWNERSHIP_FILE).tmp.XXXXXX")"; \
+			printf '%s\n%s\n' "$(KIND_CLUSTER)" "$$cluster_uid" > "$$ownership_tmp"; \
+			mv -f -- "$$ownership_tmp" "$(KIND_OWNERSHIP_FILE)"; \
+	fi
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter="$(GINKGO_LABEL_FILTER)" -timeout $(E2E_GO_TIMEOUT)
-	$(MAKE) cleanup-test-e2e
+test-e2e: manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
+	@if ! $(MAKE) setup-test-e2e; then exit 1; fi; \
+	status=0; \
+	KUBECONFIG="$(KIND_KUBECONFIG_FILE)" KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) \
+		go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter="$(GINKGO_LABEL_FILTER)" -timeout $(E2E_GO_TIMEOUT) || status=$$?; \
+	if [ "$$status" -ne 0 ]; then $(MAKE) dump-test-e2e || true; fi; \
+	cleanup_status=0; $(MAKE) cleanup-test-e2e REQUIRE_E2E_CLEANUP=true || cleanup_status=$$?; \
+	if [ "$$cleanup_status" -ne 0 ]; then $(MAKE) dump-test-e2e || true; fi; \
+	if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
+	exit "$$cleanup_status"
+
+.PHONY: dump-test-e2e
+dump-test-e2e: ## Capture suite-level diagnostics before cleanup (including BeforeSuite failures/timeouts)
+	@mkdir -p "$(E2E_DEBUG_DIR)"; \
+	$(KIND) get clusters > "$(E2E_DEBUG_DIR)/clusters.txt" 2>&1 || true; \
+	if [ ! -f "$(KIND_OWNERSHIP_FILE)" ]; then \
+		echo "No ownership record; refusing to inspect an unowned cluster." > "$(E2E_DEBUG_DIR)/$(KIND_CLUSTER)-ownership.txt"; \
+		exit 0; \
+	fi; \
+	recorded_cluster="$$(sed -n '1p' "$(KIND_OWNERSHIP_FILE)")"; \
+	recorded_uid="$$(sed -n '2p' "$(KIND_OWNERSHIP_FILE)")"; \
+	live_uid="$$( KUBECONFIG="$(KIND_KUBECONFIG_FILE)" $(KUBECTL) --context "kind-$(KIND_CLUSTER)" get namespace kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null || true )"; \
+	if [ "$$recorded_cluster" != "$(KIND_CLUSTER)" ] || [ -z "$$recorded_uid" ] || [ "$$live_uid" != "$$recorded_uid" ]; then \
+		echo "Ownership mismatch; refusing to inspect a replacement cluster." > "$(E2E_DEBUG_DIR)/$(KIND_CLUSTER)-ownership.txt"; \
+		exit 0; \
+	fi; \
+	KUBECONFIG="$(KIND_KUBECONFIG_FILE)" $(KUBECTL) --context "kind-$(KIND_CLUSTER)" get all -A -o wide > "$(E2E_DEBUG_DIR)/$(KIND_CLUSTER)-resources.txt" 2>&1 || true; \
+	KUBECONFIG="$(KIND_KUBECONFIG_FILE)" $(KUBECTL) --context "kind-$(KIND_CLUSTER)" get garagecluster,garagenode,garagebucket,garagekey,garageadmintoken -A -o yaml > "$(E2E_DEBUG_DIR)/$(KIND_CLUSTER)-garage-resources.yaml" 2>&1 || true; \
+	KUBECONFIG="$(KIND_KUBECONFIG_FILE)" $(KUBECTL) --context "kind-$(KIND_CLUSTER)" get events -A --sort-by=.lastTimestamp > "$(E2E_DEBUG_DIR)/$(KIND_CLUSTER)-events.txt" 2>&1 || true; \
+	KUBECONFIG="$(KIND_KUBECONFIG_FILE)" $(KUBECTL) --context "kind-$(KIND_CLUSTER)" logs deployment/garage-operator-controller-manager -n garage-operator-system --tail=2000 > "$(E2E_DEBUG_DIR)/$(KIND_CLUSTER)-operator.log" 2>&1 || true; \
+	KUBECONFIG="$(KIND_KUBECONFIG_FILE)" $(KUBECTL) --context "kind-$(KIND_CLUSTER)" logs deployment/garage-operator-controller-manager -n garage-operator-system --tail=2000 --previous > "$(E2E_DEBUG_DIR)/$(KIND_CLUSTER)-operator-previous.log" 2>&1 || true
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+	@if [ ! -f "$(KIND_OWNERSHIP_FILE)" ]; then \
+		echo "No ownership record for Kind cluster '$(KIND_CLUSTER)'; refusing deletion."; \
+		if [ "$(REQUIRE_E2E_CLEANUP)" = true ]; then exit 1; fi; \
+		exit 0; \
+	fi; \
+	recorded_cluster="$$(sed -n '1p' "$(KIND_OWNERSHIP_FILE)")"; \
+	recorded_uid="$$(sed -n '2p' "$(KIND_OWNERSHIP_FILE)")"; \
+	if ! live_uid="$$( KUBECONFIG="$(KIND_KUBECONFIG_FILE)" $(KUBECTL) --context "kind-$(KIND_CLUSTER)" get namespace kube-system \
+		-o jsonpath='{.metadata.uid}' 2>/dev/null )"; then \
+		echo "Could not query live Kind cluster '$(KIND_CLUSTER)'; preserving ownership record and kubeconfig."; \
+		exit 1; \
+	fi; \
+	if [ "$$recorded_cluster" != "$(KIND_CLUSTER)" ] || [ -z "$$recorded_uid" ] || \
+		[ -z "$$live_uid" ] || [ "$$live_uid" != "$$recorded_uid" ]; then \
+		echo "Ownership record does not match live Kind cluster '$(KIND_CLUSTER)'; refusing deletion."; \
+		if [ "$(REQUIRE_E2E_CLEANUP)" = true ]; then exit 1; fi; \
+		exit 0; \
+	fi; \
+	KUBECONFIG="$(KIND_KUBECONFIG_FILE)" $(KIND) delete cluster --name $(KIND_CLUSTER); \
+	rm -f "$(KIND_OWNERSHIP_FILE)" "$(KIND_KUBECONFIG_FILE)"
 
 .PHONY: test-e2e-cluster
 test-e2e-cluster: ## Run single-cluster E2E tests
@@ -270,24 +358,26 @@ docker-push: ## Push docker image with the manager.
 PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
 .PHONY: docker-buildx
 docker-buildx: ## Build and push docker image for the manager for cross-platform support
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name garage-operator-builder
 	$(CONTAINER_TOOL) buildx use garage-operator-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} .
 	- $(CONTAINER_TOOL) buildx rm garage-operator-builder
-	rm Dockerfile.cross
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
-	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
-	"$(KUSTOMIZE)" build config/default > dist/install.yaml
+	@staging="$$(mktemp -d)"; \
+	trap 'rm -rf -- "$$staging"' EXIT; \
+	cp -a config "$$staging/config"; \
+	cd "$$staging/config/manager" && "$(KUSTOMIZE)" edit set image controller=${IMG}; \
+	"$(KUSTOMIZE)" build "$$staging/config/default" > "$(CURDIR)/dist/install.yaml"
 
 ##@ Helm
 
 HELM_CHART_DIR ?= charts/garage-operator
 HELM_REGISTRY ?= ghcr.io/rajsinghtech/charts
+HELM_PACKAGE_DIR ?= dist
+SOURCE_DATE_EPOCH ?= $(shell git show -s --format=%ct HEAD 2>/dev/null)
 
 .PHONY: helm-lint
 helm-lint: ## Lint Helm chart
@@ -299,10 +389,20 @@ helm-template: ## Render Helm chart templates locally
 
 .PHONY: helm-package
 helm-package: ## Package Helm chart
-	helm package $(HELM_CHART_DIR) -d dist/
+	@test -n "$(SOURCE_DATE_EPOCH)" && [[ "$(SOURCE_DATE_EPOCH)" =~ ^[0-9]+$$ ]] || { \
+		echo "SOURCE_DATE_EPOCH must be a Unix timestamp"; exit 1; \
+	}
+	@mkdir -p "$(HELM_PACKAGE_DIR)"
+	@staging="$$(mktemp -d)"; \
+	trap 'rm -rf -- "$$staging"' EXIT; \
+	chart="$$staging/$$(basename "$(HELM_CHART_DIR)")"; \
+	cp -a "$(HELM_CHART_DIR)" "$$chart"; \
+	find "$$chart" -exec touch --date="@$(SOURCE_DATE_EPOCH)" {} +; \
+	helm package "$$chart" -d "$(HELM_PACKAGE_DIR)"
 
 .PHONY: helm-sync-crd-bases
 helm-sync-crd-bases: manifests ## Sync CRDs from config/crd/bases to Helm chart
+	rm -f $(HELM_CHART_DIR)/crd-bases/*.yaml
 	cp config/crd/bases/*.yaml $(HELM_CHART_DIR)/crd-bases/
 	@echo "CRDs synced to Helm chart"
 
@@ -319,7 +419,10 @@ helm-uninstall: ## Uninstall Helm chart from current cluster
 
 .PHONY: helm-push
 helm-push: helm-package ## Push Helm chart to OCI registry (GHCR)
-	helm push dist/garage-operator-*.tgz oci://$(HELM_REGISTRY)
+	@chart_version="$$(awk '$$1 == "version:" { print $$2; exit }' "$(HELM_CHART_DIR)/Chart.yaml")"; \
+	chart="$(HELM_PACKAGE_DIR)/$$(basename "$(HELM_CHART_DIR)")-$$chart_version.tgz"; \
+	test -f "$$chart" || { echo "Packaged chart not found: $$chart"; exit 1; }; \
+	helm push "$$chart" "oci://$(HELM_REGISTRY)"
 
 .PHONY: chart-bump
 chart-bump: ## Bump Helm chart version+appVersion and image tag. Usage: make chart-bump VERSION=v0.6.18
@@ -339,8 +442,15 @@ release: ## Bump chart, commit, tag, and push in one atomic step. Usage: make re
 ifndef VERSION
 	$(error VERSION is required. Usage: make release VERSION=v0.6.24)
 endif
+	@if [ "$$(git branch --show-current)" != main ]; then \
+		echo "ERROR: releases must be created from the main branch"; exit 1; \
+	fi
 	@if ! git diff --quiet || ! git diff --cached --quiet; then \
 		echo "ERROR: working tree not clean, commit or stash first"; exit 1; \
+	fi
+	@git fetch --quiet origin main:refs/remotes/origin/main
+	@if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse origin/main)" ]; then \
+		echo "ERROR: local main must exactly match origin/main before releasing"; exit 1; \
 	fi
 	$(MAKE) chart-bump VERSION=$(VERSION)
 	@EXPECTED=$$(echo "$(VERSION)" | sed 's/^v//'); \
@@ -355,7 +465,7 @@ endif
 	git add $(HELM_CHART_DIR)/Chart.yaml $(HELM_CHART_DIR)/values.yaml
 	git commit -m "release: $(VERSION)"
 	git tag $(VERSION)
-	git push origin main $(VERSION)
+	git push --atomic origin main $(VERSION)
 
 .PHONY: helm-verify-version
 helm-verify-version: ## Verify in-repo chart version matches the latest git tag
@@ -381,21 +491,7 @@ helm-verify-version: ## Verify in-repo chart version matches the latest git tag
 .PHONY: helm-verify-crd-bases
 helm-verify-crd-bases: ## Verify Helm chart CRDs match kustomize CRDs
 	@echo "Checking if Helm chart CRDs match kustomize CRDs..."
-	@MISMATCH=0; \
-	for crd in config/crd/bases/*.yaml; do \
-		filename=$$(basename "$$crd"); \
-		helm_crd="$(HELM_CHART_DIR)/crd-bases/$$filename"; \
-		if [ ! -f "$$helm_crd" ]; then \
-			echo "ERROR: $$filename missing from Helm chart crd-bases/"; \
-			MISMATCH=1; \
-		elif ! diff -q "$$crd" "$$helm_crd" > /dev/null 2>&1; then \
-			echo "ERROR: $$filename differs"; \
-			MISMATCH=1; \
-		else \
-			echo "OK: $$filename"; \
-		fi; \
-	done; \
-	if [ $$MISMATCH -eq 1 ]; then \
+	@if ! git diff --no-index --exit-code -- config/crd/bases $(HELM_CHART_DIR)/crd-bases; then \
 		echo ""; \
 		echo "CRDs out of sync! Run 'make helm-sync-crd-bases' to fix."; \
 		exit 1; \
@@ -404,10 +500,18 @@ helm-verify-crd-bases: ## Verify Helm chart CRDs match kustomize CRDs
 
 .PHONY: verify-generate
 verify-generate: manifests generate ## Verify committed generated files (CRDs, Helm CRDs, JSON schemas, deepcopy) match the Go types.
-	@if ! git diff --quiet; then \
+	@GENERATED_STATUS="$$(git status --porcelain --untracked-files=all -- \
+		'api/**/zz_generated.deepcopy.go' \
+		config/crd/bases config/rbac/role.yaml config/webhook/manifests.yaml \
+		charts/garage-operator/crd-bases schemas)"; \
+	if [ -n "$$GENERATED_STATUS" ]; then \
 		echo "ERROR: generated files are out of date with the Go types."; \
 		echo "Run 'make manifests generate' and commit the result:"; \
-		git --no-pager diff --stat; \
+		printf '%s\n' "$$GENERATED_STATUS"; \
+		git --no-pager diff --stat -- \
+			'api/**/zz_generated.deepcopy.go' \
+			config/crd/bases config/rbac/role.yaml config/webhook/manifests.yaml \
+			charts/garage-operator/crd-bases schemas; \
 		exit 1; \
 	fi; \
 	echo "Generated files are in sync with the Go types."
@@ -465,13 +569,12 @@ ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; 
   [ -n "$$v" ] || { echo "Set ENVTEST_VERSION manually (controller-runtime replace has no tag)" >&2; exit 1; }; \
   printf '%s\n' "$$v" | sed -E 's/^v?([0-9]+)\.([0-9]+).*/release-\1.\2/')
 
-#ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
-ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
-  [ -n "$$v" ] || { echo "Set ENVTEST_K8S_VERSION manually (k8s.io/api replace has no tag)" >&2; exit 1; }; \
-  printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
+# Exact envtest patch available from controller-tools. Keep this immutable so
+# CI does not silently move when a newer Kubernetes 1.36 asset is published.
+ENVTEST_K8S_VERSION ?= 1.36.2
 
 SETUP_ENVTEST_VERSION ?= v0.24.0
-GOLANGCI_LINT_VERSION ?= v2.12.1
+GOLANGCI_LINT_VERSION ?= v2.12.2
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)

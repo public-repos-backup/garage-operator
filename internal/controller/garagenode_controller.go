@@ -18,6 +18,10 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	stderrors "errors"
 	"fmt"
 	"maps"
@@ -49,6 +53,7 @@ import (
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	"github.com/rajsinghtech/garage-operator/internal/garage"
+	"github.com/rajsinghtech/garage-operator/internal/garageconfig"
 	"github.com/rajsinghtech/garage-operator/internal/workloadidentity"
 )
 
@@ -58,7 +63,11 @@ import (
 const finalizeOrphanedTimeout = 5 * time.Second
 
 const (
-	garageNodeFinalizer = "garagenode.garage.rajsingh.info/finalizer"
+	garageNodeFinalizer         = "garagenode.garage.rajsingh.info/finalizer"
+	managedPVCNodeUIDAnnotation = "garage.rajsingh.info/garage-node-uid"
+	managedPVCNonceAnnotation   = "garage.rajsingh.info/pvc-reservation-nonce"
+	managedPVCFinalizer         = "garagenode.garage.rajsingh.info/pvc-reservation"
+	nodeValue                   = "node"
 )
 
 // errUnsafeLayoutRoleRemoval marks a finalization failure that must not consume
@@ -86,6 +95,11 @@ type GarageNodeReconciler struct {
 	Scheme        *runtime.Scheme
 	ClusterDomain string
 	DefaultImage  string
+	// ManagedPVCAdmissionDisabled must be true in production when the PVC
+	// finalizer validating webhook is not installed. Such deployments may use
+	// EmptyDir or explicit existingClaim volumes, but cannot safely create
+	// predictable convention-named persistent claims.
+	ManagedPVCAdmissionDisabled bool
 	// ClusterScoped controls whether canonical rollout-source discovery may list
 	// GarageClusters across namespaces. Namespace-scoped installs retain full
 	// PVC/SMB support without requiring a cluster-wide List permission.
@@ -125,7 +139,7 @@ func (r *GarageNodeReconciler) nodeLocalPoolReader() client.Reader {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 
 func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -136,6 +150,30 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+	if node.DeletionTimestamp.IsZero() {
+		if err := garagev1beta1.ValidateClusterReference(node.Spec.ClusterRef, "spec.clusterRef"); err != nil {
+			return r.updateStatus(ctx, node, PhaseFailed, err)
+		}
+		if node.Spec.ClusterRef.Namespace != "" && node.Spec.ClusterRef.Namespace != node.Namespace {
+			return r.updateStatus(ctx, node, PhaseFailed, fmt.Errorf(
+				"spec.clusterRef.namespace is not permitted: GarageNode requires a same-namespace GarageCluster",
+			))
+		}
+		if node.Spec.External != nil && node.Spec.External.RemoteClusterRef != nil {
+			return r.updateStatus(ctx, node, PhaseFailed, fmt.Errorf("spec.external.remoteClusterRef is not supported"))
+		}
+		if err := garagev1beta1.ValidateSupportedPublicEndpoint(node.Spec.PublicEndpoint, "spec.publicEndpoint"); err != nil {
+			return r.updateStatus(ctx, node, PhaseFailed, err)
+		}
+		if node.Spec.Storage != nil {
+			if err := garageconfig.ValidateMetadataSnapshotInterval(
+				node.Spec.Storage.MetadataAutoSnapshotInterval,
+				"spec.storage.metadataAutoSnapshotInterval",
+			); err != nil {
+				return r.updateStatus(ctx, node, PhaseFailed, fmt.Errorf("invalid Garage configuration: %w", err))
+			}
+		}
 	}
 	if canonicalNodeID := canonicalGarageNodeID(node.Status.NodeID); canonicalNodeID != node.Status.NodeID {
 		apply := func() { node.Status.NodeID = canonicalNodeID }
@@ -178,12 +216,19 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 					}
 					if err := r.attemptOrphanedFinalize(ctx, node); err != nil {
 						log.Info("Best-effort layout cleanup against captured admin endpoint failed; releasing finalizer anyway",
-							"node", node.Name, "endpoint", node.Status.ClusterAdminEndpoint, "error", err.Error())
+							nodeValue, node.Name, "endpoint", node.Status.ClusterAdminEndpoint, "error", err.Error())
 					} else if node.Status.ClusterAdminEndpoint != "" {
 						log.Info("Removed node from layout via captured admin endpoint after parent cluster deletion",
-							"node", node.Name, "endpoint", node.Status.ClusterAdminEndpoint)
+							nodeValue, node.Name, "endpoint", node.Status.ClusterAdminEndpoint)
 					} else {
-						log.Info("Parent cluster already deleted; releasing GarageNode finalizer", "node", node.Name)
+						log.Info("Parent cluster already deleted; releasing GarageNode finalizer", nodeValue, node.Name)
+					}
+					// The missing parent no longer provides a retention policy. Preserve
+					// claims (Retain fallback), but release any exact reservation barrier
+					// so the PVC does not inherit an orphaned controller finalizer.
+					retainedCluster := &garagev1beta2.GarageCluster{ObjectMeta: metav1.ObjectMeta{Namespace: node.Namespace}}
+					if err := r.cleanupOwnerlessManagedNodePVCs(ctx, node, retainedCluster); err != nil {
+						return r.updateStatus(ctx, node, PhaseDeleting, err)
 					}
 					controllerutil.RemoveFinalizer(node, garageNodeFinalizer)
 					if updateErr := r.Update(ctx, node); updateErr != nil {
@@ -201,7 +246,7 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			// so the node self-heals when the cluster reappears, rather than
 			// flapping to Failed.
 			log.Info("Referenced GarageCluster not found; node keeps running, requeueing",
-				"node", node.Name, "clusterRef", node.Spec.ClusterRef.Name)
+				nodeValue, node.Name, "clusterRef", node.Spec.ClusterRef.Name)
 			return r.updateStatus(ctx, node, PhasePending,
 				fmt.Errorf("waiting for referenced GarageCluster %q to exist", node.Spec.ClusterRef.Name))
 		}
@@ -219,7 +264,13 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// h1 OnDelete handoff. A gateway-only parent with clusterRef mutates the
 	// referenced storage GarageCluster's layout, so load that durable owner status
 	// rather than trusting the gateway object's unrelated status.
-	layoutOwner, err := resolveGarageLayoutOwner(ctx, r.nodeLocalPoolReader(), cluster)
+	var layoutOwner *garagev1beta2.GarageCluster
+	var err error
+	if node.DeletionTimestamp.IsZero() {
+		layoutOwner, err = resolveGarageLayoutOwner(ctx, r.nodeLocalPoolReader(), cluster)
+	} else {
+		layoutOwner, err = resolveGarageLayoutOwnerForCleanup(ctx, r.nodeLocalPoolReader(), cluster)
+	}
 	if err != nil {
 		return r.updateStatus(ctx, node, PhasePending,
 			fmt.Errorf("reading canonical layout-owner GarageCluster before GarageNode reconciliation: %w", err))
@@ -288,7 +339,12 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return r.updateStatus(ctx, node, PhasePending,
 			fmt.Errorf("waiting for GarageCluster replication-factor migration to finish before reconciling the layout role"))
 	}
-	if storageDrainActive && !storageDrainActorActive {
+	// A deleting canonical layout owner has already serialized the entire
+	// cluster-wide drain. Nodes reached through surviving management handles are
+	// not the drain actor, but must still reach the deletion handoff below so a
+	// validated terminal root proof can release them.
+	canonicalParentDeleting := !node.DeletionTimestamp.IsZero() && !layoutOwner.DeletionTimestamp.IsZero()
+	if storageDrainActive && !storageDrainActorActive && !canonicalParentDeleting {
 		actorDescription := "whose durable status is still publishing"
 		if layoutOwner.Status.StorageDrain != nil {
 			actorDescription = fmt.Sprintf("%+v", layoutOwner.Status.StorageDrain.Actor)
@@ -304,12 +360,12 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			// garbage collection may mark child GarageNodes deleting before the
 			// parent finalizer has proved block migration, so keep this finalizer (and
 			// therefore the identity-bearing workload) until that proof completes.
-			if !cluster.DeletionTimestamp.IsZero() {
-				parentDrain := cluster.EffectiveDeletionPolicy() == garagev1beta2.DeletionPolicyDrain && cluster.HasStorageTier()
+			if !layoutOwner.DeletionTimestamp.IsZero() {
+				parentDrain := layoutOwner.EffectiveDeletionPolicy() == garagev1beta2.DeletionPolicyDrain && layoutOwner.HasStorageTier()
 				safeParentHandoff := false
 				var parentHandoffErr error
 				if parentDrain {
-					safeParentHandoff, parentHandoffErr = completedGarageClusterDrainAuthorizesFinalization(cluster)
+					safeParentHandoff, parentHandoffErr = completedGarageClusterDrainAuthorizesFinalization(layoutOwner)
 				}
 				switch {
 				case storageDrainActorActive:
@@ -325,6 +381,9 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 					return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 				default:
 					log.Info("Parent cluster layout cleanup is complete or Destroy was selected; releasing per-node finalizer")
+					if err := r.cleanupOwnerlessManagedNodePVCs(ctx, node, cluster); err != nil {
+						return r.updateStatus(ctx, node, PhaseDeleting, err)
+					}
 					controllerutil.RemoveFinalizer(node, garageNodeFinalizer)
 					if err := r.Update(ctx, node); err != nil {
 						return ctrl.Result{}, err
@@ -383,20 +442,21 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 						fmt.Errorf("waiting for a safe Garage layout role removal: %w", err))
 					return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 				}
-				if ShouldSkipFinalization(node) {
-					log.Info("Finalization failed too many times, removing finalizer anyway",
-						"retries", GetFinalizationRetryCount(node), "error", err)
-				} else {
-					IncrementFinalizationRetryCount(node)
-					retryCount := GetFinalizationRetryCount(node)
-					log.Error(err, "Failed to finalize node, will retry",
-						"retries", retryCount)
-					if updateErr := r.Update(ctx, node); updateErr != nil {
-						log.Error(updateErr, "Failed to update retry count annotation")
+				patch := client.MergeFrom(node.DeepCopy())
+				IncrementFinalizationRetryCount(node)
+				retryCount := GetFinalizationRetryCount(node)
+				if patchErr := r.Patch(ctx, node, patch); patchErr != nil {
+					if errors.IsNotFound(patchErr) {
+						return ctrl.Result{}, nil
 					}
-					_, _ = r.updateStatus(ctx, node, PhaseDeleting, fmt.Errorf("finalization failed (retry %d/%d): %w", retryCount, FinalizationMaxRetries, err))
-					return ctrl.Result{RequeueAfter: RequeueAfterError}, nil
+					log.Error(patchErr, "Failed to update retry count annotation")
 				}
+				log.Error(err, "Failed to finalize node, retaining finalizer", "retries", retryCount)
+				_, _ = r.updateStatus(ctx, node, PhaseDeleting, fmt.Errorf("finalization failed (retry %d): %w", retryCount, err))
+				return ctrl.Result{RequeueAfter: RequeueAfterError}, nil
+			}
+			if err := r.cleanupOwnerlessManagedNodePVCs(ctx, node, cluster); err != nil {
+				return r.updateStatus(ctx, node, PhaseDeleting, err)
 			}
 			controllerutil.RemoveFinalizer(node, garageNodeFinalizer)
 			if err := r.Update(ctx, node); err != nil {
@@ -804,7 +864,7 @@ func (r *GarageNodeReconciler) garageNodeFinalizationClient(
 			return r.exactManagedGarageNodeAdminClient(ctx, node, cluster, nodeID)
 		}
 	}
-	return GetGarageClient(ctx, r.Client, cluster, r.ClusterDomain)
+	return GetGarageClientForCleanup(ctx, r.Client, cluster, r.ClusterDomain)
 }
 
 // fenceManagedGarageNodeLostSource creates a durable stop boundary before the
@@ -1240,6 +1300,9 @@ func (r *GarageNodeReconciler) reconcileStatefulSetWithRecoveryFence(
 	existing := &appsv1.StatefulSet{}
 	err = r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, existing)
 	if errors.IsNotFound(err) {
+		if err := r.validateConventionNamedNodePVCs(ctx, node, cluster, volumeClaimTemplates); err != nil {
+			return err
+		}
 		if nameErr := validateManagedGarageNodeName(node); nameErr != nil {
 			return fmt.Errorf("refusing to create a GarageNode StatefulSet with an unsafe derived Pod label: %w", nameErr)
 		}
@@ -1247,6 +1310,12 @@ func (r *GarageNodeReconciler) reconcileStatefulSetWithRecoveryFence(
 		return r.Create(ctx, sts)
 	}
 	if err != nil {
+		return err
+	}
+	if !metav1.IsControlledBy(existing, node) {
+		return fmt.Errorf("refusing to mutate or delete StatefulSet %s/%s because it is not controlled by GarageNode %s/%s UID %s", existing.Namespace, existing.Name, node.Namespace, node.Name, node.UID)
+	}
+	if err := r.validateConventionNamedNodePVCs(ctx, node, cluster, volumeClaimTemplates); err != nil {
 		return err
 	}
 
@@ -1333,6 +1402,440 @@ func (r *GarageNodeReconciler) reconcileStatefulSetWithRecoveryFence(
 	return r.Update(ctx, existing)
 }
 
+// validateConventionNamedNodePVCs reserves convention-named claims before a
+// StatefulSet can race another namespace actor to those predictable names.
+// Exact API-server UIDs are persisted in GarageNode status before workload
+// creation and are the ownership authority on every later reconcile.
+func (r *GarageNodeReconciler) validateConventionNamedNodePVCs(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	templates []corev1.PersistentVolumeClaim,
+) error {
+	if len(templates) > 0 && r.ManagedPVCAdmissionDisabled {
+		return errors.NewBadRequest("managed persistent volume claims require enabled admission webhooks to protect exact PVC identity reservations")
+	}
+	reader := r.nodeLocalPoolReader()
+	for i := range templates {
+		pvc := &corev1.PersistentVolumeClaim{}
+		name := fmt.Sprintf("%s-%s-0", templates[i].Name, node.Name)
+		if err := reader.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, pvc); err != nil {
+			if errors.IsNotFound(err) {
+				record, recorded, recordErr := managedNodePVCReservation(node, name)
+				if recordErr != nil {
+					return recordErr
+				} else if recorded && record.UID != "" {
+					return fmt.Errorf("refusing to replace missing managed PVC %s/%s with recorded UID %s", cluster.Namespace, name, record.UID)
+				}
+				if err := r.reserveManagedNodePVC(ctx, node, cluster, &templates[i], name); err != nil {
+					return err
+				}
+				continue
+			}
+			return fmt.Errorf("checking convention-named PVC %s/%s: %w", cluster.Namespace, name, err)
+		}
+		if err := r.ensureManagedNodePVCProvenance(ctx, pvc, node, cluster); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func managedNodePVCReservation(
+	node *garagev1beta1.GarageNode, name string,
+) (garagev1beta1.ManagedNodePVCStatus, bool, error) {
+	var found *garagev1beta1.ManagedNodePVCStatus
+	for i := range node.Status.ManagedPVCs {
+		record := node.Status.ManagedPVCs[i]
+		if record.Name != name {
+			continue
+		}
+		if (record.UID == "") == (record.PendingReservationHash == "") {
+			return garagev1beta1.ManagedNodePVCStatus{}, false, fmt.Errorf(
+				"GarageNode status must set exactly one of UID or pendingReservationHash for managed PVC %q", name,
+			)
+		}
+		if found != nil {
+			return garagev1beta1.ManagedNodePVCStatus{}, false, fmt.Errorf(
+				"GarageNode status has duplicate reservations for managed PVC %q", name,
+			)
+		}
+		copy := record
+		found = &copy
+	}
+	if found == nil {
+		return garagev1beta1.ManagedNodePVCStatus{}, false, nil
+	}
+	return *found, true, nil
+}
+
+func newManagedNodePVCNonce() (string, string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", fmt.Errorf("generating managed PVC reservation nonce: %w", err)
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(raw)
+	digest := sha256.Sum256([]byte(nonce))
+	return nonce, hex.EncodeToString(digest[:]), nil
+}
+
+func managedNodePVCNonceMatches(pvc *corev1.PersistentVolumeClaim, hash string) bool {
+	nonce := pvc.Annotations[managedPVCNonceAnnotation]
+	if nonce == "" || hash == "" {
+		return false
+	}
+	digest := sha256.Sum256([]byte(nonce))
+	return hex.EncodeToString(digest[:]) == hash
+}
+
+func (r *GarageNodeReconciler) reserveManagedNodePVC(
+	ctx context.Context,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+	template *corev1.PersistentVolumeClaim,
+	name string,
+) error {
+	if node.UID == "" {
+		return fmt.Errorf("cannot reserve managed PVC %s/%s for a GarageNode without a UID", cluster.Namespace, name)
+	}
+	nonce, reservationHash, err := newManagedNodePVCNonce()
+	if err != nil {
+		return err
+	}
+	// Persist the one-way commitment before creating the predictable PVC name.
+	// If the process stops after Create, the next reconcile can authenticate the
+	// nonce on that exact claim and bind its API-server UID.
+	if err := r.persistManagedNodePVCPendingReservation(ctx, node, name, reservationHash); err != nil {
+		return err
+	}
+	claim := template.DeepCopy()
+	claim.Name = name
+	claim.Namespace = cluster.Namespace
+	claim.ResourceVersion = ""
+	claim.UID = ""
+	claim.Status = corev1.PersistentVolumeClaimStatus{}
+	if claim.Annotations == nil {
+		claim.Annotations = map[string]string{}
+	}
+	claim.Annotations[managedPVCNodeUIDAnnotation] = string(node.UID)
+	claim.Annotations[managedPVCNonceAnnotation] = nonce
+	controllerutil.AddFinalizer(claim, managedPVCFinalizer)
+	if err := r.Create(ctx, claim); err != nil {
+		if errors.IsAlreadyExists(err) {
+			return fmt.Errorf("refusing convention-named PVC %s/%s that appeared before this controller persisted its UID reservation", claim.Namespace, claim.Name)
+		}
+		return fmt.Errorf("reserving managed PVC %s/%s before StatefulSet creation: %w", claim.Namespace, claim.Name, err)
+	}
+	if claim.UID == "" {
+		return fmt.Errorf("API server returned an empty UID for reserved PVC %s/%s", claim.Namespace, claim.Name)
+	}
+	if err := r.persistManagedNodePVCUID(ctx, node, claim); err != nil {
+		// Leave the claim and its nonce in place. The durable pending hash lets a
+		// later reconcile finish binding it; deleting on an ambiguous status-write
+		// error could instead leave a bound UID pointing at an absent claim.
+		return err
+	}
+	return nil
+}
+
+func (r *GarageNodeReconciler) persistManagedNodePVCPendingReservation(
+	ctx context.Context, node *garagev1beta1.GarageNode, pvcName, reservationHash string,
+) error {
+	if node.UID == "" || reservationHash == "" {
+		return fmt.Errorf("cannot persist a pending managed PVC reservation without GarageNode UID and nonce hash")
+	}
+	desiredConditions := slices.Clone(node.Status.Conditions)
+	for attempt := 0; attempt < StatusUpdateMaxRetries; attempt++ {
+		current := &garagev1beta1.GarageNode{}
+		if err := r.nodeLocalPoolReader().Get(ctx, client.ObjectKeyFromObject(node), current); err != nil {
+			return fmt.Errorf("reading GarageNode before reserving managed PVC %s: %w", pvcName, err)
+		}
+		if current.UID != node.UID {
+			return fmt.Errorf("refusing to reserve managed PVC across GarageNode recreation: expected %s, got %s", node.UID, current.UID)
+		}
+		record, recorded, err := managedNodePVCReservation(current, pvcName)
+		if err != nil {
+			return err
+		}
+		if recorded && record.UID != "" {
+			return fmt.Errorf("refusing to replace bound managed PVC %s with recorded UID %s", pvcName, record.UID)
+		}
+		current.Status.Conditions = slices.Clone(desiredConditions)
+		updated := garagev1beta1.ManagedNodePVCStatus{Name: pvcName, PendingReservationHash: reservationHash}
+		if recorded {
+			for i := range current.Status.ManagedPVCs {
+				if current.Status.ManagedPVCs[i].Name == pvcName {
+					current.Status.ManagedPVCs[i] = updated
+				}
+			}
+		} else {
+			current.Status.ManagedPVCs = append(current.Status.ManagedPVCs, updated)
+		}
+		slices.SortFunc(current.Status.ManagedPVCs, func(a, b garagev1beta1.ManagedNodePVCStatus) int {
+			return strings.Compare(a.Name, b.Name)
+		})
+		if err := r.Status().Update(ctx, current); err != nil {
+			if errors.IsConflict(err) {
+				continue
+			}
+			return fmt.Errorf("persisting pending managed PVC %s reservation: %w", pvcName, err)
+		}
+		*node = *current.DeepCopy()
+		return nil
+	}
+	return fmt.Errorf("persisting pending managed PVC %s reservation exhausted conflict retries", pvcName)
+}
+
+func (r *GarageNodeReconciler) persistManagedNodePVCUID(
+	ctx context.Context, node *garagev1beta1.GarageNode, pvc *corev1.PersistentVolumeClaim,
+) error {
+	if node.UID == "" || pvc.UID == "" {
+		return fmt.Errorf("cannot persist managed PVC identity without GarageNode and PVC UIDs")
+	}
+	// Reconciliation may have already changed conditions in memory (for example,
+	// clearing Suspended immediately before workload creation). Preserve those
+	// desired condition changes while fetching the latest object for the PVC UID
+	// reservation; otherwise assigning the fetched object back to node resurrects
+	// stale conditions and the later status update never sees their removal.
+	desiredConditions := slices.Clone(node.Status.Conditions)
+	for attempt := 0; attempt < StatusUpdateMaxRetries; attempt++ {
+		current := &garagev1beta1.GarageNode{}
+		if err := r.nodeLocalPoolReader().Get(ctx, client.ObjectKeyFromObject(node), current); err != nil {
+			return fmt.Errorf("reading GarageNode before persisting managed PVC %s/%s UID: %w", pvc.Namespace, pvc.Name, err)
+		}
+		if current.UID != node.UID {
+			return fmt.Errorf("refusing to persist managed PVC UID across GarageNode recreation: expected %s, got %s", node.UID, current.UID)
+		}
+		record, recorded, err := managedNodePVCReservation(current, pvc.Name)
+		if err != nil {
+			return err
+		}
+		if recorded && record.UID != "" {
+			if record.UID != pvc.UID {
+				return fmt.Errorf("managed PVC %s/%s UID %s does not match recorded UID %s", pvc.Namespace, pvc.Name, pvc.UID, record.UID)
+			}
+			current.Status.Conditions = slices.Clone(desiredConditions)
+			*node = *current.DeepCopy()
+			return nil
+		}
+		if recorded {
+			if pvc.Annotations[managedPVCNodeUIDAnnotation] != string(current.UID) ||
+				!managedNodePVCNonceMatches(pvc, record.PendingReservationHash) {
+				return fmt.Errorf("refusing to bind managed PVC %s/%s because its nonce does not match the pending GarageNode reservation", pvc.Namespace, pvc.Name)
+			}
+		}
+		current.Status.Conditions = slices.Clone(desiredConditions)
+		bound := garagev1beta1.ManagedNodePVCStatus{Name: pvc.Name, UID: pvc.UID}
+		if recorded {
+			for i := range current.Status.ManagedPVCs {
+				if current.Status.ManagedPVCs[i].Name == pvc.Name {
+					current.Status.ManagedPVCs[i] = bound
+				}
+			}
+		} else {
+			current.Status.ManagedPVCs = append(current.Status.ManagedPVCs, bound)
+		}
+		slices.SortFunc(current.Status.ManagedPVCs, func(a, b garagev1beta1.ManagedNodePVCStatus) int {
+			return strings.Compare(a.Name, b.Name)
+		})
+		if err := r.Status().Update(ctx, current); err != nil {
+			if errors.IsConflict(err) {
+				continue
+			}
+			return fmt.Errorf("persisting managed PVC %s/%s UID %s: %w", pvc.Namespace, pvc.Name, pvc.UID, err)
+		}
+		*node = *current.DeepCopy()
+		return nil
+	}
+	return fmt.Errorf("persisting managed PVC %s/%s UID exhausted conflict retries", pvc.Namespace, pvc.Name)
+}
+
+func validateManagedNodePVCProvenance(
+	pvc *corev1.PersistentVolumeClaim,
+	node *garagev1beta1.GarageNode,
+	statefulSet *appsv1.StatefulSet,
+) error {
+	controller := metav1.GetControllerOf(pvc)
+	if controller != nil {
+		if statefulSet != nil && metav1.IsControlledBy(statefulSet, node) &&
+			statefulSet.DeletionTimestamp.IsZero() && metav1.IsControlledBy(pvc, statefulSet) {
+			return nil
+		}
+		return fmt.Errorf("refusing to adopt or mutate convention-named PVC %s/%s because its controller owner is not the exact GarageNode StatefulSet", pvc.Namespace, pvc.Name)
+	}
+	if pinnedUID, present := pvc.Annotations[managedPVCNodeUIDAnnotation]; present {
+		if node.UID == "" || pinnedUID != string(node.UID) {
+			return fmt.Errorf("refusing to adopt or mutate convention-named PVC %s/%s because its GarageNode UID correlation %q does not match %q", pvc.Namespace, pvc.Name, pinnedUID, node.UID)
+		}
+		return fmt.Errorf("refusing to adopt or mutate controllerless convention-named PVC %s/%s based only on its user-writable GarageNode UID annotation; exact live StatefulSet/Pod evidence is required", pvc.Namespace, pvc.Name)
+	}
+	return fmt.Errorf("refusing to adopt or mutate convention-named PVC %s/%s without strong evidence from the live exact-owned StatefulSet; labels and annotations alone are not ownership", pvc.Namespace, pvc.Name)
+}
+
+func statefulSetDeclaresPVC(statefulSet *appsv1.StatefulSet, pvcName string) bool {
+	if statefulSet == nil {
+		return false
+	}
+	for i := range statefulSet.Spec.VolumeClaimTemplates {
+		if fmt.Sprintf("%s-%s-0", statefulSet.Spec.VolumeClaimTemplates[i].Name, statefulSet.Name) == pvcName {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *GarageNodeReconciler) ensureManagedNodePVCProvenance(
+	ctx context.Context,
+	pvc *corev1.PersistentVolumeClaim,
+	node *garagev1beta1.GarageNode,
+	cluster *garagev1beta2.GarageCluster,
+) error {
+	if !pvc.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("refusing terminating convention-named PVC %s/%s UID %s", pvc.Namespace, pvc.Name, pvc.UID)
+	}
+	record, recorded, err := managedNodePVCReservation(node, pvc.Name)
+	if err != nil {
+		return err
+	}
+	if recorded && record.UID != "" {
+		if pvc.UID == "" || pvc.UID != record.UID {
+			return fmt.Errorf("refusing managed PVC %s/%s UID %s because GarageNode status records UID %s", pvc.Namespace, pvc.Name, pvc.UID, record.UID)
+		}
+		return r.ensureManagedNodePVCReplacementBarrier(ctx, pvc, node)
+	}
+	if recorded {
+		if node.UID == "" || pvc.Annotations[managedPVCNodeUIDAnnotation] != string(node.UID) ||
+			!managedNodePVCNonceMatches(pvc, record.PendingReservationHash) {
+			return fmt.Errorf("refusing convention-named PVC %s/%s because its nonce does not match the pending GarageNode reservation", pvc.Namespace, pvc.Name)
+		}
+		if err := r.ensureManagedNodePVCReplacementBarrier(ctx, pvc, node); err != nil {
+			return err
+		}
+		return r.persistManagedNodePVCUID(ctx, node, pvc)
+	}
+	// Legacy migration is an identity decision too. Re-read the exact
+	// StatefulSet authoritatively so a deleted/replaced workload lingering in the
+	// cache cannot authorize adoption of a same-name claim.
+	statefulSet := &appsv1.StatefulSet{}
+	if err := r.nodeLocalPoolReader().Get(ctx, types.NamespacedName{
+		Name: node.Name, Namespace: cluster.Namespace,
+	}, statefulSet); err != nil {
+		if !errors.IsNotFound(err) {
+			return fmt.Errorf("reading authoritative GarageNode StatefulSet before legacy PVC migration: %w", err)
+		}
+		statefulSet = nil
+	}
+	labels := pvc.GetLabels()
+	correlatedUID := pvc.Annotations[managedPVCNodeUIDAnnotation]
+	legacyShape := metav1.GetControllerOf(pvc) == nil && (correlatedUID == "" || correlatedUID == string(node.UID)) &&
+		labels[labelAppManagedBy] == operatorName && labels[labelAppComponent] == nodeValue &&
+		labels[labelGarageNode] == node.Name && labels[labelCluster] == cluster.Name
+	if legacyShape {
+		if err := r.validateLegacyManagedNodePVCLivePod(ctx, pvc, node, statefulSet); err != nil {
+			return err
+		}
+	} else if err := validateManagedNodePVCProvenance(pvc, node, statefulSet); err != nil {
+		return err
+	}
+	// Fence deletion and same-name recreation before persisting the legacy
+	// claim's UID. Otherwise a crash after the status write could leave a short
+	// window in which the live-Pod proof disappears and the authenticated claim
+	// is replaced before the next reconcile establishes the barrier.
+	if err := r.ensureManagedNodePVCReplacementBarrier(ctx, pvc, node); err != nil {
+		return err
+	}
+	if err := r.persistManagedNodePVCUID(ctx, node, pvc); err != nil {
+		return err
+	}
+	if node.UID == "" || pvc.Annotations[managedPVCNodeUIDAnnotation] != "" {
+		return nil
+	}
+	patch := client.MergeFrom(pvc.DeepCopy())
+	if pvc.Annotations == nil {
+		pvc.Annotations = map[string]string{}
+	}
+	pvc.Annotations[managedPVCNodeUIDAnnotation] = string(node.UID)
+	if err := r.Patch(ctx, pvc, patch); err != nil {
+		return fmt.Errorf("pinning convention-named PVC %s/%s to GarageNode UID %s: %w", pvc.Namespace, pvc.Name, node.UID, err)
+	}
+	return nil
+}
+
+func (r *GarageNodeReconciler) ensureManagedNodePVCReplacementBarrier(
+	ctx context.Context, pvc *corev1.PersistentVolumeClaim, node *garagev1beta1.GarageNode,
+) error {
+	statefulSet := &appsv1.StatefulSet{}
+	exactStatefulSetControl := false
+	if err := r.nodeLocalPoolReader().Get(ctx, types.NamespacedName{
+		Name: node.Name, Namespace: pvc.Namespace,
+	}, statefulSet); err != nil {
+		if !errors.IsNotFound(err) {
+			return fmt.Errorf("reading authoritative StatefulSet before updating managed PVC replacement barrier: %w", err)
+		}
+	} else {
+		controller := metav1.GetControllerOf(pvc)
+		exactStatefulSetControl = node.UID != "" && statefulSet.DeletionTimestamp.IsZero() &&
+			metav1.IsControlledBy(statefulSet, node) && controller != nil &&
+			controller.UID == statefulSet.UID && controller.Kind == "StatefulSet" &&
+			controller.APIVersion == appsv1.SchemeGroupVersion.String()
+	}
+
+	hasBarrier := controllerutil.ContainsFinalizer(pvc, managedPVCFinalizer)
+	if exactStatefulSetControl == !hasBarrier {
+		return nil
+	}
+	if exactStatefulSetControl {
+		controllerutil.RemoveFinalizer(pvc, managedPVCFinalizer)
+	} else {
+		controllerutil.AddFinalizer(pvc, managedPVCFinalizer)
+	}
+	if err := r.Update(ctx, pvc); err != nil {
+		return fmt.Errorf("updating managed PVC %s/%s replacement barrier: %w", pvc.Namespace, pvc.Name, err)
+	}
+	if !exactStatefulSetControl {
+		current := &corev1.PersistentVolumeClaim{}
+		if err := r.nodeLocalPoolReader().Get(ctx, client.ObjectKeyFromObject(pvc), current); err != nil {
+			return fmt.Errorf("verifying managed PVC replacement barrier: %w", err)
+		}
+		if current.UID != pvc.UID || !current.DeletionTimestamp.IsZero() ||
+			!controllerutil.ContainsFinalizer(current, managedPVCFinalizer) {
+			return fmt.Errorf("managed PVC %s/%s changed identity or began terminating while establishing its replacement barrier", pvc.Namespace, pvc.Name)
+		}
+		*pvc = *current
+	}
+	return nil
+}
+
+func (r *GarageNodeReconciler) validateLegacyManagedNodePVCLivePod(
+	ctx context.Context,
+	pvc *corev1.PersistentVolumeClaim,
+	node *garagev1beta1.GarageNode,
+	statefulSet *appsv1.StatefulSet,
+) error {
+	if statefulSet == nil || !metav1.IsControlledBy(statefulSet, node) ||
+		!statefulSet.DeletionTimestamp.IsZero() || !statefulSetDeclaresPVC(statefulSet, pvc.Name) {
+		return fmt.Errorf("refusing legacy convention-named PVC %s/%s without an exact live GarageNode-controlled StatefulSet declaration; labels alone are not ownership", pvc.Namespace, pvc.Name)
+	}
+	pod := &corev1.Pod{}
+	podKey := types.NamespacedName{Name: statefulSet.Name + "-0", Namespace: statefulSet.Namespace}
+	if err := r.nodeLocalPoolReader().Get(ctx, podKey, pod); err != nil {
+		if errors.IsNotFound(err) {
+			return fmt.Errorf("refusing legacy convention-named PVC %s/%s because exact StatefulSet Pod %s is absent", pvc.Namespace, pvc.Name, podKey)
+		}
+		return fmt.Errorf("reading exact StatefulSet Pod %s before legacy PVC adoption: %w", podKey, err)
+	}
+	if !pod.DeletionTimestamp.IsZero() || !metav1.IsControlledBy(pod, statefulSet) {
+		return fmt.Errorf("refusing legacy convention-named PVC %s/%s because Pod %s is deleting or is not controlled by the exact StatefulSet UID %s", pvc.Namespace, pvc.Name, podKey, statefulSet.UID)
+	}
+	for i := range pod.Spec.Volumes {
+		claim := pod.Spec.Volumes[i].PersistentVolumeClaim
+		if claim != nil && claim.ClaimName == pvc.Name {
+			return nil
+		}
+	}
+	return fmt.Errorf("refusing legacy convention-named PVC %s/%s because exact live Pod %s does not reference it", pvc.Namespace, pvc.Name, podKey)
+}
+
 // stsPVCRetentionPolicy translates the owning tier's explicit PVC policy into
 // the per-GarageNode StatefulSet policy. Nil leaves Kubernetes' Retain/Retain
 // default, which is the established default for both storage and unified
@@ -1385,6 +1888,83 @@ func translatePVCRetentionPolicy(rp *garagev1beta2.PVCRetentionPolicy) *appsv1.S
 	return out
 }
 
+// cleanupOwnerlessManagedNodePVCs closes the gap between reserving an exact
+// PVC identity and creating its StatefulSet. Kubernetes' StatefulSet retention
+// policy cannot delete a claim that the StatefulSet never came to control, so
+// Delete policy handles those exact controller reservations here. Retain policy
+// deliberately leaves every claim untouched.
+func (r *GarageNodeReconciler) cleanupOwnerlessManagedNodePVCs(
+	ctx context.Context, node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster,
+) error {
+	policy := stsPVCRetentionPolicy(cluster, node)
+	deleteOwnerless := policy != nil && policy.WhenDeleted == appsv1.DeletePersistentVolumeClaimRetentionPolicyType
+
+	statefulSet := &appsv1.StatefulSet{}
+	statefulSetExists := false
+	reader := r.nodeLocalPoolReader()
+	if err := reader.Get(ctx, types.NamespacedName{Name: node.Name, Namespace: cluster.Namespace}, statefulSet); err != nil {
+		if !errors.IsNotFound(err) {
+			return fmt.Errorf("reading GarageNode StatefulSet before managed PVC finalization: %w", err)
+		}
+	} else {
+		statefulSetExists = metav1.IsControlledBy(statefulSet, node)
+	}
+
+	for i := range node.Status.ManagedPVCs {
+		record, found, err := managedNodePVCReservation(node, node.Status.ManagedPVCs[i].Name)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		pvc := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{Name: record.Name, Namespace: cluster.Namespace}
+		if err := reader.Get(ctx, key, pvc); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("reading managed PVC %s before GarageNode finalization: %w", key, err)
+		}
+
+		exactReservation := record.UID != "" && pvc.UID == record.UID
+		if record.PendingReservationHash != "" {
+			exactReservation = pvc.Annotations[managedPVCNodeUIDAnnotation] == string(node.UID) &&
+				managedNodePVCNonceMatches(pvc, record.PendingReservationHash)
+		}
+		if !exactReservation || pvc.UID == "" {
+			// A same-name replacement or an unforgeable pending-reservation
+			// mismatch is not ours to delete.
+			continue
+		}
+		if controllerutil.ContainsFinalizer(pvc, managedPVCFinalizer) {
+			controllerutil.RemoveFinalizer(pvc, managedPVCFinalizer)
+			if err := r.Update(ctx, pvc); err != nil {
+				return fmt.Errorf("releasing managed PVC %s replacement barrier during GarageNode finalization: %w", key, err)
+			}
+		}
+		if !deleteOwnerless {
+			continue
+		}
+
+		controller := metav1.GetControllerOf(pvc)
+		controlledByExactStatefulSet := statefulSetExists && controller != nil &&
+			controller.UID == statefulSet.UID && controller.Kind == "StatefulSet" &&
+			controller.APIVersion == appsv1.SchemeGroupVersion.String()
+		if controlledByExactStatefulSet {
+			continue
+		}
+
+		uid := pvc.UID
+		if err := r.Delete(ctx, pvc, &client.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &uid},
+		}); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("deleting ownerless managed PVC %s UID %s: %w", key, uid, err)
+		}
+	}
+	return nil
+}
+
 // expandNodePVCs resizes bound PVCs in-place when spec.storage.{metadata,data}.size
 // grows. Required because StatefulSet.volumeClaimTemplates is immutable: a
 // fresh template with a larger size won't propagate to existing PVCs without
@@ -1429,13 +2009,26 @@ func (r *GarageNodeReconciler) expandNodePVCs(ctx context.Context, node *garagev
 		}
 	}
 
+	reader := r.nodeLocalPoolReader()
+	existingStatefulSet := &appsv1.StatefulSet{}
+	if err := reader.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, existingStatefulSet); err == nil {
+		if !metav1.IsControlledBy(existingStatefulSet, node) {
+			return fmt.Errorf("refusing PVC expansion because StatefulSet %s/%s is not controlled by GarageNode %s/%s UID %s", existingStatefulSet.Namespace, existingStatefulSet.Name, node.Namespace, node.Name, node.UID)
+		}
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("get StatefulSet %s before PVC expansion: %w", stsName, err)
+	}
+
 	for _, w := range wants {
 		pvc := &corev1.PersistentVolumeClaim{}
-		if err := r.Get(ctx, types.NamespacedName{Name: w.name, Namespace: cluster.Namespace}, pvc); err != nil {
+		if err := reader.Get(ctx, types.NamespacedName{Name: w.name, Namespace: cluster.Namespace}, pvc); err != nil {
 			if errors.IsNotFound(err) {
 				continue
 			}
 			return fmt.Errorf("get PVC %s: %w", w.name, err)
+		}
+		if err := r.ensureManagedNodePVCProvenance(ctx, pvc, node, cluster); err != nil {
+			return err
 		}
 		current, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 		if !ok || current.Cmp(w.size) >= 0 {
@@ -1655,6 +2248,12 @@ func (r *GarageNodeReconciler) buildNodeVolumeClaimTemplates(node *garagev1beta1
 		for k, v := range labels {
 			pvc.Labels[k] = v
 		}
+		if node.UID != "" {
+			if pvc.Annotations == nil {
+				pvc.Annotations = map[string]string{}
+			}
+			pvc.Annotations[managedPVCNodeUIDAnnotation] = string(node.UID)
+		}
 		return pvc
 	}
 	applySelector := func(pvc corev1.PersistentVolumeClaim, volume *garagev1beta1.NodeVolumeConfig, volumeName string, dataPathIndex int) corev1.PersistentVolumeClaim {
@@ -1826,7 +2425,7 @@ func (r *GarageNodeReconciler) labelsForNode(node *garagev1beta1.GarageNode, clu
 	labels := map[string]string{
 		labelAppName:      defaultAppName,
 		labelAppInstance:  cluster.Name,
-		labelAppComponent: "node",
+		labelAppComponent: nodeValue,
 		labelAppManagedBy: operatorName,
 		labelCluster:      cluster.Name,
 		labelTier:         tier,
@@ -2261,7 +2860,7 @@ func (r *GarageNodeReconciler) reconcileNode(
 			}
 		}
 		log.Info("Gateway identity changed; replacement assigned, removing stale layout role",
-			"node", node.Name, "previousNodeID", previousNodeID, "newNodeID", nodeID)
+			nodeValue, node.Name, "previousNodeID", previousNodeID, "newNodeID", nodeID)
 		if err := r.removeStaleNodeRole(ctx, node, garageClient, previousNodeID, layoutOwner); err != nil {
 			return fmt.Errorf("removing stale node role %s after assigning replacement identity: %w", previousNodeID, err)
 		}
@@ -2621,7 +3220,7 @@ func (r *GarageNodeReconciler) effectiveNodeZone(
 			zone = node.Status.Zone
 		}
 		log.V(1).Info("zoneFrom unresolved, using fallback zone",
-			"node", node.Name, "nodeLabel", src.NodeLabel, "zone", zone,
+			nodeValue, node.Name, "nodeLabel", src.NodeLabel, "zone", zone,
 			"reason", reason, "error", err)
 		return zone
 	}
@@ -2881,10 +3480,7 @@ func (r *GarageNodeReconciler) revalidateManagedPodIdentity(
 // connectNodeToCluster connects a new node to the cluster by calling ConnectNode.
 // This allows the cluster to discover the new node.
 func (r *GarageNodeReconciler) connectNodeToCluster(ctx context.Context, garageClient *garage.Client, nodeID, podIP string, cluster *garagev1beta2.GarageCluster) error {
-	rpcPort := int32(3901)
-	if cluster.Spec.Network.RPCBindPort != 0 {
-		rpcPort = cluster.Spec.Network.RPCBindPort
-	}
+	rpcPort := getRPCPort(cluster)
 
 	nodeAddr := rpcAddr(podIP, rpcPort)
 	result, err := garageClient.ConnectNode(ctx, nodeID, nodeAddr)
@@ -3501,16 +4097,14 @@ func (r *GarageNodeReconciler) updateStatusFromGarage(
 	observedGeneration := node.Generation
 	nodeID := canonicalGarageNodeID(node.Status.NodeID)
 	zone := node.Status.Zone
+	if layoutRole != nil && layoutRole.Zone != "" {
+		zone = layoutRole.Zone
+	}
 	adminEndpoint := node.Status.ClusterAdminEndpoint
 	var adminTokenRef *corev1.SecretKeySelector
 	if node.Status.ClusterAdminTokenSecretRef != nil {
 		copy := *node.Status.ClusterAdminTokenSecretRef
 		adminTokenRef = &copy
-	}
-	var address string
-	hasAddress := nodeInfo != nil && nodeInfo.Address != nil
-	if hasAddress {
-		address = *nodeInfo.Address
 	}
 	var lastSeen *metav1.Time
 	if connected {
@@ -3529,9 +4123,7 @@ func (r *GarageNodeReconciler) updateStatusFromGarage(
 			node.Status.LayoutVersion = int64(layout.Version)
 		}
 		node.Status.Connected = connected
-		if hasAddress {
-			node.Status.Address = address
-		}
+		applyGarageNodeObservations(&node.Status, nodeInfo, layoutRole)
 		if lastSeen != nil {
 			copy := *lastSeen
 			node.Status.LastSeen = &copy
@@ -3552,6 +4144,56 @@ func (r *GarageNodeReconciler) updateStatusFromGarage(
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 }
 
+func applyGarageNodeObservations(status *garagev1beta1.GarageNodeStatus, nodeInfo *garage.NodeInfo, layoutRole *garage.LayoutRole) {
+	if status == nil {
+		return
+	}
+	status.Address = ""
+	status.Hostname = ""
+	status.Version = ""
+	status.Tags = nil
+	status.DataPartition = nil
+	status.MetadataPartition = nil
+	status.Partitions = 0
+
+	if nodeInfo != nil {
+		if nodeInfo.Address != nil {
+			status.Address = *nodeInfo.Address
+		}
+		if nodeInfo.Hostname != nil {
+			status.Hostname = *nodeInfo.Hostname
+		}
+		if nodeInfo.GarageVersion != nil {
+			status.Version = *nodeInfo.GarageVersion
+		}
+		status.DataPartition = garageDiskPartitionStatus(nodeInfo.DataPartition)
+		status.MetadataPartition = garageDiskPartitionStatus(nodeInfo.MetadataPartition)
+	}
+	if layoutRole != nil {
+		status.Tags = append([]string(nil), layoutRole.Tags...)
+		if layoutRole.StoredPartitions != nil && *layoutRole.StoredPartitions <= uint64(^uint(0)>>1) {
+			status.Partitions = int(*layoutRole.StoredPartitions)
+		}
+	}
+}
+
+func garageDiskPartitionStatus(free *garage.FreeSpaceResp) *garagev1beta1.DiskPartitionStatus {
+	if free == nil {
+		return nil
+	}
+	available := resource.MustParse(fmt.Sprintf("%d", free.Available))
+	total := resource.MustParse(fmt.Sprintf("%d", free.Total))
+	usedPercent := int32(0)
+	if free.Total > 0 && free.Available < free.Total {
+		usedPercent = int32(float64(free.Total-free.Available) * 100 / float64(free.Total))
+	}
+	return &garagev1beta1.DiskPartitionStatus{
+		Available:   &available,
+		Total:       &total,
+		UsedPercent: usedPercent,
+	}
+}
+
 // reconcileNodeService creates or updates a per-node LoadBalancer/NodePort service for
 // exposing the RPC port externally. Only called when spec.publicEndpoint is set.
 //
@@ -3570,10 +4212,7 @@ func (r *GarageNodeReconciler) reconcileNodeService(ctx context.Context, node *g
 	ep := node.Spec.PublicEndpoint
 	svcName := boundedDNS1123LabelName(node.Name + "-rpc")
 
-	rpcPort := DefaultRPCPort
-	if cluster.Spec.Network.RPCBindPort != 0 {
-		rpcPort = cluster.Spec.Network.RPCBindPort
-	}
+	rpcPort := getRPCPort(cluster)
 
 	var svcType corev1.ServiceType
 	var svcMeta garagev1beta1.ServiceMeta
@@ -3649,10 +4288,7 @@ func (r *GarageNodeReconciler) effectiveNodeRPCPublicAddr(ctx context.Context, n
 		return "", nil
 	}
 
-	rpcPort := DefaultRPCPort
-	if cluster.Spec.Network.RPCBindPort != 0 {
-		rpcPort = cluster.Spec.Network.RPCBindPort
-	}
+	rpcPort := getRPCPort(cluster)
 	switch node.Spec.PublicEndpoint.Type {
 	case publicEndpointTypeLoadBalancer:
 		svc := &corev1.Service{}

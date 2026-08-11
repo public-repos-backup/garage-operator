@@ -26,6 +26,7 @@ NC='\033[0m'
 
 TESTS_PASSED=0
 TESTS_FAILED=0
+CLUSTER_CREATED=false
 
 CLEANUP=true
 SKIP_BUILD=false
@@ -39,6 +40,10 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+E2E_KUBECONFIG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/garage-ipv6-e2e-kubeconfig.XXXXXX")
+export KUBECONFIG="$E2E_KUBECONFIG_DIR/config"
+CLUSTER_UID=""
 
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
@@ -60,17 +65,42 @@ dump_debug_info() {
 }
 
 cleanup() {
+    if [ "$CLUSTER_CREATED" != true ]; then
+        return 0
+    fi
     if [ "$CLEANUP" = true ]; then
+        local live_uid
+        live_uid=$(kubectl --context "kind-$CLUSTER_NAME" get namespace kube-system \
+            -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+        if [ -z "$CLUSTER_UID" ] || [ "$live_uid" != "$CLUSTER_UID" ]; then
+            log_error "Refusing to delete '$CLUSTER_NAME': live kube-system UID does not match this run"
+            return 1
+        fi
         if kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
             dump_debug_info "$CLUSTER_NAME"
         fi
         log_info "Cleaning up kind cluster '$CLUSTER_NAME'..."
-        kind delete cluster --name "$CLUSTER_NAME" 2>/dev/null || true
+        if ! kind delete cluster --name "$CLUSTER_NAME" 2>/dev/null; then
+            log_error "Failed to delete kind cluster '$CLUSTER_NAME'; preserving kubeconfig $KUBECONFIG"
+            return 1
+        fi
+        rm -f "$KUBECONFIG"
+        rmdir "$E2E_KUBECONFIG_DIR" 2>/dev/null || true
     else
-        log_warn "Skipping cleanup. To delete: kind delete cluster --name $CLUSTER_NAME"
+        log_warn "Skipping cleanup. Kubeconfig: $KUBECONFIG"
+        log_warn "To delete: kind delete cluster --name $CLUSTER_NAME"
     fi
 }
-trap cleanup EXIT
+on_exit() {
+    local status=$? cleanup_status=0
+    trap - EXIT
+    cleanup || cleanup_status=$?
+    if [ "$status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
+        status=$cleanup_status
+    fi
+    exit "$status"
+}
+trap on_exit EXIT
 
 wait_for_phase() {
     local resource=$1 name=$2 phase=$3 timeout=$4
@@ -93,31 +123,49 @@ main() {
     cd "$ROOT_DIR"
 
     log_info "=== Step 1: Creating dual-stack Kind cluster (IPv6 primary) ==="
-    kind delete cluster --name "$CLUSTER_NAME" 2>/dev/null || true
+    if kind get clusters 2>/dev/null | grep -Fqx -- "$CLUSTER_NAME"; then
+        log_error "Refusing to delete pre-existing kind cluster '$CLUSTER_NAME'"
+        return 1
+    fi
     kind create cluster \
         --name "$CLUSTER_NAME" \
         --config hack/kind-config-ipv6.yaml \
         --wait 90s
+    CLUSTER_CREATED=true
+    CLUSTER_UID=$(kubectl --context "kind-$CLUSTER_NAME" get namespace kube-system \
+        -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+    if [ -z "$CLUSTER_UID" ]; then
+        log_error "Could not record exact ownership of '$CLUSTER_NAME'"
+        return 1
+    fi
     kubectl cluster-info --context "kind-$CLUSTER_NAME"
 
     # Verify pods actually get IPv6 primary IPs
     log_info "Waiting for kube-system pods to confirm IPv6 primary IPs..."
-    sleep 10
-    local sample_ip
-    sample_ip=$(kubectl get pods -n kube-system -o jsonpath='{.items[0].status.podIP}' 2>/dev/null || echo "")
+    local sample_ip="" end_time=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$end_time" ]; do
+        sample_ip=$(kubectl get pods -n kube-system \
+            -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' 2>/dev/null \
+            | awk 'NF { print; exit }' || true)
+        [ -n "$sample_ip" ] && break
+        sleep 2
+    done
     if [[ "$sample_ip" == *:* ]]; then
         log_info "Confirmed: primary pod IP is IPv6 ($sample_ip)"
     else
-        log_warn "Primary pod IP appears to be IPv4 ($sample_ip) — dual-stack config may not be in effect"
+        log_error "IPv6 prerequisite failed: primary pod IP is not IPv6 (${sample_ip:-missing})"
+        return 1
     fi
 
     log_info "=== Step 2: Building and loading operator image ==="
     if [ "$SKIP_BUILD" = false ]; then
         docker build -t garage-operator:e2e .
-        kind load docker-image garage-operator:e2e --name "$CLUSTER_NAME"
     else
         log_info "Skipping build (--skip-build)"
     fi
+    # --skip-build reuses an image already present in the host image store; a
+    # fresh Kind node still needs it imported before Helm starts the manager.
+    kind load docker-image garage-operator:e2e --name "$CLUSTER_NAME"
 
     log_info "=== Step 2.5: Installing cert-manager ==="
     "$ROOT_DIR/hack/install-cert-manager.sh"
@@ -154,7 +202,7 @@ metadata:
   name: garage
   namespace: garage-operator-system
 spec:
-  image: dxflrs/garage:v2.2.0
+  image: dxflrs/garage:v2.2.0@sha256:45a61ce3f7c9c24fc23d9ed2b09b27ed560ab87b34605d175d5c588f539c24e4
   replication:
     factor: 1
   storage:

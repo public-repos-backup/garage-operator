@@ -17,10 +17,60 @@ limitations under the License.
 package utils
 
 import (
+	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestPinCertManagerImages(t *testing.T) {
+	var manifest strings.Builder
+	for source := range certmanagerImagePins {
+		if strings.Contains(source, "acmesolver") {
+			_, _ = fmt.Fprintf(&manifest, "      - --acme-http01-solver-image=%s\n", source)
+		} else {
+			_, _ = fmt.Fprintf(&manifest, "      image: %q\n", source)
+		}
+	}
+
+	pinned, err := pinCertManagerImages([]byte(manifest.String()))
+	if err != nil {
+		t.Fatalf("pin cert-manager images: %v", err)
+	}
+	for source, target := range certmanagerImagePins {
+		if strings.Contains(string(pinned), `"`+source+`"`) {
+			t.Errorf("unpinned image remains: %s", source)
+		}
+		if !strings.Contains(string(pinned), target) {
+			t.Errorf("pinned image is absent: %s", target)
+		}
+	}
+}
+
+func TestPinCertManagerImagesFailsClosed(t *testing.T) {
+	if _, err := pinCertManagerImages([]byte("image: example.invalid/new:latest\n")); err == nil {
+		t.Fatal("expected an error when required cert-manager images are absent")
+	}
+
+	var manifest strings.Builder
+	for source := range certmanagerImagePins {
+		if strings.Contains(source, "acmesolver") {
+			_, _ = fmt.Fprintf(&manifest, "- --acme-http01-solver-image=%s\n", source)
+		} else {
+			_, _ = fmt.Fprintf(&manifest, "image: %s\n", source)
+		}
+	}
+	for _, unpinned := range []string{
+		"image: example.invalid/new:latest\n",
+		"- --new-helper-image=example.invalid/new:latest\n",
+	} {
+		if _, err := pinCertManagerImages([]byte(manifest.String() + unpinned)); err == nil ||
+			!strings.Contains(err.Error(), "image without digest") {
+			t.Errorf("expected unpinned transitive image error for %q, got %v", unpinned, err)
+		}
+	}
+}
 
 // An unbounded `kubectl delete` in a teardown hook blocks on Garage's
 // fail-closed finalizers and burns the rest of the shard's `go test` budget, so
@@ -60,6 +110,28 @@ func TestBoundKubectlDelete(t *testing.T) {
 				t.Fatalf("must not add a deadline to %q, got %q", before, after)
 			}
 		})
+	}
+}
+
+func TestBindKubectlContext(t *testing.T) {
+	t.Setenv("KIND_CLUSTER", "garage-e2e")
+
+	cmd := exec.Command(kubectlBinary, "get", "pods")
+	if err := bindKubectlContext(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cmd.Args, []string{kubectlBinary, "--context=kind-garage-e2e", "get", "pods"}; !slices.Equal(got, want) {
+		t.Fatalf("args = %v, want %v", got, want)
+	}
+
+	matching := exec.Command(kubectlBinary, "--context", "kind-garage-e2e", "get", "pods")
+	if err := bindKubectlContext(matching); err != nil {
+		t.Fatalf("matching context rejected: %v", err)
+	}
+
+	foreign := exec.Command(kubectlBinary, "--context=production", "get", "pods")
+	if err := bindKubectlContext(foreign); err == nil {
+		t.Fatal("foreign kubectl context was accepted during Kind E2E")
 	}
 }
 

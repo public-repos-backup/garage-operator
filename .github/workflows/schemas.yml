@@ -10,6 +10,9 @@ on:
       - 'config/samples/**'
       - 'hack/openapi2jsonschema.py'
       - 'hack/generate-schemas.sh'
+      - 'hack/preserve-crd-compat-versions.py'
+      - 'Makefile'
+      - '.github/workflows/schemas.yml'
   pull_request:
     branches:
       - main
@@ -19,10 +22,16 @@ on:
       - 'config/samples/**'
       - 'hack/openapi2jsonschema.py'
       - 'hack/generate-schemas.sh'
+      - 'hack/preserve-crd-compat-versions.py'
+      - 'Makefile'
+      - '.github/workflows/schemas.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   generate-schemas:
@@ -30,15 +39,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.14'
 
       - name: Install PyYAML
-        run: pip install pyyaml
+        run: pip install PyYAML==6.0.3
 
       - name: Generate JSON schemas
         run: make schemas
@@ -55,15 +64,19 @@ jobs:
           fi
 
       - name: Install kubeconform
-        uses: jaxxstorm/action-install-gh-release@v3.0.0
+        uses: jaxxstorm/action-install-gh-release@25e24d2d23ae098373794ef1d6faecb48ee52da8 # v3.0.0
         with:
           repo: yannh/kubeconform
           tag: v0.8.0
+          asset-name: kubeconform-linux-amd64.tar.gz
+          digest: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
 
       - name: Validate sample manifests
         run: |
           kubeconform -strict -summary \
+            -kubernetes-version 1.25.0 \
             -schema-location default \
             -schema-location 'schemas/{{ .ResourceKind }}_{{ .ResourceAPIVersion }}.json' \
             -ignore-filename-pattern 'kustomization.yaml' \
-            config/samples/*.yaml
+            config/samples/*.yaml \
+            config/samples/cosi/garagecluster-e2e.yaml

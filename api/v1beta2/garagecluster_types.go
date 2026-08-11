@@ -62,7 +62,6 @@ const (
 type GarageClusterSpec struct {
 	// Image specifies the Garage container image to use.
 	// Takes precedence over imageRepository if both are set.
-	// +kubebuilder:default="dxflrs/garage:v2.3.0"
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -950,7 +949,7 @@ type NetworkConfig struct {
 	// +kubebuilder:default=3901
 	RPCBindPort int32 `json:"rpcBindPort,omitempty"`
 
-	// RPCBindAddress is a custom bind address for the RPC server.
+	// RPCBindAddress is a custom wildcard TCP bind address for the RPC server.
 	// +optional
 	RPCBindAddress string `json:"rpcBindAddress,omitempty"`
 
@@ -1030,7 +1029,7 @@ type S3APIConfig struct {
 	// +kubebuilder:default=3900
 	BindPort int32 `json:"bindPort,omitempty"`
 
-	// BindAddress is a custom bind address for the S3 API.
+	// BindAddress is a custom wildcard TCP bind address for the S3 API.
 	// +optional
 	BindAddress string `json:"bindAddress,omitempty"`
 
@@ -1051,7 +1050,7 @@ type K2VAPIConfig struct {
 	// +kubebuilder:default=3904
 	BindPort int32 `json:"bindPort,omitempty"`
 
-	// BindAddress is a custom bind address for the K2V API.
+	// BindAddress is a custom wildcard TCP bind address for the K2V API.
 	// +optional
 	BindAddress string `json:"bindAddress,omitempty"`
 }
@@ -1072,7 +1071,7 @@ type WebAPIConfig struct {
 	// +kubebuilder:default=3902
 	BindPort int32 `json:"bindPort,omitempty"`
 
-	// BindAddress is a custom bind address for the Web API.
+	// BindAddress is a custom wildcard TCP bind address for the Web API.
 	// +optional
 	BindAddress string `json:"bindAddress,omitempty"`
 
@@ -1155,7 +1154,7 @@ type BlockConfig struct {
 	MaxConcurrentWritesPerRequest *int `json:"maxConcurrentWritesPerRequest,omitempty"`
 
 	// CompressionLevel is the zstd compression level.
-	// +kubebuilder:validation:Pattern=`^(none|-?[1-9][0-9]*)$`
+	// +kubebuilder:validation:Pattern=`^(none|0|-?[1-9][0-9]*)$`
 	// +optional
 	CompressionLevel *string `json:"compressionLevel,omitempty"`
 
@@ -1322,7 +1321,9 @@ type PublicEndpointConfig struct {
 	// +optional
 	NodePort *NodePortEndpointConfig `json:"nodePort,omitempty"`
 
-	// ExternalIP configuration.
+	// ExternalIP is retained for API compatibility but is not supported.
+	// Setting it is rejected because the operator does not consume the explicit
+	// address mapping or template.
 	// +optional
 	ExternalIP *ExternalIPEndpointConfig `json:"externalIP,omitempty"`
 }
@@ -1351,13 +1352,13 @@ type NodePortEndpointConfig struct {
 	BasePort int32 `json:"basePort,omitempty"`
 }
 
-// ExternalIPEndpointConfig for direct external IP exposure.
+// ExternalIPEndpointConfig is retained for API compatibility but is unsupported.
 type ExternalIPEndpointConfig struct {
-	// Addresses maps pod names to external IPs.
+	// Addresses is retained for API compatibility but is unsupported.
 	// +optional
 	Addresses map[string]string `json:"addresses,omitempty"`
 
-	// AddressTemplate uses go template to generate addresses from pod info.
+	// AddressTemplate is retained for API compatibility but is unsupported.
 	// +optional
 	AddressTemplate string `json:"addressTemplate,omitempty"`
 }
@@ -1378,7 +1379,9 @@ type RemoteClusterConfig struct {
 	// +required
 	Connection RemoteClusterConnection `json:"connection"`
 
-	// DefaultCapacity is the default storage capacity to assign to remote nodes.
+	// DefaultCapacity is retained for API compatibility but is not supported.
+	// Remote role capacity is copied from the source cluster's committed or
+	// staged layout and cannot be overridden by the importing cluster.
 	// +optional
 	DefaultCapacity *resource.Quantity `json:"defaultCapacity,omitempty"`
 }

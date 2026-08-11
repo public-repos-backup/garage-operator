@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -49,7 +50,17 @@ import (
 	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
-const testNamespace = "default"
+const (
+	testNamespace          = "default"
+	testGarageKeyName      = "key"
+	testAllowBucketKeyPath = "/v2/AllowBucketKey"
+	testDenyBucketKeyPath  = "/v2/DenyBucketKey"
+	testGetBucketInfoPath  = "/v2/GetBucketInfo"
+	testRemoveAliasPath    = "/v2/RemoveBucketAlias"
+	testOldGlobalAlias     = "old-global"
+	testOldLocalAlias      = "old-local"
+	testOldAlias           = "old"
+)
 
 // testBucketID is a throwaway bucket id used by the timeout tests where the
 // upstream admin API call never returns or is mocked out before responding.
@@ -213,7 +224,7 @@ var _ = Describe("GarageBucket Controller", func() {
 			cluster := &garagev1beta2.GarageCluster{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       "deleting-cluster",
-					Namespace:  "default",
+					Namespace:  testNamespace,
 					Finalizers: []string{"test.garage.rajsingh.info/keep"},
 				},
 				Spec: garagev1beta2.GarageClusterSpec{
@@ -429,13 +440,13 @@ func TestReconcileKeyPermissions_RevokesDroppedAndSkipsUnchanged(t *testing.T) {
 		var denyCalls []garage.DenyBucketKeyRequest
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			switch req.URL.Path {
-			case "/v2/AllowBucketKey":
+			case testAllowBucketKeyPath:
 				var body garage.AllowBucketKeyRequest
 				_ = json.NewDecoder(req.Body).Decode(&body)
 				allowCalls = append(allowCalls, body)
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`{}`))
-			case "/v2/DenyBucketKey":
+			case testDenyBucketKeyPath:
 				var body garage.DenyBucketKeyRequest
 				_ = json.NewDecoder(req.Body).Decode(&body)
 				denyCalls = append(denyCalls, body)
@@ -510,7 +521,7 @@ func TestReconcileKeyPermissions_RevokesDroppedAndSkipsUnchanged(t *testing.T) {
 		if got.AccessKeyID != keyAID || got.BucketID != bktID {
 			t.Errorf("AllowBucketKey target=%+v, want bucket=%s key=%s", got, bktID, keyAID)
 		}
-		if want := (garage.BucketKeyPerms{Read: true, Write: true}); got.Permissions != want {
+		if want := (garage.BucketKeyPerms{Write: true}); got.Permissions != want {
 			t.Errorf("AllowBucketKey perms=%+v, want %+v", got.Permissions, want)
 		}
 		if len(*deny) != 0 {
@@ -552,7 +563,7 @@ func TestReconcileKeyPermissions_RevokesDroppedAndSkipsUnchanged(t *testing.T) {
 		if len(*allow) != 0 {
 			t.Errorf("expected 0 AllowBucketKey calls, got %d: %+v", len(*allow), *allow)
 		}
-		// Exactly one Deny, for keyB, with all perms set.
+		// Exactly one Deny, for keyB, containing only the currently set bit.
 		if len(*deny) != 1 {
 			t.Fatalf("expected 1 DenyBucketKey call, got %d: %+v", len(*deny), *deny)
 		}
@@ -560,7 +571,7 @@ func TestReconcileKeyPermissions_RevokesDroppedAndSkipsUnchanged(t *testing.T) {
 		if d.AccessKeyID != keyBID {
 			t.Errorf("DenyBucketKey AccessKeyID=%s, want %s (must not revoke keyA or keyC)", d.AccessKeyID, keyBID)
 		}
-		if want := (garage.BucketKeyPerms{Read: true, Write: true, Owner: true}); d.Permissions != want {
+		if want := (garage.BucketKeyPerms{Read: true}); d.Permissions != want {
 			t.Errorf("DenyBucketKey perms=%+v, want %+v", d.Permissions, want)
 		}
 
@@ -588,7 +599,7 @@ func TestReconcileKeyPermissions_RevokesDroppedAndSkipsUnchanged(t *testing.T) {
 				ClusterRef:        garagev1beta1.ClusterReference{Name: testClusterName},
 				BucketPermissions: []garagev1beta1.BucketPermission{{BucketRef: &garagev1beta1.BucketRef{Name: "bkt-flapwar"}, Read: true, Write: true}},
 			},
-			Status: garagev1beta1.GarageKeyStatus{AccessKeyID: keyBID},
+			Status: garagev1beta1.GarageKeyStatus{AccessKeyID: keyBID, ManagedBucketGrants: []string{bktID}},
 		}
 		r, gc, _, deny, stop := newReconciler(t, bucket, newKey(testKeyA, keyAID), keyBClaim)
 		defer stop()
@@ -607,6 +618,492 @@ func TestReconcileKeyPermissions_RevokesDroppedAndSkipsUnchanged(t *testing.T) {
 			t.Fatalf("expected 0 DenyBucketKey calls (keyB still claimed by a GarageKey), got %d: %+v", len(*deny), *deny)
 		}
 	})
+}
+
+func TestReconcileKeyPermissions_ExactUnionDowngrade(t *testing.T) {
+	const (
+		keyID    = "GKunion"
+		bucketID = "bucket-union"
+	)
+	s := runtime.NewScheme()
+	_ = garagev1beta1.AddToScheme(s)
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "union", Namespace: testNamespace},
+		Spec: garagev1beta1.GarageBucketSpec{
+			ClusterRef: garagev1beta1.ClusterReference{Name: testClusterName},
+			KeyPermissions: []garagev1beta1.KeyPermission{{
+				KeyRef: garagev1beta1.KeyRef{Name: testGarageKeyName}, Read: true,
+			}},
+		},
+	}
+	key := &garagev1beta1.GarageKey{
+		ObjectMeta: metav1.ObjectMeta{Name: testGarageKeyName, Namespace: testNamespace},
+		Spec: garagev1beta1.GarageKeySpec{
+			ClusterRef: garagev1beta1.ClusterReference{Name: testClusterName},
+			BucketPermissions: []garagev1beta1.BucketPermission{{
+				BucketID: bucketID, Write: true,
+			}},
+		},
+		Status: garagev1beta1.GarageKeyStatus{AccessKeyID: keyID, ManagedBucketGrants: []string{bucketID}},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(bucket, key).
+		WithStatusSubresource(&garagev1beta1.GarageBucket{}).Build()
+	r := &GarageBucketReconciler{Client: fc, Scheme: s}
+	var allows []garage.AllowBucketKeyRequest
+	var denies []garage.DenyBucketKeyRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case testAllowBucketKeyPath:
+			var body garage.AllowBucketKeyRequest
+			_ = json.NewDecoder(req.Body).Decode(&body)
+			allows = append(allows, body)
+		case testDenyBucketKeyPath:
+			var body garage.DenyBucketKeyRequest
+			_ = json.NewDecoder(req.Body).Decode(&body)
+			denies = append(denies, body)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	existing := &garage.Bucket{ID: bucketID, Keys: []garage.BucketKeyInfo{{
+		AccessKeyID: keyID, Permissions: garage.BucketKeyPerms{Read: true, Write: true, Owner: true},
+	}}}
+	if err := r.reconcileKeyPermissions(context.Background(), bucket, garage.NewClient(srv.URL, "tok"), existing); err != nil {
+		t.Fatal(err)
+	}
+	if len(allows) != 0 {
+		t.Fatalf("unexpected allow calls: %+v", allows)
+	}
+	if len(denies) != 1 || denies[0].Permissions != (garage.BucketKeyPerms{Owner: true}) {
+		t.Fatalf("denies=%+v, want only Owner downgrade (Read from bucket + Write from key must remain)", denies)
+	}
+}
+
+func TestReconcileAliases_RemovesOnlyPreviouslyManaged(t *testing.T) {
+	const (
+		bucketID = "bucket-alias"
+		keyID    = "GKalias"
+	)
+	s := runtime.NewScheme()
+	_ = garagev1beta1.AddToScheme(s)
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "bucket", Namespace: testNamespace},
+		Spec: garagev1beta1.GarageBucketSpec{
+			GlobalAlias:  "new-global",
+			LocalAliases: []garagev1beta1.LocalAlias{{KeyRef: testGarageKeyName, Alias: "new-local"}},
+		},
+		Status: garagev1beta1.GarageBucketStatus{
+			ManagedGlobalAlias:  testOldGlobalAlias,
+			ManagedLocalAliases: []garagev1beta1.LocalAliasStatus{{KeyID: keyID, Alias: testOldLocalAlias}},
+		},
+	}
+	key := &garagev1beta1.GarageKey{ObjectMeta: metav1.ObjectMeta{Name: testGarageKeyName, Namespace: testNamespace}, Status: garagev1beta1.GarageKeyStatus{AccessKeyID: keyID}}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(bucket, key).
+		WithStatusSubresource(&garagev1beta1.GarageBucket{}).Build()
+	r := &GarageBucketReconciler{Client: fc, Scheme: s}
+	var adds, removes []garage.RemoveBucketAliasRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var body garage.RemoveBucketAliasRequest
+		_ = json.NewDecoder(req.Body).Decode(&body)
+		switch req.URL.Path {
+		case "/v2/AddBucketAlias":
+			adds = append(adds, body)
+		case testRemoveAliasPath:
+			removes = append(removes, body)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	gc := garage.NewClient(srv.URL, "tok")
+	ctx := context.Background()
+	if err := r.reconcileGlobalAlias(ctx, bucket, gc, bucketID, "new-global", []string{testOldGlobalAlias, "manual-global"}); err != nil {
+		t.Fatal(err)
+	}
+	currentKeys := []garage.BucketKeyInfo{{AccessKeyID: keyID, BucketLocalAliases: []string{testOldLocalAlias, "manual-local"}}}
+	if err := r.reconcileLocalAliases(ctx, bucket, gc, bucketID, currentKeys); err != nil {
+		t.Fatal(err)
+	}
+	if len(adds) != 2 {
+		t.Fatalf("adds=%+v, want new global and local aliases", adds)
+	}
+	if len(removes) != 2 {
+		t.Fatalf("removes=%+v, want old managed global and local aliases", removes)
+	}
+	for _, call := range removes {
+		if call.GlobalAlias == "manual-global" || call.LocalAlias == "manual-local" {
+			t.Fatalf("removed unmanaged alias: %+v", call)
+		}
+	}
+	if removes[0].GlobalAlias != testOldGlobalAlias || removes[1].LocalAlias != testOldLocalAlias {
+		t.Fatalf("removes=%+v, want only prior managed aliases", removes)
+	}
+}
+
+func TestReconcileGlobalAlias_DoesNotAdvanceOwnershipOnRemoveFailure(t *testing.T) {
+	s := runtime.NewScheme()
+	_ = garagev1beta1.AddToScheme(s)
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "bucket-alias-failure", Namespace: testNamespace},
+		Status:     garagev1beta1.GarageBucketStatus{ManagedGlobalAlias: testOldAlias},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(bucket).
+		WithStatusSubresource(&garagev1beta1.GarageBucket{}).Build()
+	r := &GarageBucketReconciler{Client: fc, Scheme: s}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == testRemoveAliasPath {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`remove failed`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	err := r.reconcileGlobalAlias(context.Background(), bucket, garage.NewClient(srv.URL, "tok"), "bucket-id", "new", []string{testOldAlias})
+	if err == nil {
+		t.Fatal("rename unexpectedly succeeded")
+	}
+	fresh := &garagev1beta1.GarageBucket{}
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: bucket.Name, Namespace: bucket.Namespace}, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Status.ManagedGlobalAlias != testOldAlias {
+		t.Fatalf("managedGlobalAlias=%q, want old after failed remove", fresh.Status.ManagedGlobalAlias)
+	}
+}
+
+func TestReconcileGlobalAlias_DoesNotRemoveOldAliasOnConflictingAdd(t *testing.T) {
+	s := runtime.NewScheme()
+	_ = garagev1beta1.AddToScheme(s)
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "bucket-alias-conflict", Namespace: testNamespace},
+		Status:     garagev1beta1.GarageBucketStatus{ManagedGlobalAlias: testOldAlias},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(bucket).
+		WithStatusSubresource(&garagev1beta1.GarageBucket{}).Build()
+	r := &GarageBucketReconciler{Client: fc, Scheme: s}
+	removeCalls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/v2/AddBucketAlias":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`alias already exists`))
+		case testGetBucketInfoPath:
+			_, _ = w.Write([]byte(`{"id":"other-bucket"}`))
+		case testRemoveAliasPath:
+			removeCalls++
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	err := r.reconcileGlobalAlias(context.Background(), bucket, garage.NewClient(srv.URL, "tok"), "owned-bucket", "taken", []string{testOldAlias})
+	if err == nil || !strings.Contains(err.Error(), "conflicts with another bucket") {
+		t.Fatalf("err=%v, want conflicting alias failure", err)
+	}
+	if removeCalls != 0 {
+		t.Fatalf("remove calls=%d, want zero", removeCalls)
+	}
+	if bucket.Status.ManagedGlobalAlias != testOldAlias {
+		t.Fatalf("managedGlobalAlias=%q, want %q", bucket.Status.ManagedGlobalAlias, testOldAlias)
+	}
+}
+
+func TestCleanupMPU_RetainsAnnotationsOnFailureAndRetries(t *testing.T) {
+	s := runtime.NewScheme()
+	_ = garagev1beta1.AddToScheme(s)
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "cleanup", Namespace: testNamespace, Annotations: map[string]string{
+			garagev1beta1.AnnotationCleanupMPU:          "true",
+			garagev1beta1.AnnotationCleanupMPUOlderThan: "2h",
+		}},
+		Status: garagev1beta1.GarageBucketStatus{BucketID: "bucket-cleanup"},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(bucket).Build()
+	r := &GarageBucketReconciler{Client: fc, Scheme: s}
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/v2/CleanupIncompleteUploads" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var body garage.CleanupIncompleteUploadsRequest
+		_ = json.NewDecoder(req.Body).Decode(&body)
+		if body.OlderThanSecs != 7200 {
+			t.Errorf("olderThanSecs=%d, want 7200", body.OlderThanSecs)
+		}
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`failure`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"uploadsDeleted":1}`))
+	}))
+	defer srv.Close()
+	gc := garage.NewClient(srv.URL, "tok")
+	ctx := context.Background()
+	if err := r.handleBucketAnnotations(ctx, bucket, gc); err == nil {
+		t.Fatal("first cleanup unexpectedly succeeded")
+	}
+	fresh := &garagev1beta1.GarageBucket{}
+	_ = fc.Get(ctx, types.NamespacedName{Name: bucket.Name, Namespace: bucket.Namespace}, fresh)
+	if fresh.Annotations[garagev1beta1.AnnotationCleanupMPUOlderThan] != "2h" {
+		t.Fatalf("cleanup annotations were not retained after failure: %v", fresh.Annotations)
+	}
+	if err := r.handleBucketAnnotations(ctx, fresh, gc); err != nil {
+		t.Fatalf("retry cleanup: %v", err)
+	}
+	completed := &garagev1beta1.GarageBucket{}
+	_ = fc.Get(ctx, types.NamespacedName{Name: bucket.Name, Namespace: bucket.Namespace}, completed)
+	if _, ok := completed.Annotations[garagev1beta1.AnnotationCleanupMPU]; ok {
+		t.Fatalf("cleanup annotation remains after success: %v", completed.Annotations)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls=%d, want 2", calls.Load())
+	}
+}
+
+func TestBuildQuotasUpdateRejectsNegativeValues(t *testing.T) {
+	negativeObjects := int64(-1)
+	negativeSize := resource.MustParse("-1Gi")
+	for name, quotas := range map[string]*garagev1beta1.BucketQuotas{
+		"objects": {MaxObjects: &negativeObjects},
+		"size":    {MaxSize: &negativeSize},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := buildQuotasUpdate(quotas, nil); err == nil {
+				t.Fatal("negative quota was converted to uint64")
+			}
+		})
+	}
+}
+
+func TestGetOrCreateBucket_COSIAnnotationPinsExactID(t *testing.T) {
+	const cosiID = "cosi-bucket-exact"
+	for _, tc := range []struct {
+		name   string
+		status int
+	}{
+		{name: "adopts exact annotated bucket", status: http.StatusOK},
+		{name: "fails closed when annotated bucket is missing", status: http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				requests = append(requests, req.URL.Path+"?"+req.URL.RawQuery)
+				if req.URL.Query().Get("id") != cosiID {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				w.WriteHeader(tc.status)
+				if tc.status == http.StatusOK {
+					_, _ = w.Write([]byte(`{"id":"cosi-bucket-exact","globalAliases":[],"keys":[]}`))
+				}
+			}))
+			defer srv.Close()
+			bucket := &garagev1beta1.GarageBucket{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{garagev1beta1.AnnotationCOSIBucketID: cosiID}},
+				Spec:       garagev1beta1.GarageBucketSpec{GlobalAlias: "colliding-alias"},
+				Status:     garagev1beta1.GarageBucketStatus{BucketID: cosiID},
+			}
+			r := &GarageBucketReconciler{}
+			got, err := r.getOrCreateBucket(context.Background(), bucket, garage.NewClient(srv.URL, "tok"), "colliding-alias")
+			if tc.status == http.StatusNotFound {
+				if err == nil {
+					t.Fatal("missing annotated bucket unexpectedly fell back to alias/create")
+				}
+			} else if err != nil || got.ID != cosiID || bucket.Status.BucketID != cosiID {
+				t.Fatalf("got=%+v status=%q err=%v", got, bucket.Status.BucketID, err)
+			}
+			if len(requests) != 1 || !strings.Contains(requests[0], "id="+cosiID) {
+				t.Fatalf("requests=%v, want one exact-ID lookup and no alias/create fallback", requests)
+			}
+		})
+	}
+}
+
+func TestGetOrCreateBucket_DoesNotAdoptUntrackedAlias(t *testing.T) {
+	var creates int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == testGetBucketInfoPath && req.URL.Query().Get("globalAlias") == "shared-alias" {
+			_, _ = w.Write([]byte(`{"id":"unrelated-bucket","globalAliases":["shared-alias"],"keys":[]}`))
+			return
+		}
+		if req.URL.Path == "/v2/CreateBucket" {
+			creates++
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-alias", Namespace: testNamespace, UID: "bucket-uid"},
+		Spec:       garagev1beta1.GarageBucketSpec{GlobalAlias: "shared-alias"},
+	}
+	r := &GarageBucketReconciler{}
+	_, err := r.getOrCreateBucket(context.Background(), bucket, garage.NewClient(srv.URL, "tok"), "shared-alias")
+	if err == nil || !strings.Contains(err.Error(), "untracked Garage bucket") {
+		t.Fatalf("err=%v, want untracked ownership failure", err)
+	}
+	if bucket.Status.BucketID != "" {
+		t.Fatalf("adopted unrelated bucket ID %q", bucket.Status.BucketID)
+	}
+	if creates != 0 {
+		t.Fatalf("CreateBucket calls=%d, want 0 while alias is occupied", creates)
+	}
+}
+
+func TestGetOrCreateBucket_RecoversCommittedCreateBeforeStatusWrite(t *testing.T) {
+	const (
+		name     = "crash-safe-bucket"
+		bucketID = "0123456789abcdef0123456789abcdef"
+	)
+	scheme := runtime.NewScheme()
+	if err := garagev1beta1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &garagev1beta1.GarageBucket{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, UID: "bucket-uid"}}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(bucket).Build()
+	reconciler := &GarageBucketReconciler{Client: kubeClient, Scheme: scheme}
+	createdAlias := ""
+	createCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v2/GetBucketInfo":
+			alias := request.URL.Query().Get("globalAlias")
+			if alias != "" && alias == createdAlias {
+				_ = json.NewEncoder(w).Encode(garage.Bucket{ID: bucketID, GlobalAliases: []string{createdAlias}})
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		case "/v2/CreateBucket":
+			createCalls++
+			var body garage.CreateBucketRequest
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Errorf("decode CreateBucket: %v", err)
+			}
+			createdAlias = body.GlobalAlias
+			if !strings.HasPrefix(createdAlias, "garage-rsv-") {
+				t.Errorf("reservation alias = %q", createdAlias)
+			}
+			_ = json.NewEncoder(w).Encode(garage.Bucket{ID: bucketID, GlobalAliases: []string{createdAlias}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	garageClient := garage.NewClient(server.URL, "token")
+
+	first := &garagev1beta1.GarageBucket{}
+	if err := kubeClient.Get(t.Context(), client.ObjectKeyFromObject(bucket), first); err != nil {
+		t.Fatal(err)
+	}
+	created, err := reconciler.getOrCreateBucket(t.Context(), first, garageClient, name)
+	if err != nil || created.ID != bucketID || createCalls != 1 {
+		t.Fatalf("first create=%+v err=%v calls=%d", created, err, createCalls)
+	}
+	// Simulate process death before status.bucketID is persisted. Only the
+	// metadata reservation patch survives in Kubernetes.
+	fresh := &garagev1beta1.GarageBucket{}
+	if err := kubeClient.Get(t.Context(), client.ObjectKeyFromObject(bucket), fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Status.BucketID != "" || fresh.Annotations[garagev1beta1.AnnotationBucketReservationAlias] != createdAlias {
+		t.Fatalf("durable reservation state status=%q annotations=%v", fresh.Status.BucketID, fresh.Annotations)
+	}
+	recovered, err := reconciler.getOrCreateBucket(t.Context(), fresh, garageClient, name)
+	if err != nil || recovered.ID != bucketID || fresh.Status.BucketID != bucketID {
+		t.Fatalf("recovered=%+v status=%q err=%v", recovered, fresh.Status.BucketID, err)
+	}
+	if createCalls != 1 {
+		t.Fatalf("CreateBucket calls=%d, want one across crash retry", createCalls)
+	}
+}
+
+func TestGetOrCreateBucketRejectsReservationAliasNotBoundToUID(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	bucket := &garagev1beta1.GarageBucket{ObjectMeta: metav1.ObjectMeta{
+		Name: "owned", Namespace: testNamespace, UID: "owned-uid",
+		Annotations: map[string]string{garagev1beta1.AnnotationBucketReservationAlias: "victim-alias"},
+	}}
+
+	_, err := (&GarageBucketReconciler{}).getOrCreateBucket(
+		t.Context(), bucket, garage.NewClient(server.URL, "token"), "owned",
+	)
+	if err == nil || !strings.Contains(err.Error(), "unbound bucket reservation alias") {
+		t.Fatalf("unbound reservation error = %v", err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("Garage requests = %d, want zero before ownership validation", requests.Load())
+	}
+}
+
+func TestGarageBucketReservationAliasUsesUIDBound128BitDigest(t *testing.T) {
+	original := &garagev1beta1.GarageBucket{ObjectMeta: metav1.ObjectMeta{
+		Name: "owned", Namespace: testNamespace, UID: "original-uid",
+	}}
+	recreated := original.DeepCopy()
+	recreated.UID = "recreated-uid"
+
+	originalAlias, err := garageBucketReservationAlias(original)
+	if err != nil {
+		t.Fatalf("original reservation alias: %v", err)
+	}
+	recreatedAlias, err := garageBucketReservationAlias(recreated)
+	if err != nil {
+		t.Fatalf("recreated reservation alias: %v", err)
+	}
+	const prefix = "garage-rsv-"
+	digest, err := hex.DecodeString(strings.TrimPrefix(originalAlias, prefix))
+	if !strings.HasPrefix(originalAlias, prefix) || err != nil || len(digest) != 16 {
+		t.Fatalf("reservation alias %q does not contain an exact 128-bit hexadecimal digest", originalAlias)
+	}
+	if recreatedAlias == originalAlias {
+		t.Fatalf("reservation alias was reused across UID recreation: %q", originalAlias)
+	}
+}
+
+func TestGetOrCreateBucketRejectsReservationAliasCopiedAcrossUIDRecreation(t *testing.T) {
+	original := &garagev1beta1.GarageBucket{ObjectMeta: metav1.ObjectMeta{
+		Name: "owned", Namespace: testNamespace, UID: "original-uid",
+	}}
+	copiedAlias, err := garageBucketReservationAlias(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	recreated := original.DeepCopy()
+	recreated.UID = "recreated-uid"
+	recreated.Annotations = map[string]string{garagev1beta1.AnnotationBucketReservationAlias: copiedAlias}
+
+	_, err = (&GarageBucketReconciler{}).getOrCreateBucket(
+		t.Context(), recreated, garage.NewClient(server.URL, "token"), "owned",
+	)
+	if err == nil || !strings.Contains(err.Error(), "unbound bucket reservation alias") {
+		t.Fatalf("copied reservation error = %v", err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("Garage requests = %d, want zero before UID ownership validation", requests.Load())
+	}
 }
 
 // TestGetBucketWithTimeout_HangServer asserts that getBucketWithTimeout

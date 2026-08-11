@@ -53,6 +53,30 @@ func TestParseBucketClassParameters(t *testing.T) {
 			params:  map[string]string{},
 			wantErr: true,
 		},
+		{
+			name: "negative maxSize",
+			params: map[string]string{
+				testClusterRef: testMyCluster,
+				paramMaxSize:   "-1Gi",
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative maxObjects",
+			params: map[string]string{
+				testClusterRef:  testMyCluster,
+				paramMaxObjects: "-1",
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid websiteEnabled",
+			params: map[string]string{
+				testClusterRef:      testMyCluster,
+				paramWebsiteEnabled: "treu",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -116,23 +140,18 @@ func TestParseBucketAccessClassParameters(t *testing.T) {
 }
 
 func TestParseBucketClassParameters_UnknownParams(t *testing.T) {
-	params, err := ParseBucketClassParameters(map[string]string{
+	_, err := ParseBucketClassParameters(map[string]string{
 		testClusterRef: testMyCluster,
 		"unknownKey":   "somevalue",
 		"anotherKey":   "anothervalue",
 	}, "default")
-	require.NoError(t, err)
-	require.Len(t, params.UnknownParams, 2)
-	assert.Contains(t, params.UnknownParams, "unknownKey")
-	assert.Contains(t, params.UnknownParams, "anotherKey")
+	require.EqualError(t, err, "unsupported BucketClass parameters: anotherKey, unknownKey")
 }
 
 func TestParseBucketAccessClassParameters_UnknownParams(t *testing.T) {
-	params, err := ParseBucketAccessClassParameters(map[string]string{
+	_, err := ParseBucketAccessClassParameters(map[string]string{
 		testClusterRef: testMyCluster,
 		"extra":        "ignored",
 	}, "default")
-	require.NoError(t, err)
-	require.Len(t, params.UnknownParams, 1)
-	assert.Contains(t, params.UnknownParams, "extra")
+	require.EqualError(t, err, "unsupported BucketAccessClass parameters: extra")
 }

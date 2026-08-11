@@ -20,13 +20,25 @@ fi
 # Check if PyYAML is installed, install if not
 if ! python3 -c "import yaml" 2>/dev/null; then
     echo "Installing PyYAML..."
-    pip3 install --user pyyaml 2>/dev/null || pip3 install pyyaml --break-system-packages 2>/dev/null || {
-        echo "Error: Failed to install PyYAML. Please install it manually: pip3 install pyyaml"
+    pip3 install --user 'PyYAML==6.0.3' 2>/dev/null || pip3 install 'PyYAML==6.0.3' --break-system-packages 2>/dev/null || {
+        echo "Error: Failed to install PyYAML 6.0.3. Please install it manually: pip3 install PyYAML==6.0.3"
         exit 1
     }
 fi
 
 mkdir -p "${OUTPUT_DIR}"
 
-# Run the Python converter
-python3 "${SCRIPT_DIR}/openapi2jsonschema.py" "${OUTPUT_DIR}" "${CRD_DIR}"/*.yaml
+# Generate into a fresh staging directory so schemas for deleted CRDs cannot
+# linger indefinitely in the committed output.
+STAGING_DIR="$(mktemp -d)"
+trap 'rm -rf -- "${STAGING_DIR}"' EXIT
+python3 "${SCRIPT_DIR}/openapi2jsonschema.py" "${STAGING_DIR}" "${CRD_DIR}"/*.yaml
+
+for existing in "${OUTPUT_DIR}"/*.json; do
+    [ -e "${existing}" ] || continue
+    generated="${STAGING_DIR}/$(basename "${existing}")"
+    if [ ! -f "${generated}" ]; then
+        rm -f -- "${existing}"
+    fi
+done
+cp "${STAGING_DIR}"/*.json "${OUTPUT_DIR}/"

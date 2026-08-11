@@ -100,7 +100,7 @@
           "description": "ClusterRef references the GarageCluster this key belongs to",
           "properties": {
             "kubeConfigSecretRef": {
-              "description": "KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.\nOnly needed for multi-cluster federation where the GarageCluster lives in a different\nKubernetes cluster entirely (not just a different namespace).",
+              "description": "KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.\nIt is currently rejected by admission because the operator does not use it.",
               "properties": {
                 "key": {
                   "description": "The key of the secret to select from.  Must be a valid secret key.",
@@ -163,7 +163,7 @@
               "type": "string"
             },
             "secretRef": {
-              "description": "SecretRef references a Kubernetes secret containing the credentials.\nMutually exclusive with inline accessKeyId/secretAccessKey.",
+              "description": "SecretRef references a Kubernetes secret containing the credentials.\nMutually exclusive with inline accessKeyId/secretAccessKey.\nThe namespace must be empty or match the GarageKey namespace.",
               "properties": {
                 "name": {
                   "description": "name is unique within a namespace to reference a secret resource.",
@@ -339,7 +339,7 @@
           "type": "array"
         },
         "clusterWide": {
-          "description": "ClusterWide indicates this key has cluster-wide bucket access via allBuckets",
+          "description": "ClusterWide records reserved or active operator ownership of permissions\nmanaged through spec.allBuckets. It is set before the first remote allow\nand remains set until every resulting permission has been removed.",
           "type": "boolean"
         },
         "conditions": {
@@ -408,7 +408,7 @@
           "type": "string"
         },
         "effectivePermissions": {
-          "description": "EffectivePermissions shows merged permissions from both bucket and key definitions",
+          "description": "EffectivePermissions is retained for API compatibility but is not currently\npopulated. Status.Buckets reports Garage's authoritative effective bucket access.",
           "items": {
             "description": "EffectivePermission shows the resolved permission for a bucket",
             "properties": {
@@ -453,6 +453,13 @@
         "keyId": {
           "description": "KeyID is the Garage-assigned key ID",
           "type": "string"
+        },
+        "managedBucketGrants": {
+          "description": "ManagedBucketGrants lists Garage bucket IDs with reserved or active\noperator ownership from this key's spec.bucketPermissions. IDs are recorded\nbefore the first remote mutation and removed only after exact convergence,\nallowing crash-safe removal or downgrade without touching manual grants.\nCluster-wide spec.allBuckets ownership is represented by ClusterWide.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "observedGeneration": {
           "description": "ObservedGeneration is the last observed generation",

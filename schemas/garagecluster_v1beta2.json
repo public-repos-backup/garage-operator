@@ -95,7 +95,7 @@
           "properties": {
             "compressionLevel": {
               "description": "CompressionLevel is the zstd compression level.",
-              "pattern": "^(none|-?[1-9][0-9]*)$",
+              "pattern": "^(none|0|-?[1-9][0-9]*)$",
               "type": "string"
             },
             "disableScrub": {
@@ -188,7 +188,7 @@
               "description": "ClusterRef references a GarageCluster in the same namespace.",
               "properties": {
                 "kubeConfigSecretRef": {
-                  "description": "KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.\nOnly needed for multi-cluster federation where the GarageCluster lives in a different\nKubernetes cluster entirely (not just a different namespace).",
+                  "description": "KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.\nIt is currently rejected by admission because the operator does not use it.",
                   "properties": {
                     "key": {
                       "description": "The key of the secret to select from.  Must be a valid secret key.",
@@ -2819,7 +2819,6 @@
           "additionalProperties": false
         },
         "image": {
-          "default": "dxflrs/garage:v2.3.0",
           "description": "Image specifies the Garage container image to use.\nTakes precedence over imageRepository if both are set.",
           "type": "string"
         },
@@ -2853,7 +2852,7 @@
           "description": "K2VAPI configures the K2V (key-value) API endpoint.\nOmit to disable K2V.",
           "properties": {
             "bindAddress": {
-              "description": "BindAddress is a custom bind address for the K2V API.",
+              "description": "BindAddress is a custom wildcard TCP bind address for the K2V API.",
               "type": "string"
             },
             "bindPort": {
@@ -3041,7 +3040,7 @@
               "type": "array"
             },
             "rpcBindAddress": {
-              "description": "RPCBindAddress is a custom bind address for the RPC server.",
+              "description": "RPCBindAddress is a custom wildcard TCP bind address for the RPC server.",
               "type": "string"
             },
             "rpcBindOutgoing": {
@@ -3150,17 +3149,17 @@
           "description": "PublicEndpoint configures how remote clusters reach this cluster's nodes.\nUsed for multi-cluster federation of the storage tier.",
           "properties": {
             "externalIP": {
-              "description": "ExternalIP configuration.",
+              "description": "ExternalIP is retained for API compatibility but is not supported.\nSetting it is rejected because the operator does not consume the explicit\naddress mapping or template.",
               "properties": {
                 "addressTemplate": {
-                  "description": "AddressTemplate uses go template to generate addresses from pod info.",
+                  "description": "AddressTemplate is retained for API compatibility but is unsupported.",
                   "type": "string"
                 },
                 "addresses": {
                   "additionalProperties": {
                     "type": "string"
                   },
-                  "description": "Addresses maps pod names to external IPs.",
+                  "description": "Addresses is retained for API compatibility but is unsupported.",
                   "type": "object"
                 }
               },
@@ -3308,7 +3307,7 @@
                     "type": "string"
                   }
                 ],
-                "description": "DefaultCapacity is the default storage capacity to assign to remote nodes.",
+                "description": "DefaultCapacity is retained for API compatibility but is not supported.\nRemote role capacity is copied from the source cluster's committed or\nstaged layout and cannot be overridden by the importing cluster.",
                 "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))))?$",
                 "x-kubernetes-int-or-string": true
               },
@@ -3378,7 +3377,7 @@
           "description": "S3API configures the S3-compatible API endpoint",
           "properties": {
             "bindAddress": {
-              "description": "BindAddress is a custom bind address for the S3 API.",
+              "description": "BindAddress is a custom wildcard TCP bind address for the S3 API.",
               "type": "string"
             },
             "bindPort": {
@@ -8016,7 +8015,7 @@
               "type": "boolean"
             },
             "bindAddress": {
-              "description": "BindAddress is a custom bind address for the Web API.",
+              "description": "BindAddress is a custom wildcard TCP bind address for the Web API.",
               "type": "string"
             },
             "bindPort": {

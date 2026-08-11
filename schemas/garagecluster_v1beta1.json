@@ -884,7 +884,7 @@
           "properties": {
             "compressionLevel": {
               "description": "CompressionLevel is the zstd compression level\n1-19: standard, 20-22: ultra, -1 to -99: fast, \"none\": disabled",
-              "pattern": "^(none|-?[1-9][0-9]*)$",
+              "pattern": "^(none|0|-?[1-9][0-9]*)$",
               "type": "string"
             },
             "disableScrub": {
@@ -983,7 +983,7 @@
               "description": "ClusterRef references a GarageCluster in the same namespace.\nWhen set, the operator automatically reads the RPC secret and admin token from\nthe referenced cluster \u2014 no need to set rpcSecretRef or adminTokenSecretRef.",
               "properties": {
                 "kubeConfigSecretRef": {
-                  "description": "KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.\nOnly needed for multi-cluster federation where the GarageCluster lives in a different\nKubernetes cluster entirely (not just a different namespace).",
+                  "description": "KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.\nIt is currently rejected by admission because the operator does not use it.",
                   "properties": {
                     "key": {
                       "description": "The key of the secret to select from.  Must be a valid secret key.",
@@ -1439,7 +1439,6 @@
           "type": "boolean"
         },
         "image": {
-          "default": "dxflrs/garage:v2.3.0",
           "description": "Image specifies the Garage container image to use.\nTakes precedence over imageRepository if both are set.",
           "type": "string"
         },
@@ -1473,7 +1472,7 @@
           "description": "K2VAPI configures the K2V (key-value) API endpoint.\nOmit to disable K2V.",
           "properties": {
             "bindAddress": {
-              "description": "BindAddress is a custom bind address for the K2V API.\nCan be a TCP address or Unix socket path (e.g., \"unix:///run/garage/k2v.sock\").\nIf set, this overrides BindPort.",
+              "description": "BindAddress is a custom wildcard TCP bind address for the K2V API.\nIf set, this overrides BindPort.",
               "type": "string"
             },
             "bindPort": {
@@ -1661,7 +1660,7 @@
               "type": "array"
             },
             "rpcBindAddress": {
-              "description": "RPCBindAddress is a custom bind address for the RPC server.\nCan be a TCP address (e.g., \"0.0.0.0:3901\", \"[::]:3901\").\nIf set, this overrides RPCBindPort.",
+              "description": "RPCBindAddress is a custom wildcard TCP bind address for the RPC server.\nManaged workloads accept \"0.0.0.0:3901\" or \"[::]:3901\" so the\ngenerated Service can reach every Garage process.\nIf set, this overrides RPCBindPort.",
               "type": "string"
             },
             "rpcBindOutgoing": {
@@ -1831,17 +1830,17 @@
           "description": "PublicEndpoint configures how remote clusters reach this cluster's nodes\nRequired for multi-cluster federation",
           "properties": {
             "externalIP": {
-              "description": "ExternalIP configuration",
+              "description": "ExternalIP is retained for API compatibility but is not supported.\nSetting it is rejected because the operator does not consume the explicit\naddress mapping or template.",
               "properties": {
                 "addressTemplate": {
-                  "description": "AddressTemplate uses go template to generate addresses from pod info\nExample: \"garage-{{.Index}}.example.com\"",
+                  "description": "AddressTemplate is retained for API compatibility but is unsupported.",
                   "type": "string"
                 },
                 "addresses": {
                   "additionalProperties": {
                     "type": "string"
                   },
-                  "description": "Addresses maps pod names to external IPs",
+                  "description": "Addresses is retained for API compatibility but is unsupported.",
                   "type": "object"
                 }
               },
@@ -1985,7 +1984,7 @@
                     "type": "string"
                   }
                 ],
-                "description": "DefaultCapacity is the default storage capacity to assign to remote nodes\nthat don't yet have a role in the layout. If not specified, defaults to 100Gi.\nSet to \"0\" to add nodes as gateway-only (no storage).",
+                "description": "DefaultCapacity is retained for API compatibility but is not supported.\nRemote role capacity is copied from the source cluster's committed or\nstaged layout and cannot be overridden by the importing cluster.",
                 "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))))?$",
                 "x-kubernetes-int-or-string": true
               },
@@ -2127,7 +2126,7 @@
           "description": "S3API configures the S3-compatible API endpoint",
           "properties": {
             "bindAddress": {
-              "description": "BindAddress is a custom bind address for the S3 API.\nCan be a TCP address (e.g., \"0.0.0.0:3900\", \"[::]:3900\") or\na Unix socket path (e.g., \"unix:///run/garage/s3.sock\").\nIf set, this overrides BindPort.",
+              "description": "BindAddress is a custom wildcard TCP bind address for the S3 API.\nManaged workloads accept \"0.0.0.0:3900\" or \"[::]:3900\" so the\ngenerated Service and probes can reach every Garage process.\nIf set, this overrides BindPort.",
               "type": "string"
             },
             "bindPort": {
@@ -3956,7 +3955,7 @@
               "type": "boolean"
             },
             "bindAddress": {
-              "description": "BindAddress is a custom bind address for the Web API.\nCan be a TCP address or Unix socket path (e.g., \"unix:///run/garage/web.sock\").\nIf set, this overrides BindPort.",
+              "description": "BindAddress is a custom wildcard TCP bind address for the Web API.\nIf set, this overrides BindPort.",
               "type": "string"
             },
             "bindPort": {

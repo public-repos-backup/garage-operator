@@ -602,7 +602,7 @@ func TestGetSelfNodeInfoRequiresExactConsistentMultiResponse(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodGet || r.URL.Path != "/v2/GetNodeInfo" || r.URL.Query().Get("node") != "self" {
+				if r.Method != http.MethodGet || r.URL.Path != "/v2/GetNodeInfo" || r.URL.Query().Get("node") != workerNodeSelf {
 					http.NotFound(w, r)
 					return
 				}
@@ -659,6 +659,24 @@ func TestLaunchRepairRequiresPerNodeSuccess(t *testing.T) {
 	})
 }
 
+func TestClientNormalizesTrailingSlashInBaseURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/GetClusterStatus" {
+			t.Fatalf("request path = %q, want one canonical slash before v2", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"layoutVersion":1,"nodes":[]}`)
+	}))
+	defer server.Close()
+
+	client := NewClient("  "+server.URL+"/  ", "token")
+	if client.BaseURL() != server.URL {
+		t.Fatalf("base URL = %q, want %q", client.BaseURL(), server.URL)
+	}
+	if _, err := client.GetClusterStatus(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func float32Ptr(v float32) *float32 {
 	return &v
 }
@@ -681,15 +699,100 @@ func TestLaunchScrubCommand_RequestBody(t *testing.T) {
 				if r.URL.Query().Get("node") != "*" {
 					t.Errorf("expected node=*, got %q", r.URL.Query().Get("node"))
 				}
-				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"success":{"node-a":null},"error":{}}`)
 			}))
 			defer srv.Close()
 
 			c := NewClient(srv.URL, "test-token")
-			_ = c.LaunchScrubCommand(context.Background(), "*", tt.command)
+			if err := c.LaunchScrubCommand(context.Background(), "*", tt.command); err != nil {
+				t.Fatal(err)
+			}
 
 			if string(gotBody) != tt.wantBody {
 				t.Errorf("body = %q, want %q", gotBody, tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestNodeScopedCommandsRejectEmbeddedFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		call func(*Client) error
+	}{
+		{
+			name: "worker variable",
+			path: "/v2/SetWorkerVariable",
+			call: func(c *Client) error {
+				return c.SetWorkerVariable(context.Background(), "*", "scrub-tranquility", "10")
+			},
+		},
+		{
+			name: "scrub command",
+			path: "/v2/LaunchRepairOperation",
+			call: func(c *Client) error {
+				return c.LaunchScrubCommand(context.Background(), "*", "start")
+			},
+		},
+		{
+			name: "metadata snapshot",
+			path: "/v2/CreateMetadataSnapshot",
+			call: func(c *Client) error {
+				return c.CreateMetadataSnapshot(context.Background(), "*")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != test.path || r.URL.Query().Get("node") != "*" {
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+				}
+				_, _ = io.WriteString(w, `{"success":{},"error":{"node-a":"not connected"}}`)
+			}))
+			defer server.Close()
+
+			err := test.call(NewClient(server.URL, "token"))
+			if err == nil || !strings.Contains(err.Error(), "node-a: not connected") {
+				t.Fatalf("embedded dispatch failure was accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestNodeScopedMutationsRequireAtLeastOneSuccess(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*Client) error
+	}{
+		{
+			name: "retry block resync",
+			call: func(c *Client) error {
+				_, err := c.RetryBlockResync(context.Background(), "*", true, nil)
+				return err
+			},
+		},
+		{
+			name: "purge blocks",
+			call: func(c *Client) error {
+				_, err := c.PurgeBlocks(context.Background(), "*", []string{strings.Repeat("a", 64)})
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, `{"success":{},"error":{}}`)
+			}))
+			defer server.Close()
+
+			err := test.call(NewClient(server.URL, "token"))
+			if err == nil || !strings.Contains(err.Error(), "no successful nodes") {
+				t.Fatalf("empty dispatch result was accepted: %v", err)
 			}
 		})
 	}

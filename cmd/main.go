@@ -18,6 +18,7 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -106,12 +107,15 @@ func main() {
 	flag.StringVar(&watchNamespaces, "watch-namespaces", "",
 		"Comma-separated list of namespaces to watch. If empty, watches all namespaces. "+
 			"Can also be set via WATCH_NAMESPACE env var.")
+	var controllerServiceAccountName string
+	flag.StringVar(&controllerServiceAccountName, "controller-service-account-name", os.Getenv("POD_SERVICE_ACCOUNT"),
+		"Service account name used by this controller; required to protect managed PVC finalizer removal when webhooks are enabled.")
 
 	// Default Garage image
 	var defaultGarageImage string
 	flag.StringVar(&defaultGarageImage, "default-garage-image", "",
 		"Default Garage container image for clusters that don't specify one. "+
-			"If empty, uses the built-in default (dxflrs/garage:v2.3.0).")
+			"If empty, uses the built-in digest-pinned Garage v2.3.0 image.")
 
 	// Cluster domain
 	var clusterDomain string
@@ -234,6 +238,7 @@ func main() {
 		watchNamespaces = os.Getenv("WATCH_NAMESPACE")
 	}
 	clusterScoped := true
+	var resolvedWatchNamespaces []string
 
 	managerOptions := ctrl.Options{
 		Scheme:                 scheme,
@@ -249,7 +254,11 @@ func main() {
 		for _, ns := range strings.Split(watchNamespaces, ",") {
 			ns = strings.TrimSpace(ns)
 			if ns != "" {
+				if _, exists := nsMap[ns]; exists {
+					continue
+				}
 				nsMap[ns] = cache.Config{}
+				resolvedWatchNamespaces = append(resolvedWatchNamespaces, ns)
 			}
 		}
 		if len(nsMap) > 0 {
@@ -275,16 +284,22 @@ func main() {
 		os.Exit(1)
 	}
 	layoutMutations := controller.NewLayoutMutationCoordinator()
+	garageBucketCOSIDriverName := ""
+	if enableCOSI {
+		garageBucketCOSIDriverName = cosiDriverName
+	}
 
 	_ = operatorNamespace // deprecated, kept for backward-compat flag parsing only
 	if err := (&controller.GarageClusterReconciler{
-		Client:          mgr.GetClient(),
-		APIReader:       mgr.GetAPIReader(),
-		Scheme:          mgr.GetScheme(),
-		ClusterDomain:   clusterDomain,
-		DefaultImage:    defaultGarageImage,
-		ClusterScoped:   clusterScoped,
-		LayoutMutations: layoutMutations,
+		Client:                      mgr.GetClient(),
+		APIReader:                   mgr.GetAPIReader(),
+		Scheme:                      mgr.GetScheme(),
+		ClusterDomain:               clusterDomain,
+		DefaultImage:                defaultGarageImage,
+		ManagedPVCAdmissionDisabled: len(webhookCertPath) == 0,
+		ClusterScoped:               clusterScoped,
+		WatchNamespaces:             resolvedWatchNamespaces,
+		LayoutMutations:             layoutMutations,
 		NodeLocalPoolPrerequisites: controller.NewNodeLocalPoolPrerequisiteChecker(
 			mgr.GetClient(), mgr.GetAPIReader(), discoveryClient,
 		),
@@ -293,29 +308,33 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.GarageBucketReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		ClusterDomain: clusterDomain,
+		Client:              mgr.GetClient(),
+		AuthorizationReader: mgr.GetAPIReader(),
+		Scheme:              mgr.GetScheme(),
+		ClusterDomain:       clusterDomain,
+		COSIDriverName:      garageBucketCOSIDriverName,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GarageBucket")
 		os.Exit(1)
 	}
 	if err := (&controller.GarageKeyReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		ClusterDomain: clusterDomain,
+		Client:              mgr.GetClient(),
+		AuthorizationReader: mgr.GetAPIReader(),
+		Scheme:              mgr.GetScheme(),
+		ClusterDomain:       clusterDomain,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GarageKey")
 		os.Exit(1)
 	}
 	if err := (&controller.GarageNodeReconciler{
-		Client:          mgr.GetClient(),
-		APIReader:       mgr.GetAPIReader(),
-		Scheme:          mgr.GetScheme(),
-		ClusterDomain:   clusterDomain,
-		DefaultImage:    defaultGarageImage,
-		ClusterScoped:   clusterScoped,
-		LayoutMutations: layoutMutations,
+		Client:                      mgr.GetClient(),
+		APIReader:                   mgr.GetAPIReader(),
+		Scheme:                      mgr.GetScheme(),
+		ClusterDomain:               clusterDomain,
+		DefaultImage:                defaultGarageImage,
+		ManagedPVCAdmissionDisabled: len(webhookCertPath) == 0,
+		ClusterScoped:               clusterScoped,
+		LayoutMutations:             layoutMutations,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GarageNode")
 		os.Exit(1)
@@ -362,6 +381,18 @@ func main() {
 			setupLog.Error(err, "unable to create webhook", "webhook", "GarageNode")
 			os.Exit(1)
 		}
+		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+		controllerServiceAccountName = strings.TrimSpace(controllerServiceAccountName)
+		if podNamespace == "" || controllerServiceAccountName == "" {
+			setupLog.Error(errors.New("POD_NAMESPACE and controller service account name are required when webhooks are enabled"),
+				"unable to protect managed PVC replacement barriers")
+			os.Exit(1)
+		}
+		controllerUsername := fmt.Sprintf("system:serviceaccount:%s:%s", podNamespace, controllerServiceAccountName)
+		if err := controller.SetupManagedPVCFinalizerWebhook(mgr.GetWebhookServer(), controllerUsername); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "ManagedPVCFinalizer")
+			os.Exit(1)
+		}
 		if err := (&garagev1beta1.GarageAdminToken{}).SetupWebhookWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "GarageAdminToken")
 			os.Exit(1)
@@ -400,11 +431,12 @@ func main() {
 	if enableCOSI {
 		provisioner := cosi.NewProvisioner(mgr.GetClient(), cosiNamespace, clusterDomain)
 		if err := (&cosi.BucketReconciler{
-			Client:      mgr.GetClient(),
-			Scheme:      mgr.GetScheme(),
-			DriverName:  cosiDriverName,
-			Namespace:   cosiNamespace,
-			Provisioner: provisioner,
+			Client:          mgr.GetClient(),
+			Scheme:          mgr.GetScheme(),
+			DriverName:      cosiDriverName,
+			Namespace:       cosiNamespace,
+			Provisioner:     provisioner,
+			WatchNamespaces: resolvedWatchNamespaces,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to set up BucketReconciler")
 			os.Exit(1)

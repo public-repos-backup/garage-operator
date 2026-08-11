@@ -19,25 +19,170 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
 )
 
 const (
-	certmanagerVersion = "v1.19.1"
-	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
+	certmanagerVersion     = "v1.19.1"
+	certmanagerManifestSHA = "876a41a57e36b85619f4124b24b3deb80912b5ffed515f90e2f160b6e6338e81"
+	certmanagerURLTmpl     = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
+	certmanagerMaxBytes    = 20 << 20
 
 	defaultKindBinary  = "kind"
 	defaultKindCluster = "kind"
 )
 
+func bindKubectlContext(cmd *exec.Cmd) error {
+	if cmd == nil || len(cmd.Args) == 0 || filepath.Base(cmd.Args[0]) != kubectlBinary {
+		return nil
+	}
+	cluster := strings.TrimSpace(os.Getenv("KIND_CLUSTER"))
+	if cluster == "" {
+		return nil
+	}
+	expected := "kind-" + cluster
+	for i, arg := range cmd.Args[1:] {
+		if strings.HasPrefix(arg, "--context=") {
+			if contextName := strings.TrimPrefix(arg, "--context="); contextName != expected {
+				return fmt.Errorf("refusing kubectl context %q during Kind E2E; expected %q", contextName, expected)
+			}
+			return nil
+		}
+		if arg == "--context" {
+			index := i + 2
+			if index >= len(cmd.Args) || cmd.Args[index] != expected {
+				actual := ""
+				if index < len(cmd.Args) {
+					actual = cmd.Args[index]
+				}
+				return fmt.Errorf("refusing kubectl context %q during Kind E2E; expected %q", actual, expected)
+			}
+			return nil
+		}
+	}
+	args := make([]string, 0, len(cmd.Args)+1)
+	args = append(args, cmd.Args[0], "--context="+expected)
+	cmd.Args = append(args, cmd.Args[1:]...)
+	return nil
+}
+
+var certmanagerImagePins = map[string]string{
+	"quay.io/jetstack/cert-manager-controller:v1.19.1": "quay.io/jetstack/cert-manager-controller:v1.19.1@sha256:cd49e769e18ada1fd7b9a9bacc87c90db24c65cbfd4bf71694dda7ed40e91187",
+	"quay.io/jetstack/cert-manager-cainjector:v1.19.1": "quay.io/jetstack/cert-manager-cainjector:v1.19.1@sha256:c7898aece8fb08102fca0b37683e37cb94e0a77c0d15b8e3c9128f6c04c868e0",
+	"quay.io/jetstack/cert-manager-webhook:v1.19.1":    "quay.io/jetstack/cert-manager-webhook:v1.19.1@sha256:f5bfe77541e38978aec53cc6eb924d190e1fe923c98b2582e6ccf5edf6c02cce",
+	"quay.io/jetstack/cert-manager-acmesolver:v1.19.1": "quay.io/jetstack/cert-manager-acmesolver:v1.19.1@sha256:35ed1103cb49a3e1fc2438de84f304e3fbdeb53e0366f6b1bc2ec9b2e57462db",
+}
+
 func warnError(err error) {
 	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
+}
+
+var certmanagerManifestCache struct {
+	once    sync.Once
+	payload []byte
+	err     error
+}
+
+// certManagerManifest returns the exact cert-manager release manifest expected
+// by the E2E suite. It is downloaded and verified at most once so apply and
+// teardown consume identical bytes without teardown depending on the network.
+// The immutable in-memory cache is safe for concurrent callers and is reclaimed
+// automatically when the test process exits.
+func certManagerManifest() ([]byte, error) {
+	certmanagerManifestCache.once.Do(func() {
+		certmanagerManifestCache.payload, certmanagerManifestCache.err = downloadCertManagerManifest()
+	})
+	return certmanagerManifestCache.payload, certmanagerManifestCache.err
+}
+
+func downloadCertManagerManifest() ([]byte, error) {
+	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create cert-manager manifest request: %w", err)
+	}
+	client := &http.Client{Timeout: 2 * time.Minute}
+	response, err := client.Do(request) // #nosec G107 -- fixed HTTPS release URL
+	if err != nil {
+		return nil, fmt.Errorf("download cert-manager manifest: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download cert-manager manifest: HTTP %s", response.Status)
+	}
+
+	payload, err := io.ReadAll(io.LimitReader(response.Body, certmanagerMaxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read cert-manager manifest: %w", err)
+	}
+	if len(payload) > certmanagerMaxBytes {
+		return nil, fmt.Errorf("cert-manager manifest exceeds %d bytes", certmanagerMaxBytes)
+	}
+	if digest := fmt.Sprintf("%x", sha256.Sum256(payload)); digest != certmanagerManifestSHA {
+		return nil, fmt.Errorf("cert-manager manifest checksum %s, want %s", digest, certmanagerManifestSHA)
+	}
+	return pinCertManagerImages(payload)
+}
+
+func pinCertManagerImages(payload []byte) ([]byte, error) {
+	pinned := bytes.Clone(payload)
+	for source, target := range certmanagerImagePins {
+		if bytes.Count(pinned, []byte(source)) != 1 {
+			return nil, fmt.Errorf("cert-manager manifest must contain image %q exactly once", source)
+		}
+		pinned = bytes.ReplaceAll(pinned, []byte(source), []byte(target))
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(pinned))
+	scanner.Buffer(make([]byte, 64*1024), certmanagerMaxBytes)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		image := ""
+		if strings.HasPrefix(line, "image:") {
+			image = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "image:")), `"'`)
+		} else {
+			argument := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "- ")), `"'`)
+			if equals := strings.IndexByte(argument, '='); equals > 2 &&
+				strings.HasPrefix(argument, "--") && strings.HasSuffix(argument[:equals], "-image") {
+				image = strings.Trim(argument[equals+1:], `"'`)
+			}
+		}
+		if image != "" && !isSHA256DigestPinned(image) {
+			return nil, fmt.Errorf("cert-manager manifest contains image without digest: %s", image)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan cert-manager manifest images: %w", err)
+	}
+	return pinned, nil
+}
+
+func isSHA256DigestPinned(image string) bool {
+	const separator = "@sha256:"
+	index := strings.LastIndex(image, separator)
+	if index < 1 || len(image[index+len(separator):]) != 64 {
+		return false
+	}
+	for _, character := range image[index+len(separator):] {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 const (
@@ -102,6 +247,9 @@ func Run(cmd *exec.Cmd) (string, error) {
 	}
 
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
+	if err := bindKubectlContext(cmd); err != nil {
+		return "", err
+	}
 	boundKubectlDelete(cmd)
 	command := strings.Join(cmd.Args, " ")
 	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
@@ -115,8 +263,14 @@ func Run(cmd *exec.Cmd) (string, error) {
 
 // UninstallCertManager uninstalls the cert manager
 func UninstallCertManager() {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "delete", "-f", url, "--timeout=2m", "--wait=false")
+	manifest, err := certManagerManifest()
+	if err != nil {
+		warnError(err)
+		return
+	}
+
+	cmd := exec.Command("kubectl", "delete", "-f", "-", "--timeout=2m", "--wait=false")
+	cmd.Stdin = bytes.NewReader(manifest)
 	if _, err := Run(cmd); err != nil {
 		warnError(err)
 	}
@@ -137,8 +291,13 @@ func UninstallCertManager() {
 
 // InstallCertManager installs the cert manager bundle.
 func InstallCertManager() error {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "apply", "-f", url)
+	manifest, err := certManagerManifest()
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = bytes.NewReader(manifest)
 	if _, err := Run(cmd); err != nil {
 		return err
 	}
@@ -150,7 +309,7 @@ func InstallCertManager() error {
 		"--timeout", "5m",
 	)
 
-	_, err := Run(cmd)
+	_, err = Run(cmd)
 	return err
 }
 

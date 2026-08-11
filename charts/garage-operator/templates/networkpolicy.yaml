@@ -1,4 +1,4 @@
-{{- if .Values.networkPolicy.enabled -}}
+{{- if and .Values.networkPolicy.enabled (or .Values.metrics.enabled .Values.webhooks.enabled) -}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -13,10 +13,19 @@ spec:
   policyTypes:
   - Ingress
   ingress:
+  {{- if .Values.metrics.enabled }}
   - from:
     - namespaceSelector:
         {{- toYaml .Values.networkPolicy.allowedNamespaceSelector | nindent 8 }}
     ports:
-    - port: 8443
+    - port: {{ include "garage-operator.metricsPort" . }}
       protocol: TCP
+  {{- end }}
+  {{- if .Values.webhooks.enabled }}
+  # Admission and conversion requests originate from the API server. Its
+  # source labels/namespace are not portable across Kubernetes distributions.
+  - ports:
+    - port: 9443
+      protocol: TCP
+  {{- end }}
 {{- end }}

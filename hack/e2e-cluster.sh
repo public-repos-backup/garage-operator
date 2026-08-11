@@ -24,6 +24,7 @@ TESTS_SKIPPED=0
 CONFIG_CHANGE_INITIAL_HASH=""
 CONFIG_CHANGE_APPLIED=false
 SCALE_DOWN_NODE_ID=""
+CLUSTER_CREATED=false
 
 # Parse arguments
 CLEANUP=true
@@ -40,6 +41,10 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+E2E_KUBECONFIG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/garage-e2e-kubeconfig.XXXXXX")
+export KUBECONFIG="$E2E_KUBECONFIG_DIR/config"
+CLUSTER_UID=""
 
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
@@ -73,19 +78,45 @@ dump_debug_info() {
 }
 
 cleanup() {
+    if [ "$CLUSTER_CREATED" != true ]; then
+        return 0
+    fi
     if [ "$CLEANUP" = true ]; then
+        local live_uid
+        live_uid=$(kubectl --context "kind-$CLUSTER_NAME" get namespace kube-system \
+            -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+        if [ -z "$CLUSTER_UID" ] || [ "$live_uid" != "$CLUSTER_UID" ]; then
+            log_error "Refusing to delete '$CLUSTER_NAME': live kube-system UID does not match this run"
+            return 1
+        fi
         if kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
             dump_debug_info "$CLUSTER_NAME"
         fi
         log_info "Cleaning up kind cluster..."
-        kind delete cluster --name "$CLUSTER_NAME" 2>/dev/null || true
+        if ! kind delete cluster --name "$CLUSTER_NAME" 2>/dev/null; then
+            log_error "Failed to delete kind cluster '$CLUSTER_NAME'; preserving kubeconfig $KUBECONFIG"
+            return 1
+        fi
+        rm -f "$KUBECONFIG"
+        rmdir "$E2E_KUBECONFIG_DIR" 2>/dev/null || true
     else
         log_warn "Skipping cleanup. Cluster '$CLUSTER_NAME' still running."
+        log_info "Kubeconfig: $KUBECONFIG"
         log_info "To delete: kind delete cluster --name $CLUSTER_NAME"
     fi
 }
 
-trap cleanup EXIT
+on_exit() {
+    local status=$? cleanup_status=0
+    trap - EXIT
+    cleanup || cleanup_status=$?
+    if [ "$status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
+        status=$cleanup_status
+    fi
+    exit "$status"
+}
+
+trap on_exit EXIT
 
 wait_for_condition() {
     local resource=$1
@@ -194,6 +225,212 @@ delete_test_garagenode() {
     wait_for_resource_deleted garagenode "$node_name" 60
 }
 
+garage_admin_status() {
+    local path=$1
+    local port=34905
+    local token status pf_pid
+    local log_file=/tmp/e2e-admin-port-forward.log
+
+    if ! token=$(kubectl get secret garage-admin-token -n "$NAMESPACE" \
+        -o 'go-template={{ index .data "admin-token" | base64decode }}'); then
+        return 1
+    fi
+    kubectl port-forward service/garage "$port:3903" -n "$NAMESPACE" \
+        >"$log_file" 2>&1 &
+    pf_pid=$!
+    for _ in $(seq 1 30); do
+        if curl --fail --silent --show-error "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
+            break
+        fi
+        if ! kill -0 "$pf_pid" 2>/dev/null; then
+            cat "$log_file" >&2 || true
+            wait "$pf_pid" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+    done
+    status=$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+        --output /dev/null --write-out '%{http_code}' \
+        --header "Authorization: Bearer $token" \
+        "http://127.0.0.1:$port$path") || {
+        kill "$pf_pid" 2>/dev/null || true
+        wait "$pf_pid" 2>/dev/null || true
+        return 1
+    }
+    kill "$pf_pid" 2>/dev/null || true
+    wait "$pf_pid" 2>/dev/null || true
+    printf '%s\n' "$status"
+}
+
+garage_admin_get() {
+    local path=$1
+    local port=34906
+    local token body pf_pid
+    local log_file=/tmp/e2e-admin-get-port-forward.log
+
+    if ! token=$(kubectl get secret garage-admin-token -n "$NAMESPACE" \
+        -o 'go-template={{ index .data "admin-token" | base64decode }}'); then
+        return 1
+    fi
+    kubectl port-forward service/garage "$port:3903" -n "$NAMESPACE" \
+        >"$log_file" 2>&1 &
+    pf_pid=$!
+    for _ in $(seq 1 30); do
+        if curl --fail --silent --show-error "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
+            break
+        fi
+        if ! kill -0 "$pf_pid" 2>/dev/null; then
+            cat "$log_file" >&2 || true
+            wait "$pf_pid" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+    done
+    if ! body=$(curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+        --header "Authorization: Bearer $token" \
+        "http://127.0.0.1:$port$path"); then
+        kill "$pf_pid" 2>/dev/null || true
+        wait "$pf_pid" 2>/dev/null || true
+        return 1
+    fi
+    kill "$pf_pid" 2>/dev/null || true
+    wait "$pf_pid" 2>/dev/null || true
+    printf '%s\n' "$body"
+}
+
+wait_for_garage_admin_status() {
+    local path=$1
+    local expected=$2
+    local timeout=$3
+    local status=""
+    local end_time=$((SECONDS + timeout))
+
+    while [ $SECONDS -lt $end_time ]; do
+        status=$(garage_admin_status "$path" 2>/dev/null || true)
+        if [ "$status" = "$expected" ]; then
+            return 0
+        fi
+        sleep 2
+    done
+    log_error "Garage Admin API $path did not return HTTP $expected (last: ${status:-unavailable})"
+    return 1
+}
+
+wait_for_empty_garage_admin_list() {
+    local path=$1
+    local resource_name=$2
+    local timeout=$3
+    local body=""
+    local count="unavailable"
+    local end_time=$((SECONDS + timeout))
+
+    while [ $SECONDS -lt $end_time ]; do
+        body=$(garage_admin_get "$path" 2>/dev/null || true)
+        if count=$(jq -r \
+            'if type == "array" then length else error("expected an array") end' \
+            <<<"$body" 2>/dev/null); then
+            if [ "$count" = "0" ]; then
+                return 0
+            fi
+        else
+            count="unavailable"
+        fi
+        sleep 2
+    done
+    log_error "Garage Admin API $path still reported $resource_name (last count: $count)"
+    return 1
+}
+
+s3_head_bucket_result() {
+    local job_name=$1
+    local access_key=$2
+    local secret_key=$3
+    local result=""
+
+    kubectl delete job "$job_name" -n "$NAMESPACE" \
+        --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $job_name
+  namespace: $NAMESPACE
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: aws-cli
+        image: amazon/aws-cli:2.27.41@sha256:bc6b7bba44ce38f9604ede49c584824af919047ea03fbcc7c7610671fdef95d8
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          value: "$access_key"
+        - name: AWS_SECRET_ACCESS_KEY
+          value: "$secret_key"
+        - name: AWS_DEFAULT_REGION
+          value: garage
+        - name: AWS_PAGER
+          value: ""
+        command:
+        - aws
+        - --endpoint-url
+        - http://garage.${NAMESPACE}.svc.cluster.local:3900
+        - s3api
+        - head-bucket
+        - --bucket
+        - test-bucket
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+EOF
+
+    local end_time=$((SECONDS + 120))
+    while [ $SECONDS -lt $end_time ]; do
+        local succeeded failed
+        succeeded=$(kubectl get job "$job_name" -n "$NAMESPACE" \
+            -o jsonpath='{.status.succeeded}' 2>/dev/null || true)
+        failed=$(kubectl get job "$job_name" -n "$NAMESPACE" \
+            -o jsonpath='{.status.failed}' 2>/dev/null || true)
+        if [ "$succeeded" = "1" ]; then
+            result=success
+            break
+        fi
+        if [ "$failed" = "1" ]; then
+            local job_logs
+            if ! job_logs=$(kubectl logs job/"$job_name" -n "$NAMESPACE" \
+                --all-containers=true 2>&1); then
+                log_error "Could not capture aws-cli logs from S3 credential check Job/$job_name" >&2
+                printf '%s\n' "$job_logs" >&2
+                kubectl describe job "$job_name" -n "$NAMESPACE" >&2 || true
+                result=error
+            elif grep -Eqi \
+                'InvalidAccessKeyId|AccessDenied|Forbidden|(^|[^[:digit:]])403([^[:digit:]]|$)' \
+                <<<"$job_logs"; then
+                result=denied
+            else
+                log_error "S3 credential check Job/$job_name failed without an authentication rejection" >&2
+                printf '%s\n' "$job_logs" >&2
+                kubectl describe job "$job_name" -n "$NAMESPACE" >&2 || true
+                result=error
+            fi
+            break
+        fi
+        sleep 2
+    done
+    if [ -z "$result" ]; then
+        kubectl describe job "$job_name" -n "$NAMESPACE" >&2 || true
+        kubectl logs job/"$job_name" -n "$NAMESPACE" >&2 || true
+        result=timeout
+    fi
+    kubectl delete job "$job_name" -n "$NAMESPACE" \
+        --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    printf '%s\n' "$result"
+}
+
 wait_for_storage_rollout_converged() {
     local cluster_name=$1
     local timeout=$2
@@ -288,7 +525,8 @@ check_resource_phase() {
     local end_time=$((SECONDS + timeout))
 
     while [ $SECONDS -lt $end_time ]; do
-        local phase=$(kubectl get "$resource_type" "$resource_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+        local phase
+        phase=$(kubectl get "$resource_type" "$resource_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
         if [ "$phase" = "$expected_phase" ]; then
             return 0
         fi
@@ -357,7 +595,8 @@ test_cluster_creation() {
     log_test "Testing GarageCluster creation..."
 
     if check_resource_phase "garagecluster" "garage" "Running" 60; then
-        local ready=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}')
+        local ready
+        ready=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}')
         if [ "$ready" = "3" ]; then
             test_pass "GarageCluster created with 3 ready replicas"
             return 0
@@ -372,18 +611,26 @@ test_cluster_health() {
 
     # Wait for health to be populated (controller needs time after pods are ready)
     if ! wait_for_cluster_health "healthy" 60; then
-        local health=$(get_cluster_health)
-        local connected=$(get_connected_nodes)
-        local partitions_quorum=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.partitionsQuorum}' 2>/dev/null || echo "0")
-        local partitions_total=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.partitions}' 2>/dev/null || echo "0")
+        local health
+        health=$(get_cluster_health)
+        local connected
+        connected=$(get_connected_nodes)
+        local partitions_quorum
+        partitions_quorum=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.partitionsQuorum}' 2>/dev/null || echo "0")
+        local partitions_total
+        partitions_total=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.partitions}' 2>/dev/null || echo "0")
         test_fail "Cluster health check failed: health=$health, nodes=$connected, partitions=$partitions_quorum/$partitions_total"
         return 1
     fi
 
-    local health=$(get_cluster_health)
-    local connected=$(get_connected_nodes)
-    local partitions_quorum=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.partitionsQuorum}' 2>/dev/null || echo "0")
-    local partitions_total=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.partitions}' 2>/dev/null || echo "0")
+    local health
+    health=$(get_cluster_health)
+    local connected
+    connected=$(get_connected_nodes)
+    local partitions_quorum
+    partitions_quorum=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.partitionsQuorum}' 2>/dev/null || echo "0")
+    local partitions_total
+    partitions_total=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.partitions}' 2>/dev/null || echo "0")
 
     if [ "$health" = "healthy" ] && [ "$connected" = "3" ] && [ "$partitions_quorum" = "$partitions_total" ]; then
         test_pass "Cluster health: $health, nodes: $connected, partitions: $partitions_quorum/$partitions_total"
@@ -398,7 +645,8 @@ test_bucket_creation() {
 
     if check_resource_phase "garagebucket" "test-bucket" "Ready" 60; then
         # Verify bucket exists in Garage
-        local bucket_id=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.bucketId}')
+        local bucket_id
+        bucket_id=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.bucketId}')
         if [ -n "$bucket_id" ]; then
             test_pass "GarageBucket created with ID: $bucket_id"
             return 0
@@ -412,7 +660,8 @@ test_key_creation() {
     log_test "Testing GarageKey creation..."
 
     if check_resource_phase "garagekey" "test-key" "Ready" 60; then
-        local access_key=$(kubectl get garagekey test-key -n "$NAMESPACE" -o jsonpath='{.status.accessKeyId}')
+        local access_key
+        access_key=$(kubectl get garagekey test-key -n "$NAMESPACE" -o jsonpath='{.status.accessKeyId}')
         if [ -n "$access_key" ]; then
             test_pass "GarageKey created with AccessKeyID: $access_key"
             return 0
@@ -432,7 +681,8 @@ test_secret_creation() {
     fi
 
     if kubectl get secret test-s3-credentials -n "$NAMESPACE" &>/dev/null; then
-        local keys=$(kubectl get secret test-s3-credentials -n "$NAMESPACE" -o jsonpath='{.data}' | jq -r 'keys | join(",")')
+        local keys
+        keys=$(kubectl get secret test-s3-credentials -n "$NAMESPACE" -o jsonpath='{.data}' | jq -r 'keys | join(",")')
         if [[ "$keys" == *"access-key-id"* ]] && [[ "$keys" == *"secret-access-key"* ]]; then
             test_pass "Secret created with keys: $keys"
             return 0
@@ -450,7 +700,8 @@ test_s3_connectivity() {
     local pf_pid=$!
     sleep 3
 
-    local http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3900/ 2>/dev/null || echo "000")
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3900/ 2>/dev/null || echo "000")
     kill $pf_pid 2>/dev/null || true
 
     # 403 is expected (no auth), 200 would also be fine
@@ -469,7 +720,8 @@ test_admin_api_connectivity() {
     local pf_pid=$!
     sleep 3
 
-    local http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3903/health 2>/dev/null || echo "000")
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3903/health 2>/dev/null || echo "000")
     kill $pf_pid 2>/dev/null || true
 
     if [ "$http_code" = "200" ]; then
@@ -498,11 +750,23 @@ spec:
     maxObjects: 500
 EOF
 
-    if check_resource_phase "garagebucket" "quota-test-bucket" "Ready" 60; then
-        test_pass "Bucket with quotas created"
-        return 0
-    fi
-    test_fail "Bucket quota test failed"
+    local phase=""
+    local size_limit=""
+    local object_limit=""
+    local quota_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$quota_deadline" ]; do
+        local snapshot
+        snapshot=$(kubectl get garagebucket quota-test-bucket -n "$NAMESPACE" -o json 2>/dev/null | \
+            jq -r '[.status.phase // "", (.status.quotaUsage.sizeLimit // ""), (.status.quotaUsage.objectLimit // "")] | map(tostring) | join("|")' 2>/dev/null || true)
+        IFS='|' read -r phase size_limit object_limit <<< "$snapshot"
+        if [ "$phase" = "Ready" ] && [ "$size_limit" = "524288000" ] && \
+            [ "$object_limit" = "500" ]; then
+            test_pass "Bucket reports the exact configured quotas"
+            return 0
+        fi
+        sleep 3
+    done
+    test_fail "Bucket quotas did not converge (phase: ${phase:-missing}, sizeLimit: ${size_limit:-missing}, objectLimit: ${object_limit:-missing})"
     return 1
 }
 
@@ -533,11 +797,27 @@ spec:
     name: multi-bucket-credentials
 EOF
 
-    if check_resource_phase "garagekey" "multi-bucket-key" "Ready" 60; then
-        test_pass "Key with multiple bucket permissions created"
-        return 0
-    fi
-    test_fail "Key permissions test failed"
+    local phase=""
+    local permission_count=0
+    local permission_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$permission_deadline" ]; do
+        local snapshot
+        snapshot=$(kubectl get garagekey multi-bucket-key -n "$NAMESPACE" -o json 2>/dev/null || true)
+        phase=$(echo "$snapshot" | jq -r '.status.phase // ""' 2>/dev/null || true)
+        permission_count=$(echo "$snapshot" | jq -r '[
+            .status.buckets[]? |
+            select(
+                (.globalAlias == "test-bucket" and .read == true and .write == false and .owner == false) or
+                (.globalAlias == "quota-test-bucket" and .read == true and .write == true and .owner == true)
+            )
+        ] | length' 2>/dev/null || echo "0")
+        if [ "$phase" = "Ready" ] && [ "$permission_count" = "2" ]; then
+            test_pass "Key reports both exact bucket permission sets"
+            return 0
+        fi
+        sleep 3
+    done
+    test_fail "Key permissions did not converge (phase: ${phase:-missing}, matching buckets: $permission_count/2)"
     return 1
 }
 
@@ -562,14 +842,26 @@ EOF
         return 1
     fi
 
+    local bucket_id
+    bucket_id=$(kubectl get garagebucket delete-test-bucket -n "$NAMESPACE" \
+        -o jsonpath='{.status.bucketId}' 2>/dev/null || true)
+    if [ -z "$bucket_id" ] || \
+       ! wait_for_garage_admin_status "/v2/GetBucketInfo?id=$bucket_id" 200 60; then
+        test_fail "Could not prove the exact Garage bucket existed before deletion"
+        kubectl delete garagebucket delete-test-bucket -n "$NAMESPACE" \
+            --wait=false 2>/dev/null || true
+        return 1
+    fi
+
     # Delete the bucket
     kubectl delete garagebucket delete-test-bucket -n "$NAMESPACE"
 
-    if wait_for_resource_deleted "garagebucket" "delete-test-bucket" 60; then
-        test_pass "GarageBucket deleted successfully"
+    if wait_for_resource_deleted "garagebucket" "delete-test-bucket" 60 && \
+       wait_for_garage_admin_status "/v2/GetBucketInfo?id=$bucket_id" 404 120; then
+        test_pass "GarageBucket deletion removed the exact Garage bucket $bucket_id"
         return 0
     fi
-    test_fail "GarageBucket deletion failed"
+    test_fail "GarageBucket deletion did not remove the exact Garage bucket $bucket_id"
     return 1
 }
 
@@ -587,6 +879,10 @@ spec:
   clusterRef:
     name: garage
   name: delete-test-key
+  bucketPermissions:
+    - bucketRef:
+        name: test-bucket
+      read: true
   secretTemplate:
     name: delete-test-credentials
 EOF
@@ -596,17 +892,52 @@ EOF
         return 1
     fi
 
+    local access_key secret_key pre_delete_result
+    access_key=$(kubectl get garagekey delete-test-key -n "$NAMESPACE" \
+        -o jsonpath='{.status.accessKeyId}' 2>/dev/null || true)
+    secret_key=$(kubectl get secret delete-test-credentials -n "$NAMESPACE" \
+        -o 'go-template={{ index .data "secret-access-key" | base64decode }}' 2>/dev/null || true)
+    if [ -z "$access_key" ] || [ -z "$secret_key" ] || \
+       ! wait_for_garage_admin_status "/v2/GetKeyInfo?id=$access_key" 200 60; then
+        test_fail "Could not prove the exact Garage key and copied credentials before deletion"
+        kubectl delete garagekey delete-test-key -n "$NAMESPACE" \
+            --wait=false 2>/dev/null || true
+        return 1
+    fi
+    pre_delete_result=$(s3_head_bucket_result delete-key-valid "$access_key" "$secret_key")
+    if [ "$pre_delete_result" != success ]; then
+        test_fail "Copied credentials were not usable before deletion (result: $pre_delete_result)"
+        kubectl delete garagekey delete-test-key -n "$NAMESPACE" \
+            --wait=false 2>/dev/null || true
+        return 1
+    fi
+
     # Delete the key
     kubectl delete garagekey delete-test-key -n "$NAMESPACE"
 
     if wait_for_resource_deleted "garagekey" "delete-test-key" 60; then
-        # Also verify the secret was deleted
-        sleep 5
-        if ! kubectl get secret delete-test-credentials -n "$NAMESPACE" 2>/dev/null; then
-            test_pass "GarageKey and associated secret deleted"
+        local secret_deadline=$((SECONDS + 60))
+        while [ $SECONDS -lt $secret_deadline ]; do
+            if ! kubectl get secret delete-test-credentials -n "$NAMESPACE" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 2
+        done
+        if kubectl get secret delete-test-credentials -n "$NAMESPACE" >/dev/null 2>&1; then
+            test_fail "Secret was not cleaned up"
+            return 1
+        fi
+        if ! wait_for_garage_admin_status "/v2/GetKeyInfo?id=$access_key" 404 120; then
+            test_fail "GarageKey deletion left the exact Garage key $access_key active"
+            return 1
+        fi
+        local post_delete_result
+        post_delete_result=$(s3_head_bucket_result delete-key-revoked "$access_key" "$secret_key")
+        if [ "$post_delete_result" = denied ]; then
+            test_pass "GarageKey deletion revoked $access_key, removed its Secret, and invalidated copied credentials"
             return 0
         fi
-        test_fail "Secret was not cleaned up"
+        test_fail "Copied credentials did not produce the expected authentication rejection after key deletion (result: $post_delete_result)"
         return 1
     fi
     test_fail "GarageKey deletion failed"
@@ -775,8 +1106,6 @@ test_scale_down_layout_cleanup() {
 
     # Port forward to admin API
     local pf_port=34903
-    pkill -f "port-forward.*:${pf_port}" 2>/dev/null || true
-    sleep 1
 
     kubectl port-forward svc/garage ${pf_port}:3903 -n "$NAMESPACE" &
     local pf_pid=$!
@@ -834,7 +1163,8 @@ test_cluster_recovery() {
     log_test "Testing cluster recovery after pod deletion..."
 
     # Delete a pod
-    local pod_to_delete=$(kubectl get pods -n "$NAMESPACE" -l "garage.rajsingh.info/cluster=garage" -o jsonpath='{.items[0].metadata.name}')
+    local pod_to_delete
+    pod_to_delete=$(kubectl get pods -n "$NAMESPACE" -l "garage.rajsingh.info/cluster=garage" -o jsonpath='{.items[0].metadata.name}')
     kubectl delete pod "$pod_to_delete" -n "$NAMESPACE"
 
     # Wait for pods to come back up
@@ -843,25 +1173,20 @@ test_cluster_recovery() {
         return 1
     fi
 
-    # Wait for cluster to become healthy (may take time after pod restart and gossip propagation)
+    # Wait for every recovery signal, including partition quorum, after gossip
+    # and replica synchronization settle.
     # Garage needs time to: 1) detect node is back, 2) re-sync partition data, 3) verify replication
     # This can take several minutes depending on cluster state and network conditions.
     # Note: Recovery time varies significantly based on Garage's gossip settings and partition count.
-    if wait_for_cluster_health "healthy" 300; then
+    if wait_for_cluster_fully_ready 300; then
         test_pass "Cluster recovered after pod deletion"
         return 0
     fi
 
-    # Even if cluster doesn't fully recover, verify the operator is attempting to reconnect
-    local connected=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.connectedNodes}' 2>/dev/null || echo "0")
-    local health=$(get_cluster_health)
-
-    # If 3 nodes are connected but health is degraded, it's a Garage partition sync issue (not operator issue)
-    if [ "$connected" = "3" ]; then
-        log_info "Note: All nodes connected ($connected/3) but health is $health - Garage partition sync in progress"
-        test_pass "Cluster recovery in progress (all nodes connected, waiting for partition sync)"
-        return 0
-    fi
+    local connected
+    connected=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.connectedNodes}' 2>/dev/null || echo "0")
+    local health
+    health=$(get_cluster_health)
 
     test_fail "Cluster recovery failed (health: $health, connected: $connected/3)"
     return 1
@@ -874,7 +1199,8 @@ test_configmap_update() {
     cm_name=$(get_primary_storage_configmap)
     if kubectl get configmap "$cm_name" -n "$NAMESPACE" &>/dev/null; then
         # Verify owner reference
-        local owner=$(kubectl get configmap "$cm_name" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[0].kind}')
+        local owner
+        owner=$(kubectl get configmap "$cm_name" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[0].kind}')
         if [ "$owner" = "GarageCluster" ]; then
             test_pass "Mounted immutable ConfigMap revision has correct owner reference ($cm_name)"
             return 0
@@ -887,10 +1213,12 @@ test_configmap_update() {
 test_services_created() {
     log_test "Testing Services are created..."
 
-    local headless=$(kubectl get svc garage-headless -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
-    local api_svc=$(kubectl get svc garage -n "$NAMESPACE" -o jsonpath='{.spec.type}' 2>/dev/null)
+    local headless
+    headless=$(kubectl get svc garage-headless -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+    local api_svc
+    api_svc=$(kubectl get svc garage -n "$NAMESPACE" -o jsonpath='{.spec.type}' 2>/dev/null)
 
-    if [ "$headless" = "None" ] && [ -n "$api_svc" ]; then
+    if [ "$headless" = "None" ] && [ "$api_svc" = "ClusterIP" ]; then
         test_pass "Headless and API services created correctly"
         return 0
     fi
@@ -901,11 +1229,16 @@ test_services_created() {
 test_status_endpoints() {
     log_test "Testing status endpoints are populated..."
 
-    local s3_endpoint=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.endpoints.s3}')
-    local admin_endpoint=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.endpoints.admin}')
-    local rpc_endpoint=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.endpoints.rpc}')
+    local s3_endpoint
+    s3_endpoint=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.endpoints.s3}')
+    local admin_endpoint
+    admin_endpoint=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.endpoints.admin}')
+    local rpc_endpoint
+    rpc_endpoint=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.endpoints.rpc}')
 
-    if [ -n "$s3_endpoint" ] && [ -n "$admin_endpoint" ] && [ -n "$rpc_endpoint" ]; then
+    if [ "$s3_endpoint" = "garage.${NAMESPACE}.svc.cluster.local:3900" ] && \
+        [ "$admin_endpoint" = "garage.${NAMESPACE}.svc.cluster.local:3903" ] && \
+        [ "$rpc_endpoint" = "garage-headless.${NAMESPACE}.svc.cluster.local:3901" ]; then
         test_pass "Status endpoints populated: s3=$s3_endpoint"
         return 0
     fi
@@ -930,16 +1263,25 @@ test_bucket_quota_update() {
     kubectl patch garagebucket quota-test-bucket -n "$NAMESPACE" --type=merge \
         -p '{"spec":{"quotas":{"maxSize":"1Gi","maxObjects":2000}}}'
 
-    sleep 5
-
-    # Verify bucket returns to Ready after update. The operator must push the new
-    # quota to Garage via the Admin API (UpdateBucket) and the cluster may still be
-    # re-stabilizing after the preceding pause-reconcile test, so allow generous time.
-    if check_resource_phase "garagebucket" "quota-test-bucket" "Ready" 90; then
-        test_pass "Bucket quota updated successfully"
-        return 0
-    fi
-    test_fail "Bucket quota update failed"
+    local phase=""
+    local observed_generation=""
+    local generation=""
+    local size_limit=""
+    local object_limit=""
+    local quota_deadline=$((SECONDS + 90))
+    while [ "$SECONDS" -lt "$quota_deadline" ]; do
+        local snapshot
+        snapshot=$(kubectl get garagebucket quota-test-bucket -n "$NAMESPACE" -o json 2>/dev/null | \
+            jq -r '[.status.phase // "", (.status.observedGeneration // ""), .metadata.generation, (.status.quotaUsage.sizeLimit // ""), (.status.quotaUsage.objectLimit // "")] | map(tostring) | join("|")' 2>/dev/null || true)
+        IFS='|' read -r phase observed_generation generation size_limit object_limit <<< "$snapshot"
+        if [ "$phase" = "Ready" ] && [ "$observed_generation" = "$generation" ] && \
+            [ "$size_limit" = "1073741824" ] && [ "$object_limit" = "2000" ]; then
+            test_pass "Bucket quota update converged to 1Gi/2000"
+            return 0
+        fi
+        sleep 3
+    done
+    test_fail "Bucket quota update did not converge (phase: ${phase:-missing}, observedGeneration: ${observed_generation:-missing}/${generation:-missing}, limits: ${size_limit:-missing}/${object_limit:-missing})"
     return 1
 }
 
@@ -956,13 +1298,32 @@ test_key_permission_update() {
     kubectl patch garagekey multi-bucket-key -n "$NAMESPACE" --type=merge \
         -p '{"spec":{"bucketPermissions":[{"bucketRef":{"name":"test-bucket"},"read":true,"write":true},{"bucketRef":{"name":"quota-test-bucket"},"read":true,"write":true,"owner":true}]}}'
 
-    sleep 5
-
-    if check_resource_phase "garagekey" "multi-bucket-key" "Ready" 30; then
-        test_pass "Key permissions updated successfully"
-        return 0
-    fi
-    test_fail "Key permission update failed"
+    local phase=""
+    local observed_generation=""
+    local generation=""
+    local permission_count=0
+    local permission_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$permission_deadline" ]; do
+        local snapshot
+        snapshot=$(kubectl get garagekey multi-bucket-key -n "$NAMESPACE" -o json 2>/dev/null || true)
+        phase=$(echo "$snapshot" | jq -r '.status.phase // ""' 2>/dev/null || true)
+        observed_generation=$(echo "$snapshot" | jq -r '.status.observedGeneration // ""' 2>/dev/null || true)
+        generation=$(echo "$snapshot" | jq -r '.metadata.generation // ""' 2>/dev/null || true)
+        permission_count=$(echo "$snapshot" | jq -r '[
+            .status.buckets[]? |
+            select(
+                (.globalAlias == "test-bucket" and .read == true and .write == true and .owner == false) or
+                (.globalAlias == "quota-test-bucket" and .read == true and .write == true and .owner == true)
+            )
+        ] | length' 2>/dev/null || echo "0")
+        if [ "$phase" = "Ready" ] && [ "$observed_generation" = "$generation" ] && \
+            [ "$permission_count" = "2" ]; then
+            test_pass "Key permission update converged on both buckets"
+            return 0
+        fi
+        sleep 3
+    done
+    test_fail "Key permission update did not converge (phase: ${phase:-missing}, observedGeneration: ${observed_generation:-missing}/${generation:-missing}, matching buckets: $permission_count/2)"
     return 1
 }
 
@@ -1007,16 +1368,19 @@ spec:
   globalAlias: invalid-cluster-bucket
 EOF
 
-    sleep 10
-
-    # Should be in Error or pending state
-    local phase=$(kubectl get garagebucket invalid-cluster-bucket -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-    if [ "$phase" = "Error" ] || [ "$phase" = "Failed" ] || [ "$phase" = "Pending" ] || [ "$phase" = "" ]; then
-        test_pass "Invalid cluster reference handled correctly (phase: $phase)"
-        kubectl delete garagebucket invalid-cluster-bucket -n "$NAMESPACE" 2>/dev/null || true
-        return 0
-    fi
-    test_fail "Invalid cluster reference not handled (phase: $phase)"
+    local status=""
+    local reference_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$reference_deadline" ]; do
+        status=$(kubectl get garagebucket invalid-cluster-bucket -n "$NAMESPACE" \
+            -o 'jsonpath={.status.phase}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"|"}{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null)
+        if [ "$status" = "Pending|False|ClusterNotReady" ]; then
+            test_pass "Invalid cluster reference reports Pending with Ready=False/ClusterNotReady"
+            kubectl delete garagebucket invalid-cluster-bucket -n "$NAMESPACE" 2>/dev/null || true
+            return 0
+        fi
+        sleep 3
+    done
+    test_fail "Invalid cluster reference did not report its waiting condition (status: ${status:-missing})"
     kubectl delete garagebucket invalid-cluster-bucket -n "$NAMESPACE" 2>/dev/null || true
     return 1
 }
@@ -1040,17 +1404,19 @@ spec:
       read: true
 EOF
 
-    sleep 10
-
-    # Key may be created but should handle missing bucket gracefully
-    local phase=$(kubectl get garagekey invalid-bucket-key -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-    # Accept Ready (key created, bucket permission pending) or Error
-    if [ "$phase" = "Ready" ] || [ "$phase" = "Error" ] || [ "$phase" = "Failed" ] || [ "$phase" = "Pending" ]; then
-        test_pass "Invalid bucket reference handled (phase: $phase)"
-        kubectl delete garagekey invalid-bucket-key -n "$NAMESPACE" 2>/dev/null || true
-        return 0
-    fi
-    test_fail "Invalid bucket reference not handled (phase: $phase)"
+    local status=""
+    local reference_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$reference_deadline" ]; do
+        status=$(kubectl get garagekey invalid-bucket-key -n "$NAMESPACE" \
+            -o 'jsonpath={.status.phase}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"|"}{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null)
+        if [ "$status" = "Failed|False|ReconcileFailed" ]; then
+            test_pass "Invalid bucket reference reports Failed with Ready=False/ReconcileFailed"
+            kubectl delete garagekey invalid-bucket-key -n "$NAMESPACE" 2>/dev/null || true
+            return 0
+        fi
+        sleep 3
+    done
+    test_fail "Invalid bucket reference did not report reconciliation failure (status: ${status:-missing})"
     kubectl delete garagekey invalid-bucket-key -n "$NAMESPACE" 2>/dev/null || true
     return 1
 }
@@ -1080,8 +1446,10 @@ EOF
     fi
 
     # Get the credentials from the first key
-    local access_key=$(kubectl get secret source-credentials -n "$NAMESPACE" -o jsonpath='{.data.access-key-id}' 2>/dev/null | base64 -d)
-    local secret_key=$(kubectl get secret source-credentials -n "$NAMESPACE" -o jsonpath='{.data.secret-access-key}' 2>/dev/null | base64 -d)
+    local access_key
+    access_key=$(kubectl get secret source-credentials -n "$NAMESPACE" -o jsonpath='{.data.access-key-id}' 2>/dev/null | base64 -d)
+    local secret_key
+    secret_key=$(kubectl get secret source-credentials -n "$NAMESPACE" -o jsonpath='{.data.secret-access-key}' 2>/dev/null | base64 -d)
 
     if [ -z "$access_key" ] || [ -z "$secret_key" ]; then
         test_fail "Could not get credentials from source key"
@@ -1113,28 +1481,24 @@ spec:
     name: imported-credentials
 EOF
 
-    sleep 15
+    local phase=""
+    local imported_access=""
+    local import_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$import_deadline" ]; do
+        phase=$(kubectl get garagekey imported-key -n "$NAMESPACE" \
+            -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+        imported_access=$(kubectl get garagekey imported-key -n "$NAMESPACE" \
+            -o jsonpath='{.status.accessKeyId}' 2>/dev/null)
+        if [ "$phase" = "Ready" ] && [ "$imported_access" = "$access_key" ]; then
+            test_pass "Key import succeeded with the exact source accessKeyId"
+            kubectl delete garagekey imported-key source-key -n "$NAMESPACE" 2>/dev/null || true
+            kubectl delete secret import-credentials -n "$NAMESPACE" 2>/dev/null || true
+            return 0
+        fi
+        sleep 3
+    done
 
-    # The import should either work or fail gracefully
-    local phase=$(kubectl get garagekey imported-key -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-    local imported_access=$(kubectl get garagekey imported-key -n "$NAMESPACE" -o jsonpath='{.status.accessKeyId}' 2>/dev/null)
-
-    if [ "$phase" = "Ready" ] && [ "$imported_access" = "$access_key" ]; then
-        test_pass "Key import succeeded (accessKeyId matches)"
-        kubectl delete garagekey imported-key source-key -n "$NAMESPACE" 2>/dev/null || true
-        kubectl delete secret import-credentials -n "$NAMESPACE" 2>/dev/null || true
-        return 0
-    fi
-
-    # Even if import fails, the controller should handle it gracefully
-    if [ "$phase" = "Error" ] || [ "$phase" = "Failed" ] || [ "$phase" = "Ready" ]; then
-        test_pass "Key import handled (phase: $phase)"
-        kubectl delete garagekey imported-key source-key -n "$NAMESPACE" 2>/dev/null || true
-        kubectl delete secret import-credentials -n "$NAMESPACE" 2>/dev/null || true
-        return 0
-    fi
-
-    test_fail "Key import test inconclusive (phase: $phase)"
+    test_fail "Key import did not converge to the source accessKeyId (phase: $phase, observed: ${imported_access:-missing})"
     kubectl delete garagekey imported-key source-key -n "$NAMESPACE" 2>/dev/null || true
     kubectl delete secret import-credentials -n "$NAMESPACE" 2>/dev/null || true
     return 1
@@ -1156,18 +1520,25 @@ spec:
   globalAlias: zone-test-bucket
 EOF
 
-    if check_resource_phase "garagebucket" "zone-test-bucket" "Ready" 30; then
-        # Verify cluster zone is properly set
-        local zone=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.spec.zone}' 2>/dev/null)
-        if [ -n "$zone" ]; then
-            test_pass "Zone configuration works (zone: $zone)"
-        else
-            test_pass "Zone uses default (not explicitly set)"
+    local matching_nodes=0
+    local total_nodes=0
+    local zone_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$zone_deadline" ]; do
+        local nodes
+        nodes=$(kubectl get garagenode -n "$NAMESPACE" \
+            -l 'garage.rajsingh.info/cluster=garage,garage.rajsingh.info/tier=storage' \
+            -o json 2>/dev/null || true)
+        total_nodes=$(echo "$nodes" | jq -r '.items | length' 2>/dev/null || echo "0")
+        matching_nodes=$(echo "$nodes" | jq -r '[.items[] | select(.spec.zone == "default" and .status.zone == "default" and .status.phase == "Ready")] | length' 2>/dev/null || echo "0")
+        if [ "$total_nodes" = "3" ] && [ "$matching_nodes" = "3" ] && \
+            check_resource_phase "garagebucket" "zone-test-bucket" "Ready" 2; then
+            test_pass "All three storage nodes report the expected default zone"
+            kubectl delete garagebucket zone-test-bucket -n "$NAMESPACE" 2>/dev/null || true
+            return 0
         fi
-        kubectl delete garagebucket zone-test-bucket -n "$NAMESPACE" 2>/dev/null || true
-        return 0
-    fi
-    test_fail "Zone configuration test failed"
+        sleep 3
+    done
+    test_fail "Default zone did not converge on every storage node (matching: $matching_nodes/$total_nodes)"
     kubectl delete garagebucket zone-test-bucket -n "$NAMESPACE" 2>/dev/null || true
     return 1
 }
@@ -1175,21 +1546,22 @@ EOF
 test_replication_factor_validation() {
     log_test "Testing replication factor in cluster status..."
 
-    local rep_factor=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.spec.replication.factor}' 2>/dev/null)
-    local storage_nodes=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.storageNodes}' 2>/dev/null)
+    local rep_factor=""
+    local storage_nodes=""
+    local factor_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$factor_deadline" ]; do
+        rep_factor=$(kubectl get garagecluster garage -n "$NAMESPACE" \
+            -o jsonpath='{.spec.replication.factor}' 2>/dev/null)
+        storage_nodes=$(kubectl get garagecluster garage -n "$NAMESPACE" \
+            -o jsonpath='{.status.health.storageNodes}' 2>/dev/null)
+        if [ "$rep_factor" = "3" ] && [ "$storage_nodes" = "3" ]; then
+            test_pass "Replication factor valid (factor: $rep_factor, nodes: $storage_nodes)"
+            return 0
+        fi
+        sleep 3
+    done
 
-    if [ "$rep_factor" -gt "0" ] && [ "$storage_nodes" -ge "$rep_factor" ] 2>/dev/null; then
-        test_pass "Replication factor valid (factor: $rep_factor, nodes: $storage_nodes)"
-        return 0
-    fi
-
-    # This is informational - cluster may still be bootstrapping
-    if [ -n "$rep_factor" ]; then
-        test_pass "Replication factor set (factor: $rep_factor, nodes: ${storage_nodes:-pending})"
-        return 0
-    fi
-
-    test_fail "Replication factor not configured"
+    test_fail "Replication factor not satisfied (factor: ${rep_factor:-missing}, nodes: ${storage_nodes:-missing})"
     return 1
 }
 
@@ -1200,12 +1572,17 @@ test_replication_factor_validation() {
 test_finalizers_present() {
     log_test "Testing finalizers are present on resources..."
 
-    local cluster_finalizer=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.metadata.finalizers[0]}' 2>/dev/null)
-    local bucket_finalizer=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.metadata.finalizers[0]}' 2>/dev/null)
-    local key_finalizer=$(kubectl get garagekey test-key -n "$NAMESPACE" -o jsonpath='{.metadata.finalizers[0]}' 2>/dev/null)
+    local cluster_finalizer
+    cluster_finalizer=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.metadata.finalizers[0]}' 2>/dev/null)
+    local bucket_finalizer
+    bucket_finalizer=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.metadata.finalizers[0]}' 2>/dev/null)
+    local key_finalizer
+    key_finalizer=$(kubectl get garagekey test-key -n "$NAMESPACE" -o jsonpath='{.metadata.finalizers[0]}' 2>/dev/null)
 
-    if [ -n "$cluster_finalizer" ] && [ -n "$bucket_finalizer" ] && [ -n "$key_finalizer" ]; then
-        test_pass "Finalizers present on all resources"
+    if [ "$cluster_finalizer" = "garagecluster.garage.rajsingh.info/finalizer" ] && \
+        [ "$bucket_finalizer" = "garagebucket.garage.rajsingh.info/finalizer" ] && \
+        [ "$key_finalizer" = "garagekey.garage.rajsingh.info/finalizer" ]; then
+        test_pass "Exact operator finalizers present on all resources"
         return 0
     fi
     test_fail "Missing finalizers (cluster: $cluster_finalizer, bucket: $bucket_finalizer, key: $key_finalizer)"
@@ -1270,22 +1647,15 @@ test_operator_restart() {
 
     # Wait for cluster to become healthy (operator reconciles after restart)
     # This may take longer if the cluster was recovering from a previous test
-    if wait_for_cluster_health "healthy" 300; then
+    if wait_for_cluster_fully_ready 300; then
         test_pass "Cluster healthy after operator restart"
         return 0
     fi
 
-    # If cluster was recovering from previous test, check if operator is managing correctly
-    local connected=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.connectedNodes}' 2>/dev/null || echo "0")
-    local health=$(get_cluster_health)
-
-    # If all nodes are connected, operator is doing its job - pass the test
-    if [ "$connected" = "3" ]; then
-        log_info "Note: All nodes connected ($connected/3) after operator restart - operator functioning correctly"
-        test_pass "Operator restart resilience verified (all nodes connected)"
-        return 0
-    fi
-
+    local connected
+    connected=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.connectedNodes}' 2>/dev/null || echo "0")
+    local health
+    health=$(get_cluster_health)
     test_fail "Cluster unhealthy after operator restart (health: $health, connected: $connected/3)"
     return 1
 }
@@ -1303,7 +1673,8 @@ test_secret_ownership() {
         return 1
     fi
 
-    local owner=$(kubectl get secret test-s3-credentials -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null)
+    local owner
+    owner=$(kubectl get secret test-s3-credentials -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null)
     if [ "$owner" = "GarageKey" ]; then
         test_pass "Secret has correct owner reference (GarageKey)"
         return 0
@@ -1349,7 +1720,8 @@ test_cluster_conditions() {
 
     # Select by condition type — order in .status.conditions is not stable post-#190
     # (LegacySTSMigrated may sort before/after Ready depending on transition order).
-    local ready_status=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+    local ready_status
+    ready_status=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
 
     if [ "$ready_status" = "True" ]; then
         test_pass "Cluster conditions set correctly (Ready=True)"
@@ -1366,16 +1738,20 @@ test_cluster_conditions() {
 test_idempotent_apply() {
     log_test "Testing idempotent resource apply..."
 
-    # First wait for cluster to be healthy
-    wait_for_cluster_health "healthy" 60 || true
+    # Establish a known-good source state before testing the no-op apply.
+    if ! wait_for_cluster_fully_ready 60; then
+        test_fail "Cluster was not fully ready before idempotent apply"
+        return 1
+    fi
 
     # Apply same resources again
-    kubectl apply -f hack/test-resources.yaml 2>/dev/null
+    if ! kubectl apply -f hack/test-resources.yaml 2>/dev/null; then
+        test_fail "Re-applying the unchanged resources failed"
+        return 1
+    fi
 
-    sleep 5
-
-    # Wait for cluster to be healthy again after re-apply
-    if wait_for_cluster_health "healthy" 30; then
+    # Require the full topology and partition evidence after re-apply.
+    if wait_for_cluster_fully_ready 60; then
         test_pass "Resources are idempotent (re-apply works)"
         return 0
     fi
@@ -1454,7 +1830,8 @@ EOF
 
     if check_resource_phase "garagebucket" "website-bucket" "Ready" 60; then
         # Verify website is enabled in status
-        local website_enabled=$(kubectl get garagebucket website-bucket -n "$NAMESPACE" -o jsonpath='{.status.websiteEnabled}' 2>/dev/null)
+        local website_enabled
+        website_enabled=$(kubectl get garagebucket website-bucket -n "$NAMESPACE" -o jsonpath='{.status.websiteEnabled}' 2>/dev/null)
         if [ "$website_enabled" = "true" ]; then
             test_pass "Website bucket created with hosting enabled"
             kubectl delete garagebucket website-bucket -n "$NAMESPACE" 2>/dev/null || true
@@ -1506,7 +1883,7 @@ metadata:
   name: $web_cluster
   namespace: $NAMESPACE
 spec:
-  image: dxflrs/garage:v2.2.0
+  image: dxflrs/garage:v2.2.0@sha256:45a61ce3f7c9c24fc23d9ed2b09b27ed560ab87b34605d175d5c588f539c24e4
   zone: test-zone
   replication:
     factor: 1
@@ -1608,8 +1985,10 @@ EOF
     fi
 
     # Get S3 credentials (default key names are access-key-id and secret-access-key)
-    local access_key=$(kubectl get secret "$web_key" -n "$NAMESPACE" -o jsonpath='{.data.access-key-id}' 2>/dev/null | base64 -d)
-    local secret_key=$(kubectl get secret "$web_key" -n "$NAMESPACE" -o jsonpath='{.data.secret-access-key}' 2>/dev/null | base64 -d)
+    local access_key
+    access_key=$(kubectl get secret "$web_key" -n "$NAMESPACE" -o jsonpath='{.data.access-key-id}' 2>/dev/null | base64 -d)
+    local secret_key
+    secret_key=$(kubectl get secret "$web_key" -n "$NAMESPACE" -o jsonpath='{.data.secret-access-key}' 2>/dev/null | base64 -d)
 
     if [ -z "$access_key" ] || [ -z "$secret_key" ]; then
         test_fail "Could not retrieve S3 credentials for Web API test"
@@ -1623,7 +2002,8 @@ EOF
 
     # Upload index.html using a job
     local index_content="<html><body><h1>Hello from Garage Web API!</h1></body></html>"
-    local index_content_b64=$(echo -n "$index_content" | base64 -w0)
+    local index_content_b64
+    index_content_b64=$(echo -n "$index_content" | base64 -w0)
 
     cat <<EOF | kubectl apply -f -
 apiVersion: batch/v1
@@ -1638,7 +2018,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: upload
-        image: amazon/aws-cli:latest
+        image: amazon/aws-cli:2.27.41@sha256:bc6b7bba44ce38f9604ede49c584824af919047ea03fbcc7c7610671fdef95d8
         env:
         - name: AWS_ACCESS_KEY_ID
           value: "$access_key"
@@ -1664,12 +2044,14 @@ EOF
     # Wait for upload job to complete
     local end_time=$((SECONDS + 120))
     while [ $SECONDS -lt $end_time ]; do
-        local job_status=$(kubectl get job webapi-upload-index -n "$NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null)
+        local job_status
+        job_status=$(kubectl get job webapi-upload-index -n "$NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null)
         if [ "$job_status" = "1" ]; then
             log_info "Index upload succeeded"
             break
         fi
-        local job_failed=$(kubectl get job webapi-upload-index -n "$NAMESPACE" -o jsonpath='{.status.failed}' 2>/dev/null)
+        local job_failed
+        job_failed=$(kubectl get job webapi-upload-index -n "$NAMESPACE" -o jsonpath='{.status.failed}' 2>/dev/null)
         if [ "$job_failed" = "1" ]; then
             log_error "Index upload failed"
             kubectl logs job/webapi-upload-index -n "$NAMESPACE" 2>/dev/null || true
@@ -1703,7 +2085,7 @@ spec:
   restartPolicy: Never
   containers:
   - name: curl
-    image: curlimages/curl:latest
+    image: curlimages/curl:8.14.1@sha256:9a1ed35addb45476afa911696297f8e115993df459278ed036182dd2cd22b67b
     command:
     - curl
     - -s
@@ -1720,7 +2102,8 @@ EOF
     # Wait for curl pod to complete
     end_time=$((SECONDS + 60))
     while [ $SECONDS -lt $end_time ]; do
-        local pod_phase=$(kubectl get pod webapi-curl-test -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
+        local pod_phase
+        pod_phase=$(kubectl get pod webapi-curl-test -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
         if [ "$pod_phase" = "Succeeded" ]; then
             break
         fi
@@ -1741,7 +2124,8 @@ EOF
     done
 
     # Get the response
-    local response=$(kubectl logs webapi-curl-test -n "$NAMESPACE" 2>/dev/null)
+    local response
+    response=$(kubectl logs webapi-curl-test -n "$NAMESPACE" 2>/dev/null)
 
     # Clean up - must delete objects from bucket before deleting bucket
     kubectl delete pod webapi-curl-test -n "$NAMESPACE" 2>/dev/null || true
@@ -1761,7 +2145,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: cleanup
-        image: amazon/aws-cli:latest
+        image: amazon/aws-cli:2.27.41@sha256:bc6b7bba44ce38f9604ede49c584824af919047ea03fbcc7c7610671fdef95d8
         env:
         - name: AWS_ACCESS_KEY_ID
           value: "$access_key"
@@ -1785,7 +2169,8 @@ EOF
     # Wait for cleanup job to complete (short timeout, best effort)
     local cleanup_end=$((SECONDS + 30))
     while [ $SECONDS -lt $cleanup_end ]; do
-        local cleanup_status=$(kubectl get job webapi-cleanup -n "$NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null)
+        local cleanup_status
+        cleanup_status=$(kubectl get job webapi-cleanup -n "$NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null)
         if [ "$cleanup_status" = "1" ]; then
             break
         fi
@@ -1825,33 +2210,88 @@ test_s3_list_buckets() {
     fi
 
     # Get credentials from secret
-    local access_key=$(kubectl get secret test-s3-credentials -n "$NAMESPACE" -o jsonpath='{.data.access-key-id}' 2>/dev/null | base64 -d)
-    local secret_key=$(kubectl get secret test-s3-credentials -n "$NAMESPACE" -o jsonpath='{.data.secret-access-key}' 2>/dev/null | base64 -d)
+    local access_key
+    access_key=$(kubectl get secret test-s3-credentials -n "$NAMESPACE" -o jsonpath='{.data.access-key-id}' 2>/dev/null | base64 -d)
+    local secret_key
+    secret_key=$(kubectl get secret test-s3-credentials -n "$NAMESPACE" -o jsonpath='{.data.secret-access-key}' 2>/dev/null | base64 -d)
 
     if [ -z "$access_key" ] || [ -z "$secret_key" ]; then
         test_fail "Could not retrieve S3 credentials"
         return 1
     fi
 
-    # Port forward and test
-    kubectl port-forward svc/garage 3900:3900 -n "$NAMESPACE" &>/dev/null &
-    local pf_pid=$!
-    sleep 3
+    # Exercise the named operation with a signed request from inside the cluster.
+    kubectl delete job s3-list-buckets -n "$NAMESPACE" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: s3-list-buckets
+  namespace: $NAMESPACE
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: aws-cli
+        image: amazon/aws-cli:2.27.41@sha256:bc6b7bba44ce38f9604ede49c584824af919047ea03fbcc7c7610671fdef95d8
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: test-s3-credentials
+              key: access-key-id
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: test-s3-credentials
+              key: secret-access-key
+        - name: AWS_DEFAULT_REGION
+          value: garage
+        - name: AWS_PAGER
+          value: ""
+        command:
+        - aws
+        - --endpoint-url
+        - http://garage.${NAMESPACE}.svc.cluster.local:3900
+        - s3api
+        - list-buckets
+        - --output
+        - json
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+EOF
 
-    # Sign and make request (simple check that S3 is accessible)
-    local date=$(date -u +"%Y%m%dT%H%M%SZ")
-    local http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-        -H "Host: localhost:3900" \
-        "http://localhost:3900/" 2>/dev/null || echo "000")
+    local job_succeeded=""
+    local job_failed=""
+    local job_deadline=$((SECONDS + 120))
+    while [ "$SECONDS" -lt "$job_deadline" ]; do
+        job_succeeded=$(kubectl get job s3-list-buckets -n "$NAMESPACE" \
+            -o jsonpath='{.status.succeeded}' 2>/dev/null)
+        job_failed=$(kubectl get job s3-list-buckets -n "$NAMESPACE" \
+            -o jsonpath='{.status.failed}' 2>/dev/null)
+        if [ "$job_succeeded" = "1" ] || [ "$job_failed" = "1" ]; then
+            break
+        fi
+        sleep 3
+    done
 
-    kill $pf_pid 2>/dev/null || true
+    local response
+    response=$(kubectl logs job/s3-list-buckets -n "$NAMESPACE" 2>/dev/null || true)
+    kubectl delete job s3-list-buckets -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
-    # 200 = success, 403 = auth required (expected without proper signing)
-    if [ "$http_code" = "200" ] || [ "$http_code" = "403" ]; then
-        test_pass "S3 list buckets endpoint responding (HTTP $http_code)"
+    if [ "$job_succeeded" = "1" ] && echo "$response" | \
+        jq -e '.Buckets | any(.Name == "test-bucket")' >/dev/null 2>&1; then
+        test_pass "Signed S3 ListBuckets returned test-bucket"
         return 0
     fi
-    test_fail "S3 list buckets failed (HTTP $http_code)"
+    test_fail "Signed S3 ListBuckets did not return test-bucket (succeeded: ${job_succeeded:-0}, failed: ${job_failed:-0})"
+    [ -n "$response" ] && log_error "ListBuckets response: $response"
     return 1
 }
 
@@ -1882,27 +2322,42 @@ spec:
     port: 3901
 EOF
 
-    # Poll for the operator to set a phase (avoids the fixed-sleep flake).
+    # Require the exact desired identity to be committed to the layout and
+    # observed at the current generation. A non-empty phase includes Failed and
+    # is not evidence that reconciliation succeeded.
     local phase=""
+    local observed_generation=""
+    local generation=""
+    local node_id=""
+    local zone=""
+    local in_layout=""
     local end_time=$((SECONDS + 90))
     while [ $SECONDS -lt $end_time ]; do
-        phase=$(kubectl get garagenode custom-node -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-        [ -n "$phase" ] && break
+        local snapshot
+        snapshot=$(kubectl get garagenode custom-node -n "$NAMESPACE" -o json 2>/dev/null | \
+            jq -r '[.status.phase // "", (.status.observedGeneration // ""), .metadata.generation, .status.nodeId // "", .status.zone // "", (.status.inLayout // false)] | map(tostring) | join("|")' 2>/dev/null || true)
+        IFS='|' read -r phase observed_generation generation node_id zone in_layout <<< "$snapshot"
+        if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
+            [ "$observed_generation" = "$generation" ] && \
+            [ "$node_id" = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ] && \
+            [ "$zone" = "custom-zone" ] && [ "$in_layout" = "true" ]; then
+            break
+        fi
         sleep 3
     done
 
-    # Any phase (incl. Error for an unreachable external gateway) means the resource
-    # was processed without error.
-    if [ -n "$phase" ]; then
-        if ! delete_test_garagenode custom-node; then
-            test_fail "GarageNode external fixture could not be cleaned up"
-            return 1
-        fi
-        test_pass "GarageNode external resource processed and cleaned up (phase: $phase)"
+    if ! delete_test_garagenode custom-node; then
+        test_fail "GarageNode external fixture could not be cleaned up"
+        return 1
+    fi
+    if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
+        [ "$observed_generation" = "$generation" ] && \
+        [ "$node_id" = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ] && \
+        [ "$zone" = "custom-zone" ] && [ "$in_layout" = "true" ]; then
+        test_pass "External GarageNode reached Ready with its exact identity and layout role"
         return 0
     fi
-    test_fail "GarageNode creation failed (phase: $phase)"
-    delete_test_garagenode custom-node || true
+    test_fail "External GarageNode did not converge (phase: ${phase:-missing}, observedGeneration: ${observed_generation:-missing}/${generation:-missing}, nodeId: ${node_id:-missing}, zone: ${zone:-missing}, inLayout: ${in_layout:-missing})"
     return 1
 }
 
@@ -1919,9 +2374,12 @@ test_cluster_status_fields() {
         return 1
     fi
 
-    local cluster_id=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.clusterId}' 2>/dev/null)
-    local layout_version=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.layoutVersion}' 2>/dev/null)
-    local storage_nodes=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.storageNodes}' 2>/dev/null)
+    local cluster_id
+    cluster_id=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.clusterId}' 2>/dev/null)
+    local layout_version
+    layout_version=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.layoutVersion}' 2>/dev/null)
+    local storage_nodes
+    storage_nodes=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.health.storageNodes}' 2>/dev/null)
 
     if [ -n "$cluster_id" ] && [ -n "$layout_version" ] && [ "$storage_nodes" -gt "0" ] 2>/dev/null; then
         test_pass "Cluster status fields populated (clusterId: ${cluster_id:0:16}..., layoutVersion: $layout_version, storageNodes: $storage_nodes)"
@@ -1940,16 +2398,17 @@ test_bucket_status_fields() {
         return 1
     fi
 
-    local bucket_id=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.bucketId}' 2>/dev/null)
-    local global_alias=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.globalAlias}' 2>/dev/null)
-    local size=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.size}' 2>/dev/null)
-    local object_count=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.quotaUsage.objectCount}' 2>/dev/null)
-
-    if [ -n "$bucket_id" ] && [ -n "$global_alias" ]; then
+    local bucket_id
+    bucket_id=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.bucketId}' 2>/dev/null)
+    local global_alias
+    global_alias=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.globalAlias}' 2>/dev/null)
+    local size
+    size=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.size}' 2>/dev/null)
+    if [ -n "$bucket_id" ] && [ "$global_alias" = "test-bucket" ] && [ -n "$size" ]; then
         test_pass "Bucket status fields populated (bucketId: ${bucket_id:0:16}..., alias: $global_alias, size: $size)"
         return 0
     fi
-    test_fail "Bucket status fields missing (bucketId: $bucket_id, alias: $global_alias)"
+    test_fail "Bucket status fields missing or incorrect (bucketId: $bucket_id, alias: ${global_alias:-missing}, size: ${size:-missing})"
     return 1
 }
 
@@ -1962,9 +2421,12 @@ test_key_status_fields() {
         return 1
     fi
 
-    local key_id=$(kubectl get garagekey test-key -n "$NAMESPACE" -o jsonpath='{.status.keyId}' 2>/dev/null)
-    local access_key_id=$(kubectl get garagekey test-key -n "$NAMESPACE" -o jsonpath='{.status.accessKeyId}' 2>/dev/null)
-    local secret_ref=$(kubectl get garagekey test-key -n "$NAMESPACE" -o jsonpath='{.status.secretRef.name}' 2>/dev/null)
+    local key_id
+    key_id=$(kubectl get garagekey test-key -n "$NAMESPACE" -o jsonpath='{.status.keyId}' 2>/dev/null)
+    local access_key_id
+    access_key_id=$(kubectl get garagekey test-key -n "$NAMESPACE" -o jsonpath='{.status.accessKeyId}' 2>/dev/null)
+    local secret_ref
+    secret_ref=$(kubectl get garagekey test-key -n "$NAMESPACE" -o jsonpath='{.status.secretRef.name}' 2>/dev/null)
 
     if [ -n "$key_id" ] && [ -n "$access_key_id" ] && [ -n "$secret_ref" ]; then
         test_pass "Key status fields populated (keyId: ${key_id:0:16}..., accessKeyId: $access_key_id, secretRef: $secret_ref)"
@@ -1981,22 +2443,22 @@ test_key_status_fields() {
 test_quota_status_reporting() {
     log_test "Testing quota usage reporting..."
 
-    # Check if quota-test-bucket has quota usage in status
-    local size_limit=$(kubectl get garagebucket quota-test-bucket -n "$NAMESPACE" -o jsonpath='{.status.quotaUsage.sizeLimit}' 2>/dev/null)
-    local object_limit=$(kubectl get garagebucket quota-test-bucket -n "$NAMESPACE" -o jsonpath='{.status.quotaUsage.objectLimit}' 2>/dev/null)
+    local size_limit=""
+    local object_limit=""
+    local quota_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$quota_deadline" ]; do
+        size_limit=$(kubectl get garagebucket quota-test-bucket -n "$NAMESPACE" \
+            -o jsonpath='{.status.quotaUsage.sizeLimit}' 2>/dev/null)
+        object_limit=$(kubectl get garagebucket quota-test-bucket -n "$NAMESPACE" \
+            -o jsonpath='{.status.quotaUsage.objectLimit}' 2>/dev/null)
+        if [ "$size_limit" = "524288000" ] && [ "$object_limit" = "500" ]; then
+            test_pass "Quota usage reports configured limits (sizeLimit: $size_limit, objectLimit: $object_limit)"
+            return 0
+        fi
+        sleep 3
+    done
 
-    if [ -n "$size_limit" ] && [ "$size_limit" != "0" ]; then
-        test_pass "Quota usage reporting works (sizeLimit: $size_limit, objectLimit: $object_limit)"
-        return 0
-    fi
-
-    # If quota-test-bucket doesn't exist yet, skip
-    if ! kubectl get garagebucket quota-test-bucket -n "$NAMESPACE" &>/dev/null; then
-        test_pass "Quota test bucket not yet created, skipping"
-        return 0
-    fi
-
-    test_fail "Quota usage not reported (sizeLimit: $size_limit, objectLimit: $object_limit)"
+    test_fail "Quota usage did not report configured limits (sizeLimit: ${size_limit:-missing}, objectLimit: ${object_limit:-missing})"
     return 1
 }
 
@@ -2023,19 +2485,20 @@ spec:
 EOF
 
     if check_resource_phase "garagebucket" "alias-test-bucket" "Ready" 60; then
-        # Check if local alias is in status
-        local local_aliases=$(kubectl get garagebucket alias-test-bucket -n "$NAMESPACE" -o jsonpath='{.status.localAliases}' 2>/dev/null)
-        if [ -n "$local_aliases" ]; then
-            test_pass "Local alias bucket created (aliases: $local_aliases)"
-            kubectl delete garagebucket alias-test-bucket -n "$NAMESPACE" 2>/dev/null || true
-            return 0
-        fi
-        # Local alias may take time to appear - still pass if bucket is ready
-        test_pass "Local alias bucket created (aliases pending)"
-        kubectl delete garagebucket alias-test-bucket -n "$NAMESPACE" 2>/dev/null || true
-        return 0
+        local alias_count=0
+        local alias_deadline=$((SECONDS + 60))
+        while [ "$SECONDS" -lt "$alias_deadline" ]; do
+            alias_count=$(kubectl get garagebucket alias-test-bucket -n "$NAMESPACE" -o json 2>/dev/null | \
+                jq -r '[.status.localAliases[]? | select(.keyName == "test-key" and .alias == "my-local-alias")] | length' 2>/dev/null || echo "0")
+            if [ "$alias_count" -ge 1 ] 2>/dev/null; then
+                test_pass "Local alias my-local-alias is reported for test-key"
+                kubectl delete garagebucket alias-test-bucket -n "$NAMESPACE" 2>/dev/null || true
+                return 0
+            fi
+            sleep 3
+        done
     fi
-    test_fail "Local alias bucket creation failed"
+    test_fail "Local alias my-local-alias was not reported for test-key"
     kubectl delete garagebucket alias-test-bucket -n "$NAMESPACE" 2>/dev/null || true
     return 1
 }
@@ -2047,11 +2510,15 @@ EOF
 test_observed_generation() {
     log_test "Testing observedGeneration tracking..."
 
-    local cluster_gen=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.metadata.generation}' 2>/dev/null)
-    local cluster_obs_gen=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.observedGeneration}' 2>/dev/null)
+    local cluster_gen
+    cluster_gen=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.metadata.generation}' 2>/dev/null)
+    local cluster_obs_gen
+    cluster_obs_gen=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.observedGeneration}' 2>/dev/null)
 
-    local bucket_gen=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.metadata.generation}' 2>/dev/null)
-    local bucket_obs_gen=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.observedGeneration}' 2>/dev/null)
+    local bucket_gen
+    bucket_gen=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.metadata.generation}' 2>/dev/null)
+    local bucket_obs_gen
+    bucket_obs_gen=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.observedGeneration}' 2>/dev/null)
 
     if [ "$cluster_gen" = "$cluster_obs_gen" ] && [ "$bucket_gen" = "$bucket_obs_gen" ]; then
         test_pass "ObservedGeneration tracking correct (cluster: $cluster_gen=$cluster_obs_gen, bucket: $bucket_gen=$bucket_obs_gen)"
@@ -2069,7 +2536,8 @@ test_key_expiration() {
     log_test "Testing key with expiration..."
 
     # Create a key with expiration set to 1 hour from now
-    local expiration=$(date -u -d "+1 hour" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v+1H +"%Y-%m-%dT%H:%M:%SZ")
+    local expiration
+    expiration=$(date -u -d "+1 hour" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v+1H +"%Y-%m-%dT%H:%M:%SZ")
 
     cat <<EOF | kubectl apply -f -
 apiVersion: garage.rajsingh.info/v1beta1
@@ -2087,20 +2555,23 @@ spec:
 EOF
 
     if check_resource_phase "garagekey" "expiring-key" "Ready" 60; then
-        # Verify expiration is set in status
-        local status_expiration=$(kubectl get garagekey expiring-key -n "$NAMESPACE" -o jsonpath='{.status.expiresAt}' 2>/dev/null)
-        local phase=$(kubectl get garagekey expiring-key -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
-
-        if [ -n "$status_expiration" ] && [ "$phase" = "Ready" ]; then
-            test_pass "Key with expiration created (expiresAt: $status_expiration, phase: $phase)"
-            kubectl delete garagekey expiring-key -n "$NAMESPACE" 2>/dev/null || true
-            return 0
-        fi
-        test_pass "Key with expiration created (status fields may take time to populate)"
-        kubectl delete garagekey expiring-key -n "$NAMESPACE" 2>/dev/null || true
-        return 0
+        local status_expiration=""
+        local phase=""
+        local expiration_deadline=$((SECONDS + 60))
+        while [ "$SECONDS" -lt "$expiration_deadline" ]; do
+            status_expiration=$(kubectl get garagekey expiring-key -n "$NAMESPACE" \
+                -o jsonpath='{.status.expiresAt}' 2>/dev/null)
+            phase=$(kubectl get garagekey expiring-key -n "$NAMESPACE" \
+                -o jsonpath='{.status.phase}' 2>/dev/null)
+            if [ "$status_expiration" = "$expiration" ] && [ "$phase" = "Ready" ]; then
+                test_pass "Key expiration converged (expiresAt: $status_expiration, phase: $phase)"
+                kubectl delete garagekey expiring-key -n "$NAMESPACE" 2>/dev/null || true
+                return 0
+            fi
+            sleep 3
+        done
     fi
-    test_fail "Key with expiration creation failed"
+    test_fail "Key expiration did not converge (expected: $expiration, observed: ${status_expiration:-missing}, phase: ${phase:-missing})"
     kubectl delete garagekey expiring-key -n "$NAMESPACE" 2>/dev/null || true
     return 1
 }
@@ -2123,13 +2594,48 @@ spec:
     name: permanent-credentials
 EOF
 
-    if check_resource_phase "garagekey" "permanent-key" "Ready" 60; then
-        test_pass "Key with neverExpires flag created"
+    if ! check_resource_phase "garagekey" "permanent-key" "Ready" 60; then
+        test_fail "Key with neverExpires flag did not reach Ready"
         kubectl delete garagekey permanent-key -n "$NAMESPACE" 2>/dev/null || true
+        return 1
+    fi
+
+    local access_key_id
+    access_key_id=$(kubectl get garagekey permanent-key -n "$NAMESPACE" \
+        -o jsonpath='{.status.accessKeyId}' 2>/dev/null)
+    local admin_token
+    admin_token=$(kubectl get secret garage-admin-token -n "$NAMESPACE" \
+        -o jsonpath='{.data.admin-token}' 2>/dev/null | base64 -d)
+    if [ -z "$access_key_id" ] || [ -z "$admin_token" ]; then
+        test_fail "Cannot verify neverExpires in Garage (accessKeyId or admin token missing)"
+        kubectl delete garagekey permanent-key -n "$NAMESPACE" 2>/dev/null || true
+        return 1
+    fi
+
+    local pf_port=34904
+    kubectl port-forward svc/garage ${pf_port}:3903 -n "$NAMESPACE" &>/dev/null &
+    local pf_pid=$!
+    local expiration=""
+    local key_info=""
+    local expiration_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$expiration_deadline" ]; do
+        key_info=$(curl -fsS --connect-timeout 5 --max-time 10 --get \
+            -H "Authorization: Bearer ${admin_token}" \
+            --data-urlencode "id=${access_key_id}" \
+            "http://localhost:${pf_port}/v2/GetKeyInfo" 2>/dev/null || true)
+        expiration=$(echo "$key_info" | jq -r '.expiration // ""' 2>/dev/null || true)
+        [ "$expiration" = "never" ] && break
+        sleep 3
+    done
+    kill "$pf_pid" 2>/dev/null || true
+    wait "$pf_pid" 2>/dev/null || true
+
+    kubectl delete garagekey permanent-key -n "$NAMESPACE" 2>/dev/null || true
+    if [ "$expiration" = "never" ]; then
+        test_pass "Garage reports the permanent key expiration as never"
         return 0
     fi
-    test_fail "Key with neverExpires flag creation failed"
-    kubectl delete garagekey permanent-key -n "$NAMESPACE" 2>/dev/null || true
+    test_fail "Garage did not report expiration=never for the permanent key (observed: ${expiration:-missing})"
     return 1
 }
 
@@ -2157,28 +2663,41 @@ spec:
     port: 3901
 EOF
 
-    # Poll for the operator to set a phase. A fixed sleep flaked when the
-    # per-node controller was busy and hadn't reconciled within 10s.
+    # Require the exact desired gateway identity to reach the current
+    # generation and enter the committed layout.
     local phase=""
+    local observed_generation=""
+    local generation=""
+    local node_id=""
+    local zone=""
+    local in_layout=""
     local end_time=$((SECONDS + 90))
     while [ $SECONDS -lt $end_time ]; do
-        phase=$(kubectl get garagenode gateway-node -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-        [ -n "$phase" ] && break
+        local snapshot
+        snapshot=$(kubectl get garagenode gateway-node -n "$NAMESPACE" -o json 2>/dev/null | \
+            jq -r '[.status.phase // "", (.status.observedGeneration // ""), .metadata.generation, .status.nodeId // "", .status.zone // "", (.status.inLayout // false)] | map(tostring) | join("|")' 2>/dev/null || true)
+        IFS='|' read -r phase observed_generation generation node_id zone in_layout <<< "$snapshot"
+        if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
+            [ "$observed_generation" = "$generation" ] && \
+            [ "$node_id" = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210" ] && \
+            [ "$zone" = "gateway-zone" ] && [ "$in_layout" = "true" ]; then
+            break
+        fi
         sleep 3
     done
 
-    # Gateway nodes don't require capacity; any phase (incl. Error for an
-    # unreachable external node) means the resource was processed without error.
-    if [ -n "$phase" ]; then
-        if ! delete_test_garagenode gateway-node; then
-            test_fail "Gateway node fixture could not be cleaned up"
-            return 1
-        fi
-        test_pass "Gateway node resource processed and cleaned up (phase: $phase)"
+    if ! delete_test_garagenode gateway-node; then
+        test_fail "Gateway node fixture could not be cleaned up"
+        return 1
+    fi
+    if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
+        [ "$observed_generation" = "$generation" ] && \
+        [ "$node_id" = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210" ] && \
+        [ "$zone" = "gateway-zone" ] && [ "$in_layout" = "true" ]; then
+        test_pass "External gateway reached Ready with its exact identity and layout role"
         return 0
     fi
-    test_fail "Gateway node creation failed (phase: $phase)"
-    delete_test_garagenode gateway-node || true
+    test_fail "External gateway did not converge (phase: ${phase:-missing}, observedGeneration: ${observed_generation:-missing}/${generation:-missing}, nodeId: ${node_id:-missing}, zone: ${zone:-missing}, inLayout: ${in_layout:-missing})"
     return 1
 }
 
@@ -2240,7 +2759,8 @@ test_pdb_creation() {
     local end_time=$((SECONDS + timeout))
     while [ $SECONDS -lt $end_time ]; do
         if kubectl get pdb garage -n "$NAMESPACE" &>/dev/null; then
-            local min_available=$(kubectl get pdb garage -n "$NAMESPACE" -o jsonpath='{.spec.minAvailable}' 2>/dev/null)
+            local min_available
+            min_available=$(kubectl get pdb garage -n "$NAMESPACE" -o jsonpath='{.spec.minAvailable}' 2>/dev/null)
             if [ "$min_available" = "2" ]; then
                 if ! wait_for_storage_rollout_converged garage 600; then
                     test_fail "PDB generation did not converge"
@@ -2249,18 +2769,12 @@ test_pdb_creation() {
                 test_pass "PDB created with minAvailable: $min_available"
                 return 0
             fi
-            if ! wait_for_storage_rollout_converged garage 600; then
-                test_fail "PDB generation did not converge"
-                return 1
-            fi
-            test_pass "PDB created (minAvailable: $min_available)"
-            return 0
         fi
         sleep 2
     done
 
-    test_skip "PDB not implemented yet"
-    return 0
+    test_fail "PDB did not converge with minAvailable=2"
+    return 1
 }
 
 # ============================================================================
@@ -2311,24 +2825,38 @@ spec:
 EOF
 
     if check_resource_phase "garagekey" "custom-secret-key" "Ready" 60; then
-        # Verify custom keys exist in secret
-        local custom_key=$(kubectl get secret custom-credentials -n "$NAMESPACE" -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' 2>/dev/null)
-        local custom_label=$(kubectl get secret custom-credentials -n "$NAMESPACE" -o jsonpath='{.metadata.labels.custom-label}' 2>/dev/null)
+        local access_key=""
+        local secret_key=""
+        local endpoint=""
+        local region=""
+        local custom_label=""
+        local custom_annotation=""
+        local secret_deadline=$((SECONDS + 60))
+        while [ "$SECONDS" -lt "$secret_deadline" ]; do
+            access_key=$(kubectl get secret custom-credentials -n "$NAMESPACE" \
+                -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' 2>/dev/null)
+            secret_key=$(kubectl get secret custom-credentials -n "$NAMESPACE" \
+                -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' 2>/dev/null)
+            endpoint=$(kubectl get secret custom-credentials -n "$NAMESPACE" \
+                -o jsonpath='{.data.S3_ENDPOINT}' 2>/dev/null)
+            region=$(kubectl get secret custom-credentials -n "$NAMESPACE" \
+                -o jsonpath='{.data.AWS_REGION}' 2>/dev/null)
+            custom_label=$(kubectl get secret custom-credentials -n "$NAMESPACE" \
+                -o jsonpath='{.metadata.labels.custom-label}' 2>/dev/null)
+            custom_annotation=$(kubectl get secret custom-credentials -n "$NAMESPACE" \
+                -o jsonpath='{.metadata.annotations.custom-annotation}' 2>/dev/null)
 
-        if [ -n "$custom_key" ] && [ "$custom_label" = "test-value" ]; then
-            test_pass "Secret template with custom keys works (label: $custom_label)"
-            kubectl delete garagekey custom-secret-key -n "$NAMESPACE" 2>/dev/null || true
-            return 0
-        fi
-
-        # Partial success if key was created
-        if [ -n "$custom_key" ]; then
-            test_pass "Secret template with custom keys partially works"
-            kubectl delete garagekey custom-secret-key -n "$NAMESPACE" 2>/dev/null || true
-            return 0
-        fi
+            if [ -n "$access_key" ] && [ -n "$secret_key" ] && [ -n "$endpoint" ] &&
+                [ -n "$region" ] && [ "$custom_label" = "test-value" ] &&
+                [ "$custom_annotation" = "test-annotation" ]; then
+                test_pass "Secret template contains every custom key, label, and annotation"
+                kubectl delete garagekey custom-secret-key -n "$NAMESPACE" 2>/dev/null || true
+                return 0
+            fi
+            sleep 3
+        done
     fi
-    test_fail "Secret template customization failed"
+    test_fail "Secret template did not converge with every custom key, label, and annotation"
     kubectl delete garagekey custom-secret-key -n "$NAMESPACE" 2>/dev/null || true
     return 1
 }
@@ -2344,13 +2872,26 @@ test_database_engine_config() {
     local config
     config=$(get_primary_storage_config)
 
-    if echo "$config" | grep -q "db_engine"; then
-        local engine=$(echo "$config" | grep "db_engine" | head -1)
+    if [ -z "$config" ]; then
+        test_fail "Mounted Garage configuration is unavailable"
+        return 1
+    fi
+
+    if echo "$config" | grep -q '^db_engine = "lmdb"$'; then
+        local engine
+        engine=$(echo "$config" | grep '^db_engine = ' | head -1)
         test_pass "Database engine configured: $engine"
         return 0
     fi
 
-    # Default is lmdb, may not be explicitly set
+    if echo "$config" | grep -q '^db_engine = '; then
+        local engine
+        engine=$(echo "$config" | grep '^db_engine = ' | head -1)
+        test_fail "Database engine does not match the expected lmdb default: $engine"
+        return 1
+    fi
+
+    # Garage defaults an omitted db_engine to lmdb.
     test_pass "Database engine using default (lmdb)"
     return 0
 }
@@ -2408,8 +2949,10 @@ test_compression_config() {
 test_build_info_status() {
     log_test "Testing build info in cluster status..."
 
-    local version=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.buildInfo.version}' 2>/dev/null)
-    local rust_version=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.buildInfo.rustVersion}' 2>/dev/null)
+    local version
+    version=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.buildInfo.version}' 2>/dev/null)
+    local rust_version
+    rust_version=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.buildInfo.rustVersion}' 2>/dev/null)
 
     if [ -n "$version" ]; then
         test_pass "Build info populated (version: $version, rust: ${rust_version:-not-set})"
@@ -2426,16 +2969,19 @@ test_build_info_status() {
 test_storage_stats_status() {
     log_test "Testing storage stats in cluster status..."
 
-    local total_capacity=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.storageStats.totalCapacity}' 2>/dev/null)
-    local used_capacity=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.storageStats.usedCapacity}' 2>/dev/null)
+    local total_capacity
+    total_capacity=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.storageStats.totalCapacity}' 2>/dev/null)
+    local used_capacity
+    used_capacity=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.storageStats.usedCapacity}' 2>/dev/null)
+    local available_capacity
+    available_capacity=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.storageStats.availableCapacity}' 2>/dev/null)
 
-    if [ -n "$total_capacity" ]; then
-        test_pass "Storage stats populated (total: $total_capacity, used: ${used_capacity:-0})"
+    if [ -n "$total_capacity" ] && [ -n "$used_capacity" ] && [ -n "$available_capacity" ]; then
+        test_pass "Storage stats populated (total: $total_capacity, used: $used_capacity, available: $available_capacity)"
         return 0
     fi
 
-    # May not be implemented
-    test_fail "Storage stats not populated in status"
+    test_fail "Storage stats not fully populated (total: ${total_capacity:-missing}, used: ${used_capacity:-missing}, available: ${available_capacity:-missing})"
     return 1
 }
 
@@ -2463,17 +3009,20 @@ spec:
 EOF
 
     if check_resource_phase "garagekey" "admin-key" "Ready" 60; then
-        local create_bucket=$(kubectl get garagekey admin-key -n "$NAMESPACE" -o jsonpath='{.status.permissions.createBucket}' 2>/dev/null)
-        if [ "$create_bucket" = "true" ]; then
-            test_pass "Key with createBucket permission works"
-            kubectl delete garagekey admin-key -n "$NAMESPACE" 2>/dev/null || true
-            return 0
-        fi
-        test_pass "Key created (createBucket status may not be populated)"
-        kubectl delete garagekey admin-key -n "$NAMESPACE" 2>/dev/null || true
-        return 0
+        local create_bucket=""
+        local permission_deadline=$((SECONDS + 60))
+        while [ "$SECONDS" -lt "$permission_deadline" ]; do
+            create_bucket=$(kubectl get garagekey admin-key -n "$NAMESPACE" \
+                -o jsonpath='{.status.permissions.createBucket}' 2>/dev/null)
+            if [ "$create_bucket" = "true" ]; then
+                test_pass "Key reports createBucket permission enabled"
+                kubectl delete garagekey admin-key -n "$NAMESPACE" 2>/dev/null || true
+                return 0
+            fi
+            sleep 3
+        done
     fi
-    test_fail "Key with createBucket permission failed"
+    test_fail "Key did not report createBucket permission enabled (observed: ${create_bucket:-missing})"
     kubectl delete garagekey admin-key -n "$NAMESPACE" 2>/dev/null || true
     return 1
 }
@@ -2504,18 +3053,20 @@ spec:
 EOF
 
     if check_resource_phase "garagebucket" "permissions-bucket" "Ready" 60; then
-        # Check if key permissions are in bucket status
-        local keys=$(kubectl get garagebucket permissions-bucket -n "$NAMESPACE" -o jsonpath='{.status.keys}' 2>/dev/null)
-        if [ -n "$keys" ]; then
-            test_pass "Bucket with keyPermissions works (keys in status)"
-            kubectl delete garagebucket permissions-bucket -n "$NAMESPACE" 2>/dev/null || true
-            return 0
-        fi
-        test_pass "Bucket with keyPermissions created (status may take time)"
-        kubectl delete garagebucket permissions-bucket -n "$NAMESPACE" 2>/dev/null || true
-        return 0
+        local matching_permissions=0
+        local permissions_deadline=$((SECONDS + 60))
+        while [ "$SECONDS" -lt "$permissions_deadline" ]; do
+            matching_permissions=$(kubectl get garagebucket permissions-bucket -n "$NAMESPACE" -o json 2>/dev/null | \
+                jq -r '[.status.keys[]? | select(.name == "test-key" and .permissions.read == true and .permissions.write == true and .permissions.owner == true)] | length' 2>/dev/null || echo "0")
+            if [ "$matching_permissions" -ge 1 ] 2>/dev/null; then
+                test_pass "Bucket reports read, write, and owner permissions for test-key"
+                kubectl delete garagebucket permissions-bucket -n "$NAMESPACE" 2>/dev/null || true
+                return 0
+            fi
+            sleep 3
+        done
     fi
-    test_fail "Bucket with keyPermissions failed"
+    test_fail "Bucket did not report read, write, and owner permissions for test-key"
     kubectl delete garagebucket permissions-bucket -n "$NAMESPACE" 2>/dev/null || true
     return 1
 }
@@ -2527,17 +3078,20 @@ EOF
 test_bucket_mpu_status() {
     log_test "Testing bucket incomplete uploads status..."
 
-    # Check if test-bucket has incomplete upload fields
-    local incomplete_uploads=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.incompleteUploads}' 2>/dev/null)
-
-    # Value may be 0 or empty, both are acceptable
-    if [ -n "$incomplete_uploads" ] || [ "$incomplete_uploads" = "0" ]; then
-        test_pass "Bucket incomplete uploads status available (count: ${incomplete_uploads:-0})"
-        return 0
+    if ! check_resource_phase "garagebucket" "test-bucket" "Ready" 60; then
+        test_fail "Bucket incomplete uploads status unavailable because test-bucket is not Ready"
+        return 1
     fi
 
-    # Field may not be populated if there are no incomplete uploads
-    test_pass "Bucket incomplete uploads status not set (likely 0)"
+    # The API omits the zero-valued field, so empty and literal zero both
+    # affirmatively represent no incomplete uploads on a Ready bucket.
+    local incomplete_uploads
+    incomplete_uploads=$(kubectl get garagebucket test-bucket -n "$NAMESPACE" -o jsonpath='{.status.incompleteUploads}' 2>/dev/null)
+    if [ -n "$incomplete_uploads" ] && [[ ! "$incomplete_uploads" =~ ^[0-9]+$ ]]; then
+        test_fail "Bucket incomplete uploads status is not numeric (value: $incomplete_uploads)"
+        return 1
+    fi
+    test_pass "Ready bucket reports incomplete uploads count ${incomplete_uploads:-0}"
     return 0
 }
 
@@ -2548,30 +3102,48 @@ test_bucket_mpu_status() {
 test_connect_nodes_annotation() {
     log_test "Testing connect-nodes annotation processing..."
 
-    # Get a node ID from the cluster
-    local node_id=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.nodes[0].nodeId}' 2>/dev/null)
-    local pod_ip=$(kubectl get pod garage-0 -n "$NAMESPACE" -o jsonpath='{.status.podIP}' 2>/dev/null)
+    # Get a node ID and address with a bounded wait.
+    local node_id=""
+    local pod_ip=""
+    local node_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$node_deadline" ]; do
+        local node_snapshot pod_name
+        node_snapshot=$(kubectl get garagecluster garage -n "$NAMESPACE" \
+            -o 'jsonpath={.status.nodes[0].nodeId}{"|"}{.status.nodes[0].podName}' 2>/dev/null)
+        IFS='|' read -r node_id pod_name <<< "$node_snapshot"
+        if [ -n "$pod_name" ]; then
+            pod_ip=$(kubectl get pod "$pod_name" -n "$NAMESPACE" \
+                -o jsonpath='{.status.podIP}' 2>/dev/null)
+        fi
+        [ -n "$node_id" ] && [ -n "$pod_ip" ] && break
+        sleep 3
+    done
 
     if [ -z "$node_id" ] || [ -z "$pod_ip" ]; then
-        test_pass "Cannot test connect-nodes (no node info available yet)"
-        return 0
+        test_fail "connect-nodes prerequisites unavailable (nodeId: ${node_id:-missing}, podIP: ${pod_ip:-missing})"
+        return 1
     fi
 
     # Apply the connect-nodes annotation (connecting to self is a no-op but tests the parsing)
-    kubectl annotate garagecluster garage -n "$NAMESPACE" \
-        "garage.rajsingh.info/connect-nodes=${node_id}@${pod_ip}:3901" --overwrite
-
-    sleep 10
-
-    # The annotation should be removed after processing
-    local annotation=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.metadata.annotations.garage\.rajsingh\.info/connect-nodes}' 2>/dev/null)
-
-    if [ -z "$annotation" ]; then
-        test_pass "connect-nodes annotation processed and removed"
-        return 0
+    if ! kubectl annotate garagecluster garage -n "$NAMESPACE" \
+        "garage.rajsingh.info/connect-nodes=${node_id}@${pod_ip}:3901" --overwrite; then
+        test_fail "connect-nodes annotation could not be applied"
+        return 1
     fi
 
-    # Annotation still present - may not be implemented
+    # The annotation should be removed after processing.
+    local annotation=""
+    local annotation_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$annotation_deadline" ]; do
+        annotation=$(kubectl get garagecluster garage -n "$NAMESPACE" \
+            -o jsonpath='{.metadata.annotations.garage\.rajsingh\.info/connect-nodes}' 2>/dev/null)
+        if [ -z "$annotation" ]; then
+            test_pass "connect-nodes annotation processed and removed"
+            return 0
+        fi
+        sleep 3
+    done
+
     test_fail "connect-nodes annotation not processed (still present: $annotation)"
     # Clean up
     kubectl annotate garagecluster garage -n "$NAMESPACE" "garage.rajsingh.info/connect-nodes-" 2>/dev/null || true
@@ -2581,43 +3153,9 @@ test_connect_nodes_annotation() {
 test_pause_reconcile_annotation() {
     log_test "Testing pause-reconcile annotation..."
 
-    # Apply pause annotation
-    kubectl annotate garagecluster garage -n "$NAMESPACE" \
-        "garage.rajsingh.info/pause-reconcile=true" --overwrite
-
-    sleep 5
-
-    # Make a change that would normally trigger reconciliation
-    local before_gen=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.observedGeneration}' 2>/dev/null)
-
-    # Change something trivial
-    kubectl label garagecluster garage -n "$NAMESPACE" test-label=test-value --overwrite
-
-    sleep 10
-
-    local after_gen=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.status.observedGeneration}' 2>/dev/null)
-
-    # Remove pause
-    kubectl annotate garagecluster garage -n "$NAMESPACE" "garage.rajsingh.info/pause-reconcile-" 2>/dev/null || true
-    kubectl label garagecluster garage -n "$NAMESPACE" test-label- 2>/dev/null || true
-
-    # Wait for resources to be reconciled after unpausing
-    # This is important for subsequent tests that depend on Ready state
-    sleep 5
-    wait_for_cluster_health "healthy" 60 || true
-    # Also wait for bucket and key to be Ready (subsequent update tests depend on these)
-    check_resource_phase "garagebucket" "quota-test-bucket" "Ready" 30 || true
-    check_resource_phase "garagekey" "multi-bucket-key" "Ready" 30 || true
-
-    # If generation didn't change, reconciliation was paused
-    # Note: This test is informational - pause may or may not be implemented
-    if [ "$before_gen" = "$after_gen" ]; then
-        test_pass "Reconciliation was paused (observedGeneration unchanged)"
-        return 0
-    fi
-
-    # Reconciliation continued - annotation may not be implemented
-    test_pass "pause-reconcile may not be implemented (reconciliation continued)"
+    # The annotation is intentionally unsupported. Maintenance suspension is
+    # configured through spec.maintenance.suspended instead.
+    test_skip "pause-reconcile annotation is unsupported; use spec.maintenance.suspended"
     return 0
 }
 
@@ -2628,21 +3166,30 @@ test_force_layout_apply_annotation() {
     kubectl annotate garagecluster garage -n "$NAMESPACE" \
         "garage.rajsingh.info/force-layout-apply=true" --overwrite
 
-    sleep 10
+    # Unlike one-shot operational annotations, force-layout-apply is a
+    # documented persistent bootstrap flag. Verify that exact contract.
+    local annotation=""
+    local annotation_deadline=$((SECONDS + 30))
+    while [ "$SECONDS" -lt "$annotation_deadline" ]; do
+        annotation=$(kubectl get garagecluster garage -n "$NAMESPACE" \
+            -o jsonpath='{.metadata.annotations.garage\.rajsingh\.info/force-layout-apply}' 2>/dev/null)
+        [ "$annotation" = "true" ] && break
+        sleep 2
+    done
 
-    # The annotation should be removed after processing
-    local annotation=$(kubectl get garagecluster garage -n "$NAMESPACE" -o jsonpath='{.metadata.annotations.garage\.rajsingh\.info/force-layout-apply}' 2>/dev/null)
+    if ! kubectl annotate garagecluster garage -n "$NAMESPACE" \
+        "garage.rajsingh.info/force-layout-apply-" >/dev/null 2>&1; then
+        test_fail "force-layout-apply annotation could not be cleaned up"
+        return 1
+    fi
 
-    if [ -z "$annotation" ]; then
-        test_pass "force-layout-apply annotation processed and removed"
+    if [ "$annotation" = "true" ]; then
+        test_pass "force-layout-apply persisted as the documented bootstrap flag"
         return 0
     fi
 
-    # Annotation still present - may not be implemented
-    test_pass "force-layout-apply annotation present (may not be fully implemented)"
-    # Clean up
-    kubectl annotate garagecluster garage -n "$NAMESPACE" "garage.rajsingh.info/force-layout-apply-" 2>/dev/null || true
-    return 0
+    test_fail "force-layout-apply did not persist with value true"
+    return 1
 }
 
 # ============================================================================
@@ -2673,33 +3220,40 @@ spec:
     port: 3901
 EOF
 
-    # Poll for the operator to set a phase (avoids the fixed-sleep flake).
+    # Poll for the operator to commit the exact custom tags at the current
+    # generation. Tags copied onto a Failed status are not success evidence.
     local phase=""
+    local observed_generation=""
+    local generation=""
+    local in_layout=""
+    local status_tags=""
     local end_time=$((SECONDS + 90))
     while [ $SECONDS -lt $end_time ]; do
-        phase=$(kubectl get garagenode tagged-node -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-        [ -n "$phase" ] && break
+        local snapshot
+        snapshot=$(kubectl get garagenode tagged-node -n "$NAMESPACE" -o json 2>/dev/null | \
+            jq -r '[.status.phase // "", (.status.observedGeneration // ""), .metadata.generation, (.status.inLayout // false), ((.status.tags // []) | sort | join(","))] | map(tostring) | join("|")' 2>/dev/null || true)
+        IFS='|' read -r phase observed_generation generation in_layout status_tags <<< "$snapshot"
+        if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
+            [ "$observed_generation" = "$generation" ] && [ "$in_layout" = "true" ] && \
+            [ "$status_tags" = "rack-a,ssd,tier-1" ]; then
+            break
+        fi
         sleep 3
     done
 
-    # Tags in status
-    local status_tags=$(kubectl get garagenode tagged-node -n "$NAMESPACE" -o jsonpath='{.status.tags}' 2>/dev/null)
+    if ! delete_test_garagenode tagged-node; then
+        test_fail "Tagged GarageNode fixture could not be cleaned up"
+        return 1
+    fi
 
-    if [ -n "$phase" ]; then
-        if ! delete_test_garagenode tagged-node; then
-            test_fail "Tagged GarageNode fixture could not be cleaned up"
-            return 1
-        fi
-        if [ -n "$status_tags" ]; then
-            test_pass "Node with tags processed and cleaned up (phase: $phase, tags: $status_tags)"
-        else
-            test_pass "Node with tags processed and cleaned up (phase: $phase, tags pending)"
-        fi
+    if [ "$phase" = "Ready" ] && [ -n "$generation" ] && \
+        [ "$observed_generation" = "$generation" ] && [ "$in_layout" = "true" ] && \
+        [ "$status_tags" = "rack-a,ssd,tier-1" ]; then
+        test_pass "Node committed all custom tags at its current generation and was cleaned up"
         return 0
     fi
 
-    test_fail "Node with tags failed (phase: $phase)"
-    delete_test_garagenode tagged-node || true
+    test_fail "Node did not commit the requested custom tags (phase: ${phase:-missing}, observedGeneration: ${observed_generation:-missing}/${generation:-missing}, inLayout: ${in_layout:-missing}, tags: ${status_tags:-missing})"
     return 1
 }
 
@@ -2714,7 +3268,8 @@ test_metrics_endpoint() {
     local pf_pid=$!
     sleep 3
 
-    local http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3903/metrics 2>/dev/null || echo "000")
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3903/metrics 2>/dev/null || echo "000")
     kill $pf_pid 2>/dev/null || true
 
     # 200 = success, 401/403 = auth required (also acceptable)
@@ -2737,8 +3292,10 @@ test_health_endpoint() {
     local pf_pid=$!
     sleep 3
 
-    local response=$(curl -s http://localhost:3903/health 2>/dev/null)
-    local http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3903/health 2>/dev/null || echo "000")
+    local response
+    response=$(curl -s http://localhost:3903/health 2>/dev/null)
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3903/health 2>/dev/null || echo "000")
     kill $pf_pid 2>/dev/null || true
 
     if [ "$http_code" = "200" ]; then
@@ -2778,24 +3335,23 @@ spec:
       key: admin-token
 EOF
 
-    sleep 10
-
-    # Verify no StatefulSet is created for Manual mode cluster
-    if kubectl get statefulset manual-cluster -n "$NAMESPACE" 2>/dev/null; then
-        test_fail "StatefulSet should NOT exist for Manual mode cluster"
-        kubectl delete garagecluster manual-cluster -n "$NAMESPACE" 2>/dev/null || true
-        return 1
-    fi
-
-    # Verify cluster is in Running phase (services and config created)
-    local phase=$(kubectl get garagecluster manual-cluster -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-
-    # Manual mode clusters may stay in Pending/Running until nodes are added
-    if [ "$phase" = "Running" ] || [ "$phase" = "Pending" ] || [ "$phase" = "" ]; then
-        test_pass "Manual mode cluster created without StatefulSet (phase: $phase)"
-        return 0
-    fi
-    test_fail "Manual mode cluster creation failed (phase: $phase)"
+    local phase=""
+    local manual_deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$manual_deadline" ]; do
+        if kubectl get statefulset manual-cluster -n "$NAMESPACE" >/dev/null 2>&1; then
+            test_fail "StatefulSet should NOT exist for Manual mode cluster"
+            kubectl delete garagecluster manual-cluster -n "$NAMESPACE" 2>/dev/null || true
+            return 1
+        fi
+        phase=$(kubectl get garagecluster manual-cluster -n "$NAMESPACE" \
+            -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+        if [ "$phase" = "Running" ] || [ "$phase" = "Pending" ]; then
+            test_pass "Manual mode cluster reached $phase without creating a StatefulSet"
+            return 0
+        fi
+        sleep 3
+    done
+    test_fail "Manual mode cluster did not reach Pending or Running without a StatefulSet (phase: $phase)"
     kubectl delete garagecluster manual-cluster -n "$NAMESPACE" 2>/dev/null || true
     return 1
 }
@@ -2906,8 +3462,10 @@ test_manual_mode_nodes_in_layout() {
     local end_time=$((SECONDS + timeout))
 
     while [ $SECONDS -lt $end_time ]; do
-        local node1_in_layout=$(kubectl get garagenode manual-node-1 -n "$NAMESPACE" -o jsonpath='{.status.inLayout}' 2>/dev/null || echo "false")
-        local node2_in_layout=$(kubectl get garagenode manual-node-2 -n "$NAMESPACE" -o jsonpath='{.status.inLayout}' 2>/dev/null || echo "false")
+        local node1_in_layout
+        node1_in_layout=$(kubectl get garagenode manual-node-1 -n "$NAMESPACE" -o jsonpath='{.status.inLayout}' 2>/dev/null || echo "false")
+        local node2_in_layout
+        node2_in_layout=$(kubectl get garagenode manual-node-2 -n "$NAMESPACE" -o jsonpath='{.status.inLayout}' 2>/dev/null || echo "false")
 
         if [ "$node1_in_layout" = "true" ] && [ "$node2_in_layout" = "true" ]; then
             test_pass "Both nodes registered in layout"
@@ -2916,8 +3474,10 @@ test_manual_mode_nodes_in_layout() {
         sleep 5
     done
 
-    local node1_status=$(kubectl get garagenode manual-node-1 -n "$NAMESPACE" -o jsonpath='{.status.inLayout}' 2>/dev/null)
-    local node2_status=$(kubectl get garagenode manual-node-2 -n "$NAMESPACE" -o jsonpath='{.status.inLayout}' 2>/dev/null)
+    local node1_status
+    node1_status=$(kubectl get garagenode manual-node-1 -n "$NAMESPACE" -o jsonpath='{.status.inLayout}' 2>/dev/null)
+    local node2_status
+    node2_status=$(kubectl get garagenode manual-node-2 -n "$NAMESPACE" -o jsonpath='{.status.inLayout}' 2>/dev/null)
     test_fail "Nodes not in layout (node1: $node1_status, node2: $node2_status)"
     return 1
 }
@@ -2930,18 +3490,21 @@ test_manual_mode_cluster_health() {
     local end_time=$((SECONDS + timeout))
 
     while [ $SECONDS -lt $end_time ]; do
-        local connected=$(kubectl get garagecluster manual-cluster -n "$NAMESPACE" -o jsonpath='{.status.health.connectedNodes}' 2>/dev/null || echo "0")
-
-        if [ "$connected" = "2" ]; then
-            test_pass "Manual mode cluster has 2 connected nodes"
+        local snapshot phase health connected storage_nodes partitions_quorum partitions_total
+        snapshot=$(kubectl get garagecluster manual-cluster -n "$NAMESPACE" \
+            -o 'jsonpath={.status.phase}{"|"}{.status.health.status}{"|"}{.status.health.connectedNodes}{"|"}{.status.health.storageNodes}{"|"}{.status.health.partitionsQuorum}{"|"}{.status.health.partitions}' 2>/dev/null || true)
+        IFS='|' read -r phase health connected storage_nodes partitions_quorum partitions_total <<< "$snapshot"
+        if [ "$phase" = "Running" ] && [ "$health" = "healthy" ] && \
+            [ "$connected" = "2" ] && [ "$storage_nodes" = "2" ] && \
+            [ -n "$partitions_total" ] && [ "$partitions_total" != "0" ] && \
+            [ "$partitions_quorum" = "$partitions_total" ]; then
+            test_pass "Manual mode cluster is fully healthy with two storage nodes"
             return 0
         fi
         sleep 5
     done
 
-    local connected=$(kubectl get garagecluster manual-cluster -n "$NAMESPACE" -o jsonpath='{.status.health.connectedNodes}' 2>/dev/null || echo "0")
-    local health=$(kubectl get garagecluster manual-cluster -n "$NAMESPACE" -o jsonpath='{.status.health.status}' 2>/dev/null || echo "unknown")
-    test_fail "Manual mode cluster health check failed (connected: $connected, health: $health)"
+    test_fail "Manual mode cluster health check failed (phase: ${phase:-missing}, health: ${health:-missing}, connected/storage: ${connected:-missing}/${storage_nodes:-missing}, partitions: ${partitions_quorum:-missing}/${partitions_total:-missing})"
     return 1
 }
 
@@ -3025,14 +3588,18 @@ test_full_cleanup() {
     sleep 10
 
     # Verify keys are gone
-    local key_count=$(kubectl get garagekey -n "$NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-    local bucket_count=$(kubectl get garagebucket -n "$NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    local key_count
+    key_count=$(kubectl get garagekey -n "$NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    local bucket_count
+    bucket_count=$(kubectl get garagebucket -n "$NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' ')
 
-    if [ "$key_count" = "0" ] && [ "$bucket_count" = "0" ]; then
-        test_pass "All buckets and keys cleaned up"
+    if [ "$key_count" = "0" ] && [ "$bucket_count" = "0" ] && \
+       wait_for_empty_garage_admin_list "/v2/ListKeys" "keys" 120 && \
+       wait_for_empty_garage_admin_list "/v2/ListBuckets" "buckets" 120; then
+        test_pass "All bucket and key CRs and exact Garage-side objects cleaned up"
         return 0
     fi
-    test_fail "Cleanup incomplete (keys: $key_count, buckets: $bucket_count)"
+    test_fail "Cleanup incomplete (key CRs: $key_count, bucket CRs: $bucket_count, or Garage-side objects remain)"
     return 1
 }
 
@@ -3114,15 +3681,28 @@ main() {
     # Docker Hub occasionally times out with "context deadline exceeded", which
     # flaked main and dependency PRs).
     log_info "=== Step 1: Creating kind cluster ==="
-    kind delete cluster --name "$CLUSTER_NAME" 2>/dev/null || true
+    if kind get clusters 2>/dev/null | grep -Fqx -- "$CLUSTER_NAME"; then
+        log_error "Refusing to delete pre-existing kind cluster '$CLUSTER_NAME'"
+        exit 1
+    fi
     local kind_ok=false
     for attempt in 1 2 3; do
         if kind create cluster --name "$CLUSTER_NAME" --wait 90s; then
+            CLUSTER_CREATED=true
+            CLUSTER_UID=$(kubectl --context "kind-$CLUSTER_NAME" get namespace kube-system \
+                -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+            if [ -z "$CLUSTER_UID" ]; then
+                log_error "Could not record exact ownership of '$CLUSTER_NAME'"
+                exit 1
+            fi
             kind_ok=true
             break
         fi
-        log_info "kind create cluster failed (attempt ${attempt}/3); cleaning up and retrying..."
-        kind delete cluster --name "$CLUSTER_NAME" 2>/dev/null || true
+        if kind get clusters 2>/dev/null | grep -Fqx -- "$CLUSTER_NAME"; then
+            log_error "kind create failed and left an unproven cluster named '$CLUSTER_NAME'; refusing deletion"
+            break
+        fi
+        log_info "kind create cluster failed before creating '$CLUSTER_NAME' (attempt ${attempt}/3); retrying..."
         sleep 10
     done
     if [ "$kind_ok" = false ]; then
@@ -3134,10 +3714,12 @@ main() {
     if [ "$SKIP_BUILD" = false ]; then
         log_info "=== Step 2: Building operator image ==="
         docker build -t garage-operator:e2e .
-        kind load docker-image garage-operator:e2e --name "$CLUSTER_NAME"
     else
         log_info "=== Step 2: Skipping build (--skip-build) ==="
     fi
+    # --skip-build reuses an image already present in the host image store; a
+    # fresh Kind node still needs it imported before Helm starts the manager.
+    kind load docker-image garage-operator:e2e --name "$CLUSTER_NAME"
 
     # Step 2.5: Install cert-manager (required by the chart's webhook stack)
     log_info "=== Step 2.5: Installing cert-manager ==="

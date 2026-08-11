@@ -7,7 +7,22 @@ on:
     paths:
       - 'charts/**'
       - 'config/crd/bases/**'
+      - 'config/default/**'
+      - 'config/manager/**'
+      - 'config/rbac/**'
+      - 'config/samples/**'
+      - 'config/webhook/**'
       - 'api/**'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - 'hack/pin-manifest-images.sh'
+      - 'hack/pin-manifest-images.go'
+      - 'hack/pin-manifest-images_test.go'
+      - 'hack/preserve-crd-compat-versions.py'
+      - 'Makefile'
       - '.github/workflows/helm.yml'
     tags:
       - 'v*'
@@ -15,12 +30,31 @@ on:
     paths:
       - 'charts/**'
       - 'config/crd/bases/**'
+      - 'config/default/**'
+      - 'config/manager/**'
+      - 'config/rbac/**'
+      - 'config/samples/**'
+      - 'config/webhook/**'
       - 'api/**'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - 'hack/pin-manifest-images.sh'
+      - 'hack/pin-manifest-images.go'
+      - 'hack/pin-manifest-images_test.go'
+      - 'hack/preserve-crd-compat-versions.py'
+      - 'Makefile'
       - '.github/workflows/helm.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
 
 env:
   REGISTRY: ghcr.io
@@ -33,7 +67,7 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
@@ -59,32 +93,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Check CRDs are in sync
-        run: |
-          echo "Checking if Helm chart CRDs match kustomize CRDs..."
-          MISMATCH=0
-          for crd in config/crd/bases/*.yaml; do
-            filename=$(basename "$crd")
-            helm_crd="charts/${{ env.CHART_NAME }}/crd-bases/$filename"
-            if [ ! -f "$helm_crd" ]; then
-              echo "ERROR: $filename missing from Helm chart crd-bases/"
-              MISMATCH=1
-            elif ! diff -q "$crd" "$helm_crd" > /dev/null 2>&1; then
-              echo "ERROR: $filename differs between config/crd/bases/ and charts/garage-operator/crd-bases/"
-              diff "$crd" "$helm_crd" || true
-              MISMATCH=1
-            else
-              echo "OK: $filename is in sync"
-            fi
-          done
-          if [ $MISMATCH -eq 1 ]; then
-            echo ""
-            echo "CRDs are out of sync! Run 'make helm-sync-crds' to fix."
-            exit 1
-          fi
-          echo "All CRDs are in sync."
+        run: make helm-verify-crd-bases
 
   lint:
     name: Lint Chart
@@ -92,12 +104,12 @@ jobs:
     needs: verify-crds
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
       - name: Set up Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v4.2.3
 
@@ -106,6 +118,147 @@ jobs:
 
       - name: Template chart
         run: helm template ${{ env.CHART_NAME }} charts/${{ env.CHART_NAME }} --namespace garage-operator-system
+
+      - name: Verify scoped networking and webhook rendering
+        shell: bash
+        run: |
+          set -euo pipefail
+          rendered="$(helm template scoped charts/${{ env.CHART_NAME }} \
+            --namespace operators \
+            --set 'watchNamespaces={app}' \
+            --set cosi.enabled=true \
+            --set cosi.namespace=shadows \
+            --set networkPolicy.enabled=true \
+            --set 'metrics.bindAddress=[::]:9444')"
+          grep -q -- '--watch-namespaces=operators,app,shadows' <<<"$rendered"
+          grep -q -- 'containerPort: 9444' <<<"$rendered"
+          grep -q -- 'port: 9444' <<<"$rendered"
+          grep -q -- 'port: 9443' <<<"$rendered"
+          grep -q -- '--cosi-namespace=shadows' <<<"$rendered"
+          webhook_render="$(sed -n '/kind: MutatingWebhookConfiguration/,$p' <<<"$rendered")"
+          test "$(grep -c '^  namespaceSelector:' <<<"$webhook_render")" -eq 14
+          test "$(grep -c '    - "shadows"' <<<"$webhook_render")" -eq 14
+
+          cosi_rbac="$(helm template scoped charts/${{ env.CHART_NAME }} \
+            --namespace operators \
+            --set 'watchNamespaces={app}' \
+            --set cosi.enabled=true \
+            --set cosi.namespace=shadows \
+            --show-only templates/cosi-rbac.yaml)"
+          scoped_cluster_role="$(awk '
+            /^kind: ClusterRole$/ { emit=1 }
+            emit { print }
+            emit && /^---$/ { exit }
+          ' <<<"$cosi_rbac")"
+          if grep -q '^  - secrets$' <<<"$scoped_cluster_role"; then
+            echo "scoped COSI ClusterRole leaked cluster-wide Secret permissions" >&2
+            exit 1
+          fi
+          if grep -Eq '^  - (bucketclaims|bucketaccesses)$' <<<"$scoped_cluster_role"; then
+            echo "scoped COSI ClusterRole leaked namespaced COSI permissions" >&2
+            exit 1
+          fi
+          test "$(grep -c '^kind: Role$' <<<"$cosi_rbac")" -eq 3
+          test "$(grep -c '^  - secrets$' <<<"$cosi_rbac")" -eq 0
+          test "$(grep -c '^  - bucketclaims$' <<<"$cosi_rbac")" -eq 3
+          test "$(grep -c '^  - bucketaccesses$' <<<"$cosi_rbac")" -eq 3
+          scoped_cosi_namespaces="$(awk '
+            /^kind:/ { kind=$2 }
+            kind == "Role" && /^  namespace:/ { print $2; kind="" }
+          ' <<<"$cosi_rbac" | sort)"
+          test "$scoped_cosi_namespaces" = "$(printf '%s\n' app operators shadows)"
+
+          scoped_namespace_rbac="$(helm template scoped charts/${{ env.CHART_NAME }} \
+            --namespace operators \
+            --set 'watchNamespaces={app}' \
+            --set cosi.enabled=true \
+            --set cosi.namespace=shadows \
+            --show-only templates/namespace-rbac.yaml)"
+          test "$(grep -c '^kind: Role$' <<<"$scoped_namespace_rbac")" -eq 3
+          test "$(grep -c '^  - secrets$' <<<"$scoped_namespace_rbac")" -eq 3
+          scoped_manager_namespaces="$(awk '
+            /^kind:/ { kind=$2 }
+            kind == "Role" && /^  namespace:/ { print $2; kind="" }
+          ' <<<"$scoped_namespace_rbac" | sort)"
+          test "$scoped_manager_namespaces" = "$(printf '%s\n' app operators shadows)"
+
+          scoped_metrics_rbac="$(helm template scoped charts/${{ env.CHART_NAME }} \
+            --namespace operators \
+            --set 'watchNamespaces={app}' \
+            --show-only templates/metrics-rbac.yaml)"
+          test "$(grep -c '^kind: ClusterRole$' <<<"$scoped_metrics_rbac")" -eq 2
+          test "$(grep -c '^kind: ClusterRoleBinding$' <<<"$scoped_metrics_rbac")" -eq 1
+          test "$(grep -c '^  - tokenreviews$' <<<"$scoped_metrics_rbac")" -eq 1
+          test "$(grep -c '^  - subjectaccessreviews$' <<<"$scoped_metrics_rbac")" -eq 1
+          grep -q '^  namespace: operators$' <<<"$scoped_metrics_rbac"
+
+          metrics_disabled="$(helm template scoped charts/${{ env.CHART_NAME }} \
+            --namespace operators \
+            --set 'watchNamespaces={app}' \
+            --set metrics.enabled=false)"
+          if grep -Eq 'tokenreviews|subjectaccessreviews|metrics-auth-role' \
+            <<<"$metrics_disabled"; then
+            echo "metrics.enabled=false still rendered metrics authentication RBAC" >&2
+            exit 1
+          fi
+
+          unscoped_cosi_rbac="$(helm template unscoped charts/${{ env.CHART_NAME }} \
+            --namespace operators \
+            --set cosi.enabled=true \
+            --show-only templates/cosi-rbac.yaml)"
+          test "$(grep -c '^kind: Role$' <<<"$unscoped_cosi_rbac")" -eq 0
+          test "$(grep -c '^  - secrets$' <<<"$unscoped_cosi_rbac")" -eq 0
+          unscoped_manager_rbac="$(helm template unscoped charts/${{ env.CHART_NAME }} \
+            --namespace operators \
+            --set cosi.enabled=true \
+            --show-only templates/clusterrole.yaml)"
+          test "$(grep -c '^  - secrets$' <<<"$unscoped_manager_rbac")" -eq 1
+          external_rbac="$(helm template external-rbac charts/${{ env.CHART_NAME }} \
+            --namespace operators \
+            --set cosi.enabled=true \
+            --set rbac.create=false)"
+          if grep -Eq '^kind: (ClusterRole|ClusterRoleBinding|Role|RoleBinding)$' \
+            <<<"$external_rbac"; then
+            echo "rbac.create=false still rendered RBAC" >&2
+            exit 1
+          fi
+
+          if helm template invalid charts/${{ env.CHART_NAME }} \
+            --set metrics.bindAddress=127.0.0.1:8443 >/dev/null 2>&1; then
+            echo "chart accepted an unreachable metrics bind address" >&2
+            exit 1
+          fi
+
+          digest="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          digest_render="$(helm template digest charts/${{ env.CHART_NAME }} \
+            --set-string "image.digest=${digest}")"
+          grep -q -- "image: ghcr.io/rajsinghtech/garage-operator@${digest}" \
+            <<<"$digest_render"
+          if helm template invalid charts/${{ env.CHART_NAME }} \
+            --set-string image.digest=invalid >/dev/null 2>&1; then
+            echo "chart accepted an invalid image digest" >&2
+            exit 1
+          fi
+
+      - name: Verify reproducible chart packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          epoch="$(git show -s --format=%ct HEAD)"
+          first="$(mktemp -d)"
+          second="$(mktemp -d)"
+          trap 'rm -rf -- "$first" "$second"' EXIT
+
+          make helm-package SOURCE_DATE_EPOCH="$epoch" HELM_PACKAGE_DIR="$first"
+          find charts/${{ env.CHART_NAME }} -exec touch {} +
+          make helm-package SOURCE_DATE_EPOCH="$epoch" HELM_PACKAGE_DIR="$second"
+
+          first_digest="$(sha256sum "$first"/*.tgz | awk '{print $1}')"
+          second_digest="$(sha256sum "$second"/*.tgz | awk '{print $1}')"
+          test "$first_digest" = "$second_digest" || {
+            echo "chart package is not reproducible: $first_digest != $second_digest" >&2
+            exit 1
+          }
 
       - name: Verify leader-election safety guard
         shell: bash
@@ -149,10 +302,213 @@ jobs:
             exit 1
           fi
 
+  kubernetes-1-25:
+    name: Kubernetes 1.25 Smoke
+    runs-on: ubuntu-latest
+    needs: verify-crds
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install kind
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
+        with:
+          install_only: true
+          version: v0.31.0
+
+      - name: Install Kubernetes 1.25 kubectl
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5
+        with:
+          version: v1.25.16
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v4.2.3
+
+      - name: Create Kubernetes 1.25 cluster
+        run: |
+          kind create cluster \
+            --name garage-kubernetes-1-25 \
+            --image kindest/node:v1.25.16@sha256:6110314339b3b44d10da7d27881849a87e092124afab5956f2e10ecdb463b025 \
+            --wait 120s
+
+      - name: Install Kubernetes 1.25-compatible cert-manager
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            https://github.com/cert-manager/cert-manager/releases/download/v1.13.6/cert-manager.yaml \
+            --output /tmp/cert-manager.yaml
+          echo 'a24f591f10635295d45f16897f4ffa58acd92085c7cee99cba4ed1b614bba300  /tmp/cert-manager.yaml' | sha256sum --check
+          hack/pin-manifest-images.sh \
+            'quay.io/jetstack/cert-manager-controller:v1.13.6=quay.io/jetstack/cert-manager-controller:v1.13.6@sha256:689d029f027b8af34d37033a7bd1fb07f8a84048416a8f9540445c8dc43f19ad' \
+            'quay.io/jetstack/cert-manager-cainjector:v1.13.6=quay.io/jetstack/cert-manager-cainjector:v1.13.6@sha256:e77e12293f16da24744394c5525d570801c29c42cdae6cbd3f1089b63f42c04f' \
+            'quay.io/jetstack/cert-manager-webhook:v1.13.6=quay.io/jetstack/cert-manager-webhook:v1.13.6@sha256:682fb3d893e04171f7c9651208ca59cfb2fbd555f0ea45988911f5acc68648c8' \
+            'quay.io/jetstack/cert-manager-acmesolver:v1.13.6=quay.io/jetstack/cert-manager-acmesolver:v1.13.6@sha256:4751475924a5f43b218b8bf774d97c5c8787436b5e53f314f61775aefc6bcf50' \
+            < /tmp/cert-manager.yaml > /tmp/cert-manager-pinned.yaml
+          kubectl apply --filename /tmp/cert-manager-pinned.yaml
+          kubectl wait --for=condition=Available deployment --all \
+            --namespace cert-manager --timeout=300s
+
+      - name: Build and load current checkout image
+        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v')
+        env:
+          LOCAL_IMAGE: garage-operator-smoke:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg TARGETARCH=amd64 \
+            --build-arg VERSION=smoke \
+            --build-arg COMMIT="${GITHUB_SHA}" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --tag "$LOCAL_IMAGE" \
+            .
+          kind load docker-image "$LOCAL_IMAGE" --name garage-kubernetes-1-25
+
+      - name: Require release image publication
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          run_id=""
+          for _ in $(seq 1 60); do
+            run_id="$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/docker.yml/runs" \
+              -f event=push \
+              -f head_sha="${GITHUB_SHA}" \
+              -f per_page=20 \
+              | jq -r --arg ref "${GITHUB_REF_NAME}" \
+                '.workflow_runs[] | select(.head_branch == $ref) | .id' \
+              | sed -n '1p')"
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::no Docker release run found for ${GITHUB_REF_NAME} at ${GITHUB_SHA}"
+            exit 1
+          fi
+          gh run watch "$run_id" --exit-status --repo "$GITHUB_REPOSITORY"
+
+      - name: Install default chart and exercise webhooks
+        run: |
+          set -euo pipefail
+          image_values=()
+          is_release=false
+          if [ "$GITHUB_EVENT_NAME" = push ] && [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            is_release=true
+          else
+            image_values=(
+              --set-string image.repository=garage-operator-smoke
+              --set-string "image.tag=${GITHUB_SHA}"
+              --set image.pullPolicy=Never
+            )
+          fi
+          helm install garage-operator charts/${{ env.CHART_NAME }} \
+            --namespace garage-operator-system \
+            --create-namespace \
+            --set 'watchNamespaces={garage-operator-system}' \
+            "${image_values[@]}"
+          kubectl wait --for=condition=Established crd --all --timeout=120s
+          kubectl wait --for=condition=Ready certificate --all \
+            --namespace garage-operator-system --timeout=120s
+          kubectl rollout status deployment/garage-operator \
+            --namespace garage-operator-system --timeout=180s
+          if [ "$is_release" = false ]; then
+            expected_image="garage-operator-smoke:${GITHUB_SHA}"
+            test "$(kubectl get deployment garage-operator \
+              --namespace garage-operator-system \
+              -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].image}')" = \
+              "$expected_image"
+            test "$(kubectl get pods \
+              --namespace garage-operator-system \
+              -l app.kubernetes.io/name=garage-operator \
+              -o jsonpath='{.items[0].spec.containers[?(@.name=="manager")].image}')" = \
+              "$expected_image"
+            kubectl logs deployment/garage-operator \
+              --namespace garage-operator-system | grep -F -- "$GITHUB_SHA"
+          fi
+
+          kubectl create serviceaccount metrics-smoke \
+            --namespace garage-operator-system
+          kubectl create clusterrolebinding garage-operator-metrics-smoke \
+            --clusterrole=garage-operator-metrics-reader \
+            --serviceaccount=garage-operator-system:metrics-smoke
+          metrics_token="$(kubectl create token metrics-smoke \
+            --namespace garage-operator-system \
+            --duration=10m)"
+          kubectl port-forward service/garage-operator-metrics 18443:8443 \
+            --namespace garage-operator-system \
+            >/tmp/garage-operator-metrics-port-forward.log 2>&1 &
+          metrics_port_forward_pid=$!
+          cleanup_metrics_smoke() {
+            kill "$metrics_port_forward_pid" 2>/dev/null || true
+            wait "$metrics_port_forward_pid" 2>/dev/null || true
+            kubectl delete clusterrolebinding garage-operator-metrics-smoke \
+              --ignore-not-found --wait=false >/dev/null 2>&1 || true
+            kubectl delete serviceaccount metrics-smoke \
+              --namespace garage-operator-system \
+              --ignore-not-found --wait=false >/dev/null 2>&1 || true
+          }
+          trap cleanup_metrics_smoke EXIT
+          metrics_status=""
+          for _ in $(seq 1 30); do
+            if ! kill -0 "$metrics_port_forward_pid" 2>/dev/null; then
+              cat /tmp/garage-operator-metrics-port-forward.log >&2
+              exit 1
+            fi
+            metrics_status="$(curl --silent --show-error --insecure \
+              --output /tmp/garage-operator-metrics-response \
+              --write-out '%{http_code}' \
+              --header "Authorization: Bearer ${metrics_token}" \
+              https://127.0.0.1:18443/metrics || true)"
+            if [ "$metrics_status" = 200 ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$metrics_status" != 200 ]; then
+            cat /tmp/garage-operator-metrics-port-forward.log >&2
+            cat /tmp/garage-operator-metrics-response >&2 || true
+            exit 1
+          fi
+          cleanup_metrics_smoke
+          trap - EXIT
+
+          admission_ca=""
+          conversion_ca=""
+          for _ in $(seq 1 60); do
+            admission_ca="$(kubectl get validatingwebhookconfiguration garage-operator-validating \
+              -o jsonpath='{.webhooks[0].clientConfig.caBundle}')"
+            conversion_ca="$(kubectl get crd garageclusters.garage.rajsingh.info \
+              -o jsonpath='{.spec.conversion.webhook.clientConfig.caBundle}')"
+            if [ -n "$admission_ca" ] && [ -n "$conversion_ca" ]; then
+              break
+            fi
+            sleep 2
+          done
+          test -n "$admission_ca"
+          test -n "$conversion_ca"
+          kubectl apply --dry-run=server -f config/samples/garage_v1beta2_garagecluster.yaml
+          kubectl apply --dry-run=server -f config/samples/garage_v1beta1_garagecluster.yaml
+
+      - name: Delete Kubernetes 1.25 cluster
+        if: always()
+        run: kind delete cluster --name garage-kubernetes-1-25
+
   publish:
     name: Publish Chart
     runs-on: ubuntu-latest
-    needs: lint
+    needs: [lint, verify-version, kubernetes-1-25]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
@@ -163,22 +519,22 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
       - name: Set up Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v4.2.3
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4.1.2
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       # Helm and cosign use separate credential stores. Authenticate both so
       # the chart push and its signature/referrer uploads share the same scope.
       - name: Log in to GHCR for cosign
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -191,18 +547,18 @@ jobs:
         id: chart_version
         run: |
           VERSION=$(grep '^version:' charts/${{ env.CHART_NAME }}/Chart.yaml | awk '{print $2}')
-          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Chart version: ${VERSION}"
 
       - name: Sync CRDs to Helm chart
         run: |
+          rm -f charts/${{ env.CHART_NAME }}/crd-bases/*.yaml
           cp config/crd/bases/*.yaml charts/${{ env.CHART_NAME }}/crd-bases/
           echo "CRDs synced to Helm chart"
 
       - name: Package chart
         run: |
-          mkdir -p dist
-          helm package charts/${{ env.CHART_NAME }} -d dist/
+          make helm-package SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
 
       - name: Push chart to GHCR
         id: push
@@ -226,7 +582,7 @@ jobs:
         run: cosign sign --yes "${CHART_DIGEST}"
 
       - name: Attest chart provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/${{ env.CHART_NAME }}
           subject-digest: ${{ steps.push.outputs.DIGEST }}
@@ -234,14 +590,16 @@ jobs:
 
       - name: Summary
         run: |
-          echo "### Helm Chart Published" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Chart:** ${{ env.CHART_NAME }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** ${{ steps.chart_version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Registry:** oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/${{ env.CHART_NAME }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Digest:** ${{ steps.push.outputs.DIGEST }} (signed, provenance attested)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Install command:**" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-          echo "helm install garage-operator oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/${{ env.CHART_NAME }} --version ${{ steps.chart_version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### Helm Chart Published"
+            echo
+            echo "**Chart:** ${{ env.CHART_NAME }}"
+            echo "**Version:** ${{ steps.chart_version.outputs.VERSION }}"
+            echo "**Registry:** oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/${{ env.CHART_NAME }}"
+            echo "**Digest:** ${{ steps.push.outputs.DIGEST }} (signed, provenance attested)"
+            echo
+            echo "**Install command:**"
+            echo '```bash'
+            echo "helm install garage-operator oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/${{ env.CHART_NAME }} --version ${{ steps.chart_version.outputs.VERSION }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

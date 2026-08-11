@@ -11,6 +11,8 @@ image:
   pullPolicy: IfNotPresent
   # -- Overrides the image tag (default is the chart appVersion)
   tag: "v0.7.3"
+  # -- Immutable image digest. When set, takes precedence over tag and renders repository@digest.
+  digest: ""
 
 # -- Default Garage container image for clusters that don't specify one.
 # When set, all GarageCluster/GarageNode CRs that omit spec.image will use this image.
@@ -188,9 +190,11 @@ webhooks:
   # -- Enable admission and conversion webhooks. Required when multiple API versions
   # are in use, for nodeLocalPools, and for admission-protected storage deletion.
   # Disabling this is supported only for local development or simple v1beta2-only
-  # installs that do not rely on those safety boundaries. cert-manager must be installed.
+  # installs that do not rely on those safety boundaries, controller-managed
+  # persistent claims, or PVC-backed rollout/recovery. cert-manager must be installed.
   enabled: true
-  # -- Failure policy for webhooks (Fail or Ignore)
+  # -- Failure policy for ordinary webhooks (Fail or Ignore). The managed-PVC
+  # identity-protection webhook is always Fail.
   failurePolicy: Fail
   # Certificate configuration for webhooks
   certManager:
@@ -264,7 +268,10 @@ cosi:
   enabled: false
   # -- COSI driver name (must match BucketClass/BucketAccessClass driverName)
   driverName: garage.rajsingh.info
-  # -- Namespace for shadow resources (defaults to release namespace)
+  # -- Namespace for shadow resources (defaults to release namespace).
+  # If this differs from a target GarageCluster namespace, create a
+  # GarageReferenceGrant in that target namespace allowing GarageBucket and
+  # GarageKey references from this namespace.
   namespace: ""
 
 # -- Extra Kubernetes objects to deploy with the chart (supports templating)

@@ -18,10 +18,14 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -30,12 +34,44 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 )
+
+type namespaceRecordingReader struct {
+	client.Reader
+	rejectClusterWide bool
+	rejectNamespaced  bool
+	namespaces        []string
+}
+
+func (r *namespaceRecordingReader) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	listOptions := &client.ListOptions{}
+	for _, option := range options {
+		option.ApplyToList(listOptions)
+	}
+	r.namespaces = append(r.namespaces, listOptions.Namespace)
+	if r.rejectClusterWide && listOptions.Namespace == "" {
+		return stderrors.New("namespace-scoped APIReader received an unauthorized all-namespace List")
+	}
+	if r.rejectNamespaced && listOptions.Namespace != "" {
+		return stderrors.New("cluster-scoped APIReader unexpectedly received a namespaced List")
+	}
+	return r.Reader.List(ctx, list, options...)
+}
+
+type listRejectingClient struct {
+	client.Client
+}
+
+func (listRejectingClient) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return stderrors.New("cluster-scoped dependent sweep did not use its authoritative APIReader")
+}
 
 func managementHandleScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -70,6 +106,474 @@ func newHandle(endpoint string) (*garagev1beta2.GarageCluster, *corev1.Secret) {
 		},
 	}
 	return handle, secret
+}
+
+func TestManagementHandleFinalizerDeletesReferencingBucketsAndKeys(t *testing.T) {
+	handle, _ := newHandle("http://garage.example:3903")
+	matchingKey := &garagev1beta1.GarageKey{
+		ObjectMeta: metav1.ObjectMeta{Name: "matching-key", Namespace: mhNS},
+		Spec:       garagev1beta1.GarageKeySpec{ClusterRef: garagev1beta1.ClusterReference{Name: mhName}},
+	}
+	matchingBucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "matching-bucket", Namespace: "tenant"},
+		Spec: garagev1beta1.GarageBucketSpec{ClusterRef: garagev1beta1.ClusterReference{
+			Name: mhName, Namespace: mhNS,
+		}},
+	}
+	unrelated := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: "tenant"},
+		Spec:       garagev1beta1.GarageBucketSpec{ClusterRef: garagev1beta1.ClusterReference{Name: "other", Namespace: mhNS}},
+	}
+	fc := fake.NewClientBuilder().WithScheme(managementHandleScheme(t)).WithObjects(handle, matchingKey, matchingBucket, unrelated).Build()
+	reader := &namespaceRecordingReader{Reader: fc, rejectClusterWide: true}
+	r := &GarageClusterReconciler{
+		Client: listRejectingClient{Client: fc}, APIReader: reader, Scheme: fc.Scheme(), ClusterScoped: false,
+		WatchNamespaces: []string{mhNS, "tenant"},
+	}
+
+	pending, err := r.deleteGarageResourceDependents(context.Background(), handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pending {
+		t.Fatal("dependents were not reported pending before deletion")
+	}
+	if want := []string{mhNS, "tenant", mhNS, "tenant", mhNS, "tenant"}; !slices.Equal(reader.namespaces, want) {
+		t.Fatalf("namespace-scoped APIReader List scopes = %v, want %v", reader.namespaces, want)
+	}
+	keyRef := types.NamespacedName{Name: matchingKey.Name, Namespace: matchingKey.Namespace}
+	bucketRef := types.NamespacedName{Name: matchingBucket.Name, Namespace: matchingBucket.Namespace}
+	protectedKey := &garagev1beta1.GarageKey{}
+	if err := fc.Get(context.Background(), keyRef, protectedKey); err != nil {
+		t.Fatalf("dependent key disappeared before its finalizer was attached: %v", err)
+	}
+	if len(protectedKey.Finalizers) != 1 || protectedKey.Finalizers[0] != garageKeyFinalizer || !protectedKey.DeletionTimestamp.IsZero() {
+		t.Fatalf("first sweep key finalization state = finalizers %v, deletionTimestamp %v", protectedKey.Finalizers, protectedKey.DeletionTimestamp)
+	}
+	protectedBucket := &garagev1beta1.GarageBucket{}
+	if err := fc.Get(context.Background(), bucketRef, protectedBucket); err != nil {
+		t.Fatalf("dependent bucket disappeared before its finalizer was attached: %v", err)
+	}
+	if len(protectedBucket.Finalizers) != 1 || protectedBucket.Finalizers[0] != garageBucketFinalizer || !protectedBucket.DeletionTimestamp.IsZero() {
+		t.Fatalf("first sweep bucket finalization state = finalizers %v, deletionTimestamp %v", protectedBucket.Finalizers, protectedBucket.DeletionTimestamp)
+	}
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: unrelated.Name, Namespace: unrelated.Namespace}, &garagev1beta1.GarageBucket{}); err != nil {
+		t.Fatalf("unrelated bucket was deleted: %v", err)
+	}
+
+	pending, err = r.deleteGarageResourceDependents(context.Background(), handle)
+	if err != nil || !pending {
+		t.Fatalf("second dependent sweep pending=%v err=%v, want deletion in progress", pending, err)
+	}
+	deletingKey := &garagev1beta1.GarageKey{}
+	if err := fc.Get(context.Background(), keyRef, deletingKey); err != nil || deletingKey.DeletionTimestamp.IsZero() {
+		t.Fatalf("second sweep did not start protected key deletion: timestamp=%v err=%v", deletingKey.DeletionTimestamp, err)
+	}
+	deletingBucket := &garagev1beta1.GarageBucket{}
+	if err := fc.Get(context.Background(), bucketRef, deletingBucket); err != nil || deletingBucket.DeletionTimestamp.IsZero() {
+		t.Fatalf("second sweep did not start protected bucket deletion: timestamp=%v err=%v", deletingBucket.DeletionTimestamp, err)
+	}
+
+	// Stand in for the child controllers completing their external Garage cleanup.
+	deletingKey.Finalizers = nil
+	if err := fc.Update(context.Background(), deletingKey); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("release key finalizer: %v", err)
+	}
+	deletingBucket.Finalizers = nil
+	if err := fc.Update(context.Background(), deletingBucket); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("release bucket finalizer: %v", err)
+	}
+	pending, err = r.deleteGarageResourceDependents(context.Background(), handle)
+	if err != nil || pending {
+		t.Fatalf("terminal dependent sweep pending=%v err=%v, want complete", pending, err)
+	}
+}
+
+func TestManagementHandleFinalizationConvergesAfterReferenceGrantRevocation(t *testing.T) {
+	ctx := t.Context()
+	handle, secret := newHandle("http://garage.example:3903")
+	key := &garagev1beta1.GarageKey{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cross-key", Namespace: "tenant", Finalizers: []string{garageKeyFinalizer},
+		},
+		Spec: garagev1beta1.GarageKeySpec{
+			Name:       "cross-key",
+			ClusterRef: garagev1beta1.ClusterReference{Name: handle.Name, Namespace: handle.Namespace},
+			AllBuckets: &garagev1beta1.AllBucketsPermission{Read: true},
+		},
+	}
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cross-bucket", Namespace: "tenant", Finalizers: []string{garageBucketFinalizer},
+		},
+		Spec: garagev1beta1.GarageBucketSpec{
+			ClusterRef:  garagev1beta1.ClusterReference{Name: handle.Name, Namespace: handle.Namespace},
+			GlobalAlias: "cross-bucket",
+		},
+	}
+	grant := &garagev1beta1.GarageReferenceGrant{
+		ObjectMeta: metav1.ObjectMeta{Name: "allow-dependents", Namespace: handle.Namespace},
+		Spec: garagev1beta1.GarageReferenceGrantSpec{
+			From: []garagev1beta1.ReferenceGrantFrom{
+				{Kind: "GarageKey", Namespace: key.Namespace},
+				{Kind: "GarageBucket", Namespace: bucket.Namespace},
+			},
+			To: []garagev1beta1.ReferenceGrantTo{{Kind: "GarageCluster", Name: handle.Name}},
+		},
+	}
+	scheme := managementHandleScheme(t)
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(handle, secret, key, bucket, grant).Build()
+	keyValidator := &garagev1beta1.GarageKeyValidator{Client: base}
+	bucketValidator := &garagev1beta1.GarageBucketValidator{Client: base}
+	if _, err := keyValidator.ValidateCreate(ctx, key); err != nil {
+		t.Fatalf("initial key grant: %v", err)
+	}
+	if _, err := bucketValidator.ValidateCreate(ctx, bucket); err != nil {
+		t.Fatalf("initial bucket grant: %v", err)
+	}
+	if err := base.Delete(ctx, grant); err != nil {
+		t.Fatalf("revoke GarageReferenceGrant: %v", err)
+	}
+
+	r := &GarageClusterReconciler{Client: base, APIReader: base, Scheme: scheme, ClusterScoped: true}
+	if err := r.finalize(ctx, handle); err == nil || !strings.Contains(err.Error(), "GarageBucket and GarageKey dependents") {
+		t.Fatalf("first parent finalization error = %v, want dependent barrier", err)
+	}
+
+	deletingKey := &garagev1beta1.GarageKey{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(key), deletingKey); err != nil {
+		t.Fatalf("get deleting key: %v", err)
+	}
+	keyCleanup := deletingKey.DeepCopy()
+	keyCleanup.Finalizers = nil
+	if _, err := keyValidator.ValidateUpdate(ctx, deletingKey, keyCleanup); err != nil {
+		t.Fatalf("revoked grant stranded key finalizer removal: %v", err)
+	}
+	if err := base.Update(ctx, keyCleanup); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("release key finalizer: %v", err)
+	}
+
+	deletingBucket := &garagev1beta1.GarageBucket{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(bucket), deletingBucket); err != nil {
+		t.Fatalf("get deleting bucket: %v", err)
+	}
+	bucketCleanup := deletingBucket.DeepCopy()
+	bucketCleanup.Finalizers = nil
+	if _, err := bucketValidator.ValidateUpdate(ctx, deletingBucket, bucketCleanup); err != nil {
+		t.Fatalf("revoked grant stranded bucket finalizer removal: %v", err)
+	}
+	if err := base.Update(ctx, bucketCleanup); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("release bucket finalizer: %v", err)
+	}
+
+	if err := r.finalize(ctx, handle); err != nil {
+		t.Fatalf("parent finalization did not converge after grant revocation: %v", err)
+	}
+}
+
+func TestManagementHandleFinalizerUsesAPIReaderForClusterScopedCrossNamespaceDependents(t *testing.T) {
+	handle, _ := newHandle("http://garage.example:3903")
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "cross-namespace", Namespace: "tenant"},
+		Spec: garagev1beta1.GarageBucketSpec{ClusterRef: garagev1beta1.ClusterReference{
+			Name: handle.Name, Namespace: handle.Namespace,
+		}},
+	}
+	base := fake.NewClientBuilder().WithScheme(managementHandleScheme(t)).WithObjects(handle, bucket).Build()
+	reader := &namespaceRecordingReader{Reader: base, rejectNamespaced: true}
+	r := &GarageClusterReconciler{
+		Client: listRejectingClient{Client: base}, APIReader: reader, Scheme: base.Scheme(), ClusterScoped: true,
+	}
+
+	pending, err := r.deleteGarageResourceDependents(t.Context(), handle)
+	if err != nil || !pending {
+		t.Fatalf("cluster-scoped dependent sweep pending=%v err=%v", pending, err)
+	}
+	if want := []string{"", "", ""}; !slices.Equal(reader.namespaces, want) {
+		t.Fatalf("cluster-scoped APIReader List scopes = %v, want %v", reader.namespaces, want)
+	}
+	protected := &garagev1beta1.GarageBucket{}
+	if err := base.Get(t.Context(), client.ObjectKeyFromObject(bucket), protected); err != nil {
+		t.Fatal(err)
+	}
+	if len(protected.Finalizers) != 1 || protected.Finalizers[0] != garageBucketFinalizer {
+		t.Fatalf("cross-namespace dependent finalizers = %v, want %q", protected.Finalizers, garageBucketFinalizer)
+	}
+}
+
+func TestStorageClusterFinalizerWaitsForCrossNamespaceGarageDependents(t *testing.T) {
+	cluster := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: mhName, Namespace: mhNS, UID: "storage-cluster-uid"},
+		Spec: garagev1beta2.GarageClusterSpec{Storage: &garagev1beta2.StorageSpec{
+			Replicas: 1, Metadata: &garagev1beta2.VolumeConfig{}, Data: &garagev1beta2.VolumeConfig{},
+		}},
+	}
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "cross-namespace", Namespace: "tenant"},
+		Spec: garagev1beta1.GarageBucketSpec{ClusterRef: garagev1beta1.ClusterReference{
+			Name: cluster.Name, Namespace: cluster.Namespace,
+		}},
+	}
+	base := fake.NewClientBuilder().WithScheme(managementHandleScheme(t)).WithObjects(cluster, bucket).Build()
+	r := &GarageClusterReconciler{Client: base, APIReader: base, Scheme: base.Scheme(), ClusterScoped: true}
+
+	err := r.finalize(t.Context(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "GarageBucket and GarageKey dependents") {
+		t.Fatalf("finalize error = %v, want dependent barrier", err)
+	}
+	protected := &garagev1beta1.GarageBucket{}
+	if err := base.Get(t.Context(), client.ObjectKeyFromObject(bucket), protected); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(protected, garageBucketFinalizer) {
+		t.Fatalf("cross-namespace dependent finalizers = %v", protected.Finalizers)
+	}
+}
+
+func TestStorageClusterFinalizerFindsDependentsThroughHandleChains(t *testing.T) {
+	storage := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "storage", Namespace: mhNS, UID: "storage-uid"},
+		Spec: garagev1beta2.GarageClusterSpec{Storage: &garagev1beta2.StorageSpec{
+			Replicas: 1, Metadata: &garagev1beta2.VolumeConfig{}, Data: &garagev1beta2.VolumeConfig{},
+		}},
+	}
+	handle := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "handle", Namespace: mhNS, UID: "handle-uid"},
+		Spec: garagev1beta2.GarageClusterSpec{ConnectTo: &garagev1beta2.ConnectToConfig{
+			ClusterRef: &garagev1beta2.ClusterReference{Name: storage.Name},
+		}},
+	}
+	leafHandle := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "leaf-handle", Namespace: mhNS, UID: "leaf-handle-uid"},
+		Spec: garagev1beta2.GarageClusterSpec{ConnectTo: &garagev1beta2.ConnectToConfig{
+			ClusterRef: &garagev1beta2.ClusterReference{Name: handle.Name},
+		}},
+	}
+	key := &garagev1beta1.GarageKey{
+		ObjectMeta: metav1.ObjectMeta{Name: "through-two-handles", Namespace: "tenant"},
+		Spec: garagev1beta1.GarageKeySpec{ClusterRef: garagev1beta1.ClusterReference{
+			Name: leafHandle.Name, Namespace: leafHandle.Namespace,
+		}},
+	}
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "through-handle", Namespace: "tenant"},
+		Spec: garagev1beta1.GarageBucketSpec{ClusterRef: garagev1beta1.ClusterReference{
+			Name: handle.Name, Namespace: handle.Namespace,
+		}},
+	}
+	nodeID := strings.Repeat("a", 64)
+	node := &garagev1beta1.GarageNode{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "through-handle-node", Namespace: mhNS, Finalizers: []string{garageNodeFinalizer},
+		},
+		Spec: garagev1beta1.GarageNodeSpec{ClusterRef: garagev1beta1.ClusterReference{
+			Name: leafHandle.Name,
+		}},
+		Status: garagev1beta1.GarageNodeStatus{NodeID: nodeID},
+	}
+	base := fake.NewClientBuilder().WithScheme(managementHandleScheme(t)).WithObjects(
+		storage, handle, leafHandle, key, bucket, node,
+	).Build()
+	r := &GarageClusterReconciler{Client: base, APIReader: base, Scheme: base.Scheme(), ClusterScoped: true}
+
+	pending, err := r.deleteGarageResourceDependents(t.Context(), storage)
+	if err != nil || !pending {
+		t.Fatalf("transitive dependent sweep pending=%v err=%v", pending, err)
+	}
+	for _, dependent := range []client.Object{key, bucket} {
+		fresh := dependent.DeepCopyObject().(client.Object)
+		if err := base.Get(t.Context(), client.ObjectKeyFromObject(dependent), fresh); err != nil {
+			t.Fatal(err)
+		}
+		if len(fresh.GetFinalizers()) != 1 {
+			t.Fatalf("dependent %T %s finalizers = %v", dependent, dependent.GetName(), fresh.GetFinalizers())
+		}
+	}
+	for _, survivingHandle := range []*garagev1beta2.GarageCluster{handle, leafHandle} {
+		fresh := &garagev1beta2.GarageCluster{}
+		if err := base.Get(t.Context(), client.ObjectKeyFromObject(survivingHandle), fresh); err != nil {
+			t.Fatalf("handle %s was removed before its dependents finalized: %v", survivingHandle.Name, err)
+		}
+	}
+	nodeIDs, err := r.collectGarageNodeIDs(t.Context(), storage)
+	if err != nil || !nodeIDs[nodeID] {
+		t.Fatalf("transitive GarageNode inventory IDs=%v err=%v", nodeIDs, err)
+	}
+	pendingNodes, err := r.deleteReferencingGarageNodes(t.Context(), storage)
+	if err != nil || !pendingNodes {
+		t.Fatalf("transitive GarageNode deletion pending=%v err=%v", pendingNodes, err)
+	}
+	deletingNode := &garagev1beta1.GarageNode{}
+	if err := base.Get(t.Context(), client.ObjectKeyFromObject(node), deletingNode); err != nil || deletingNode.DeletionTimestamp.IsZero() {
+		t.Fatalf("transitive GarageNode was not retained for finalization: timestamp=%v err=%v", deletingNode.DeletionTimestamp, err)
+	}
+}
+
+func TestDeletingTransitiveGarageNodeAcceptsCanonicalRootDrainHandoff(t *testing.T) {
+	now := metav1.Now()
+	root := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "storage-root", Namespace: mhNS, UID: "storage-root-uid",
+			DeletionTimestamp: &now, Finalizers: []string{garageClusterFinalizer},
+		},
+		Spec: garagev1beta2.GarageClusterSpec{
+			Storage:        &garagev1beta2.StorageSpec{Replicas: 1},
+			DeletionPolicy: garagev1beta2.DeletionPolicyDrain,
+		},
+	}
+	handle := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "surviving-handle", Namespace: mhNS, UID: "handle-uid"},
+		Spec: garagev1beta2.GarageClusterSpec{
+			LayoutPolicy: LayoutPolicyManual,
+			ConnectTo:    &garagev1beta2.ConnectToConfig{ClusterRef: &garagev1beta2.ClusterReference{Name: root.Name}},
+		},
+	}
+	nodeID := strings.Repeat("d", 64)
+	proof, err := storageDrainRemovalIntent(
+		nil, storageDrainActorForCluster(root), []string{nodeID}, []string{nodeID}, time.Now().Add(-time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedAt := metav1.Now()
+	proof.CompletedAt = &completedAt
+	root.Status.StorageDrain = v1beta2StorageDrainStatus(proof)
+	node := &garagev1beta1.GarageNode{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "transitive-node", Namespace: mhNS, UID: "transitive-node-uid",
+			DeletionTimestamp: &now, Finalizers: []string{garageNodeFinalizer},
+		},
+		Spec: garagev1beta1.GarageNodeSpec{
+			ClusterRef: garagev1beta1.ClusterReference{Name: handle.Name},
+			External:   &garagev1beta1.ExternalNodeConfig{Address: "garage.example.test"},
+		},
+		Status: garagev1beta1.GarageNodeStatus{NodeID: nodeID},
+	}
+	scheme := managementHandleScheme(t)
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(root, handle, node).
+		WithStatusSubresource(&garagev1beta1.GarageNode{}, &garagev1beta2.GarageCluster{}).Build()
+	r := &GarageNodeReconciler{
+		Client: base, APIReader: base, Scheme: scheme, ClusterScoped: true,
+		LayoutMutations: NewLayoutMutationCoordinator(),
+	}
+
+	result, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(node)})
+	if err != nil || result != (reconcile.Result{}) {
+		t.Fatalf("transitive node terminal handoff result=%+v err=%v", result, err)
+	}
+	if err := base.Get(t.Context(), client.ObjectKeyFromObject(node), &garagev1beta1.GarageNode{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("transitive GarageNode remained after canonical root terminal handoff: %v", err)
+	}
+}
+
+func TestDeletingDependentsFinalizeThroughDeletingRootHandle(t *testing.T) {
+	var keyDeletes atomic.Int32
+	var bucketDeletes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/v2/DeleteKey":
+			if req.URL.Query().Get("id") != "GKcleanupthroughroot000001" {
+				t.Errorf("DeleteKey id = %q", req.URL.Query().Get("id"))
+			}
+			keyDeletes.Add(1)
+		case "/v2/DeleteBucket":
+			if req.URL.Query().Get("id") != "cleanup-bucket-id" {
+				t.Errorf("DeleteBucket id = %q", req.URL.Query().Get("id"))
+			}
+			bucketDeletes.Add(1)
+		default:
+			t.Errorf("unexpected Garage request path %q", req.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	root, secret := newHandle(server.URL)
+	now := metav1.Now()
+	root.DeletionTimestamp = &now
+	leaf := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cleanup-leaf", Namespace: root.Namespace},
+		Spec: garagev1beta2.GarageClusterSpec{ConnectTo: &garagev1beta2.ConnectToConfig{
+			ClusterRef: &garagev1beta2.ClusterReference{Name: root.Name},
+		}},
+	}
+	key := &garagev1beta1.GarageKey{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cleanup-key", Namespace: root.Namespace, DeletionTimestamp: &now,
+			Finalizers: []string{garageKeyFinalizer},
+		},
+		Spec:   garagev1beta1.GarageKeySpec{ClusterRef: garagev1beta1.ClusterReference{Name: leaf.Name}},
+		Status: garagev1beta1.GarageKeyStatus{AccessKeyID: "GKcleanupthroughroot000001"},
+	}
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cleanup-bucket", Namespace: root.Namespace, DeletionTimestamp: &now,
+			Finalizers: []string{garageBucketFinalizer},
+		},
+		Spec:   garagev1beta1.GarageBucketSpec{ClusterRef: garagev1beta1.ClusterReference{Name: leaf.Name}},
+		Status: garagev1beta1.GarageBucketStatus{BucketID: "cleanup-bucket-id"},
+	}
+	scheme := managementHandleScheme(t)
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(root, secret, leaf, key, bucket).
+		WithStatusSubresource(&garagev1beta1.GarageKey{}, &garagev1beta1.GarageBucket{}).Build()
+
+	keyReconciler := &GarageKeyReconciler{Client: kubeClient, Scheme: scheme}
+	if result, err := keyReconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(key)}); err != nil || result != (reconcile.Result{}) {
+		t.Fatalf("deleting key Reconcile result=%+v err=%v", result, err)
+	}
+	bucketReconciler := &GarageBucketReconciler{Client: kubeClient, Scheme: scheme}
+	if result, err := bucketReconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(bucket)}); err != nil || result != (reconcile.Result{}) {
+		t.Fatalf("deleting bucket Reconcile result=%+v err=%v", result, err)
+	}
+	if keyDeletes.Load() != 1 || bucketDeletes.Load() != 1 {
+		t.Fatalf("Garage cleanup calls: keys=%d buckets=%d, want one each", keyDeletes.Load(), bucketDeletes.Load())
+	}
+	if err := kubeClient.Get(t.Context(), client.ObjectKeyFromObject(key), &garagev1beta1.GarageKey{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("key remains after finalizer release: %v", err)
+	}
+	if err := kubeClient.Get(t.Context(), client.ObjectKeyFromObject(bucket), &garagev1beta1.GarageBucket{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("bucket remains after finalizer release: %v", err)
+	}
+}
+
+func TestNewGarageKeyCannotMutateDeletingManagementHandle(t *testing.T) {
+	var adminCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		adminCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	handle, secret := newHandle(server.URL)
+	now := metav1.Now()
+	handle.DeletionTimestamp = &now
+	key := &garagev1beta1.GarageKey{
+		ObjectMeta: metav1.ObjectMeta{Name: "late-key", Namespace: handle.Namespace},
+		Spec:       garagev1beta1.GarageKeySpec{ClusterRef: garagev1beta1.ClusterReference{Name: handle.Name}},
+	}
+	scheme := managementHandleScheme(t)
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(handle, secret, key).
+		WithStatusSubresource(&garagev1beta1.GarageKey{}).Build()
+	reconciler := &GarageKeyReconciler{Client: base, Scheme: scheme}
+
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(key)})
+	if err != nil || result.RequeueAfter != RequeueAfterUnhealthy {
+		t.Fatalf("late dependent Reconcile result=%+v err=%v", result, err)
+	}
+	fresh := &garagev1beta1.GarageKey{}
+	if err := base.Get(t.Context(), client.ObjectKeyFromObject(key), fresh); err != nil {
+		t.Fatal(err)
+	}
+	if len(fresh.Finalizers) != 0 {
+		t.Fatalf("late dependent acquired finalizer before deleting-cluster guard: %v", fresh.Finalizers)
+	}
+	condition := meta.FindStatusCondition(fresh.Status.Conditions, PhaseReady)
+	if fresh.Status.Phase != PhasePending || condition == nil || condition.Reason != garagev1beta1.ReasonClusterNotReady {
+		t.Fatalf("late dependent status=%+v ready=%+v", fresh.Status, condition)
+	}
+	if adminCalls.Load() != 0 {
+		t.Fatalf("deleting management handle received %d Admin API calls from late dependent", adminCalls.Load())
+	}
 }
 
 // Reachable external Admin API → Phase Running, ManagementHandleReady True, and
@@ -243,10 +747,10 @@ func TestReconcileManagementHandle_UnreachableSetsPending(t *testing.T) {
 	}
 }
 
-// A key's generated Secret on a management handle must expose the EXTERNAL S3
-// endpoint (derived from connectTo.adminApiEndpoint host), not the nonexistent
-// managed Service FQDN (#269).
-func TestBuildSecretData_ManagementHandleEndpoint(t *testing.T) {
+// A management handle exposes only an Admin API address. It is not enough
+// information to infer the external cluster's S3 endpoint, so endpoint-bearing
+// generated Secrets must fail closed.
+func TestReconcileSecret_ManagementHandleRequiresExplicitEndpoint(t *testing.T) {
 	handle := &garagev1beta2.GarageCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: mhName, Namespace: mhNS},
 		Spec: garagev1beta2.GarageClusterSpec{
@@ -256,24 +760,12 @@ func TestBuildSecretData_ManagementHandleEndpoint(t *testing.T) {
 	key := &garagev1beta1.GarageKey{ObjectMeta: metav1.ObjectMeta{Name: "k", Namespace: mhNS}}
 	key.Status.AccessKeyID = "GKtest"
 
-	cfg := secretConfig{
-		accessKeyIDKey:  "access_key_id",
-		endpointKey:     "endpoint",
-		hostKey:         "host",
-		schemeKey:       "scheme",
-		includeEndpoint: true,
-	}
-
 	s := managementHandleScheme(t)
 	fc := fake.NewClientBuilder().WithScheme(s).Build()
 	r := &GarageKeyReconciler{Client: fc, Scheme: s, ClusterDomain: testClusterDomain}
 
-	data := r.buildSecretData(context.Background(), cfg, key, handle, "sk")
-
-	if got, want := string(data["endpoint"]), "http://garage.garage.svc:3900"; got != want {
-		t.Errorf("endpoint = %q, want %q (external host, S3 port)", got, want)
-	}
-	if got, want := string(data["host"]), "garage.garage.svc:3900"; got != want {
-		t.Errorf("host = %q, want %q", got, want)
+	err := r.reconcileSecret(context.Background(), key, handle, "sk")
+	if err == nil || !strings.Contains(err.Error(), "secretTemplate.includeEndpoint=false") {
+		t.Fatalf("reconcileSecret error = %v, want actionable endpoint configuration failure", err)
 	}
 }

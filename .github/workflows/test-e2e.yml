@@ -12,8 +12,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
-  KIND_NODE_IMAGE: kindest/node:v1.35.0
+  KIND_NODE_IMAGE: kindest/node:v1.35.0@sha256:4613778f3cfcd10e615029370f5786704559103cf27bef934597ba562b269661
 
 jobs:
   e2e-ginkgo:
@@ -77,22 +80,24 @@ jobs:
             kind_config: ""
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Install kind
-        uses: helm/kind-action@v1
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with:
           install_only: true
           version: v0.31.0
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v5
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5
+        with:
+          version: v1.35.0
 
       - name: Run Ginkgo e2e tests
         run: make test-e2e GINKGO_LABEL_FILTER='${{ matrix.shard.filter }}' KIND_CLUSTER='garage-e2e-${{ matrix.shard.name }}' KIND_CONFIG_E2E='${{ matrix.shard.kind_config }}'
@@ -101,7 +106,7 @@ jobs:
         if: failure()
         run: |
           mkdir -p /tmp/e2e-debug
-          kind get clusters > /tmp/e2e-debug/clusters.txt 2>&1 || true
+          kind get clusters > /tmp/e2e-debug/clusters-post-cleanup.txt 2>&1 || true
           for cluster in $(kind get clusters 2>/dev/null); do
             kubectl --context "kind-$cluster" get all -A > "/tmp/e2e-debug/${cluster}-resources.txt" 2>&1 || true
             kubectl --context "kind-$cluster" logs deployment/garage-operator-controller-manager -n garage-operator-system --tail=200 > "/tmp/e2e-debug/${cluster}-operator.txt" 2>&1 || true
@@ -109,7 +114,7 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ginkgo-e2e-logs-${{ matrix.shard.name }}
           path: /tmp/e2e-debug/
@@ -141,25 +146,29 @@ jobs:
     timeout-minutes: 58
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Install kind
-        uses: helm/kind-action@v1
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with:
           install_only: true
           version: v0.31.0
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v5
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5
+        with:
+          version: v1.35.0
 
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v4.2.3
 
       - name: Run single-cluster e2e tests
         run: make test-e2e-cluster
@@ -169,7 +178,7 @@ jobs:
       # the script crashes before its trap fires, this artifact will be empty.
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cluster-e2e-logs
           path: /tmp/e2e-debug/
@@ -183,32 +192,36 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Install kind
-        uses: helm/kind-action@v1
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with:
           install_only: true
           version: v0.31.0
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v5
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5
+        with:
+          version: v1.35.0
 
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v4.2.3
 
       - name: Run COSI e2e tests
         run: make test-e2e-cosi
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cosi-e2e-logs
           path: /tmp/e2e-debug/
@@ -221,32 +234,36 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Install kind
-        uses: helm/kind-action@v1
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with:
           install_only: true
           version: v0.31.0
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v5
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5
+        with:
+          version: v1.35.0
 
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v4.2.3
 
       - name: Run multi-cluster e2e tests
         run: make test-e2e-multicluster
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: multicluster-e2e-logs
           path: /tmp/e2e-debug/
@@ -259,32 +276,36 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Install kind
-        uses: helm/kind-action@v1
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with:
           install_only: true
           version: v0.31.0
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v5
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5
+        with:
+          version: v1.35.0
 
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v4.2.3
 
       - name: Run external gateway e2e tests
         run: make test-e2e-external-gateway
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: external-gateway-e2e-logs
           path: /tmp/e2e-debug/
@@ -297,32 +318,36 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Install kind
-        uses: helm/kind-action@v1
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with:
           install_only: true
           version: v0.31.0
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v5
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5
+        with:
+          version: v1.35.0
 
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v4.2.3
 
       - name: Run IPv6 dual-stack e2e tests
         run: make test-e2e-ipv6
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ipv6-e2e-logs
           path: /tmp/e2e-debug/

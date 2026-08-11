@@ -284,12 +284,32 @@ type GarageBucketStatus struct {
 	// +optional
 	Keys []BucketKeyStatus `json:"keys,omitempty"`
 
-	// ManagedKeyGrants lists the access key IDs this bucket's spec.keyPermissions
-	// last granted access to. Used to revoke grants when a keyRef is dropped
-	// from the spec, without disturbing grants made via a GarageKey's
-	// bucketPermissions/allBuckets or by hand.
+	// ManagedKeyGrants lists access key IDs with reserved or active operator
+	// ownership from this bucket's spec.keyPermissions. IDs are recorded before
+	// the first remote mutation and removed only after exact convergence, allowing
+	// crash-safe revocation when a declaration is dropped without disturbing
+	// grants managed through GarageKey or by hand.
 	// +optional
 	ManagedKeyGrants []string `json:"managedKeyGrants,omitempty"`
+
+	// ManagedGlobalAlias is the global alias reserved or successfully managed from
+	// spec.globalAlias (or the bucket name when spec.globalAlias is empty).
+	// It is separate from GlobalAlias, which reports observed Garage state, so
+	// aliases created outside the operator are never removed accidentally.
+	// +optional
+	ManagedGlobalAlias string `json:"managedGlobalAlias,omitempty"`
+
+	// PendingGlobalAlias reserves a replacement before its first remote add.
+	// ManagedGlobalAlias retains the old alias until the replacement succeeds,
+	// so a failed rename never leaves the bucket without its prior alias.
+	// +optional
+	PendingGlobalAlias string `json:"pendingGlobalAlias,omitempty"`
+
+	// ManagedLocalAliases lists the per-key aliases reserved or successfully
+	// managed from spec.localAliases. IDs are recorded before the first remote
+	// add so an interrupted add can still be removed safely.
+	// +optional
+	ManagedLocalAliases []LocalAliasStatus `json:"managedLocalAliases,omitempty"`
 
 	// LocalAliases tracks per-key local aliases for this bucket
 	// +optional

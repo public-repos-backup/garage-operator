@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
@@ -501,6 +502,7 @@ var _ = Describe("GarageCluster Controller", func() {
 					},
 				},
 			}
+			Expect(controllerutil.SetControllerReference(cluster, oldDeploy, k8sClient.Scheme())).To(Succeed())
 			Expect(k8sClient.Create(ctx, oldDeploy)).To(Succeed())
 
 			reconciler := &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
@@ -1290,7 +1292,9 @@ var _ = Describe("GarageCluster PodDisruptionBudget reconcile", func() {
 		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
 
 		Expect(k8sClient.Create(ctx, newCluster(&garagev1beta2.PodDisruptionBudgetConfig{Enabled: true}))).To(Succeed())
-		driveReconciles()
+		cluster := &garagev1beta2.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, cluster)).To(Succeed())
+		Expect(reconciler.reconcileTierPodDisruptionBudget(ctx, cluster, tierStorage)).To(MatchError(ContainSubstring("refusing to mutate PodDisruptionBudget")))
 
 		got := &policyv1.PodDisruptionBudget{}
 		Expect(k8sClient.Get(ctx, key, got)).To(Succeed())

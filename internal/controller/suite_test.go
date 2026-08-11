@@ -34,6 +34,7 @@ import (
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
+	"github.com/rajsinghtech/garage-operator/internal/testutil"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -103,39 +104,8 @@ var _ = AfterSuite(func() {
 // setting the 'KUBEBUILDER_ASSETS' environment variable. To ensure the binaries are
 // properly set up, run 'make setup-envtest' beforehand.
 func getEnvTestBinaryDir() string {
-	if configured := os.Getenv("KUBEBUILDER_ASSETS"); envtestBinaryDirComplete(configured) {
-		return configured
-	}
-	basePath := filepath.Join("..", "..", "bin", "k8s")
-	entries, err := os.ReadDir(basePath)
-	if err != nil {
-		logf.Log.Error(err, "Failed to read directory", "path", basePath)
-		return ""
-	}
-	// os.ReadDir sorts by filename. Prefer the newest complete cached release
-	// and skip interrupted downloads rather than blindly selecting the oldest
-	// directory and failing several seconds later in envtest.Start.
-	for i := len(entries) - 1; i >= 0; i-- {
-		entry := entries[i]
-		if entry.IsDir() {
-			candidate := filepath.Join(basePath, entry.Name())
-			if envtestBinaryDirComplete(candidate) {
-				return candidate
-			}
-		}
-	}
-	return ""
-}
-
-func envtestBinaryDirComplete(directory string) bool {
-	if directory == "" {
-		return false
-	}
-	for _, binary := range []string{"kube-apiserver", "etcd", "kubectl"} {
-		info, err := os.Stat(filepath.Join(directory, binary))
-		if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
-			return false
-		}
-	}
-	return true
+	return testutil.FindEnvTestBinaryDir(
+		os.Getenv("KUBEBUILDER_ASSETS"),
+		filepath.Join("..", "..", "bin", "k8s"),
+	)
 }

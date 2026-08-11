@@ -19,7 +19,7 @@
           "description": "ClusterRef references the GarageCluster this token belongs to",
           "properties": {
             "kubeConfigSecretRef": {
-              "description": "KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.\nOnly needed for multi-cluster federation where the GarageCluster lives in a different\nKubernetes cluster entirely (not just a different namespace).",
+              "description": "KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.\nIt is currently rejected by admission because the operator does not use it.",
               "properties": {
                 "key": {
                   "description": "The key of the secret to select from.  Must be a valid secret key.",

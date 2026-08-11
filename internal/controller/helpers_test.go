@@ -28,8 +28,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
@@ -1759,5 +1761,52 @@ func TestGatewayVolumeClaimTemplatesChangedCoversSupportedImmutableShape(t *test
 				t.Fatalf("%s claim-template drift was not detected", name)
 			}
 		})
+	}
+}
+
+func TestUpdateStatusWithRetryPreservesDesiredStatusWithoutCallback(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := garagev1beta1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	stored := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "status-retry", Namespace: testNamespace, UID: "uid-1"},
+		Status:     garagev1beta1.GarageBucketStatus{Phase: PhasePending},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(stored).
+		WithStatusSubresource(&garagev1beta1.GarageBucket{}).Build()
+	updates := 0
+	wrapped := interceptor.NewClient(base, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			updates++
+			if subResourceName == "status" && updates == 1 {
+				return apierrors.NewConflict(schema.GroupResource{
+					Group: garagev1beta1.GroupVersion.Group, Resource: "garagebuckets",
+				}, obj.GetName(), fmt.Errorf("injected conflict"))
+			}
+			return c.Status().Update(ctx, obj, opts...)
+		},
+	})
+
+	desired := &garagev1beta1.GarageBucket{}
+	if err := wrapped.Get(ctx, client.ObjectKeyFromObject(stored), desired); err != nil {
+		t.Fatal(err)
+	}
+	desired.Status.Phase = PhaseRunning
+	desired.Status.BucketID = "desired-status-survived"
+	if err := UpdateStatusWithRetry(ctx, wrapped, desired); err != nil {
+		t.Fatal(err)
+	}
+
+	got := &garagev1beta1.GarageBucket{}
+	if err := wrapped.Get(ctx, client.ObjectKeyFromObject(stored), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != PhaseRunning || got.Status.BucketID != "desired-status-survived" {
+		t.Fatalf("status after conflict = %#v, want desired status", got.Status)
+	}
+	if updates != 2 {
+		t.Fatalf("status updates = %d, want 2", updates)
 	}
 }

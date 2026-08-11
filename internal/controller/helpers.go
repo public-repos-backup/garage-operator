@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +43,7 @@ import (
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	"github.com/rajsinghtech/garage-operator/internal/garage"
+	"github.com/rajsinghtech/garage-operator/internal/garageconfig"
 )
 
 // findNodeByIPs returns the node ID whose RPC address matches any of the given pod IPs.
@@ -244,6 +246,7 @@ const (
 	defaultSchemeKey          = "scheme"
 	defaultRegionKey          = "region"
 	defaultBucketNameKey      = "bucket"
+	garageKeyKind             = "GarageKey"
 )
 
 var validRepairTypes = map[string]bool{
@@ -365,10 +368,9 @@ const (
 
 // Finalization constants
 const (
-	// FinalizationMaxRetries is tracked via annotation on the resource
+	// FinalizationRetryAnnotation records failures for diagnostics. Finalizers
+	// are retained until cleanup succeeds; the count never authorizes a leak.
 	FinalizationRetryAnnotation = "garage.rajsingh.info/finalization-retries"
-	// FinalizationMaxRetries before giving up and removing finalizer
-	FinalizationMaxRetries = 5
 	// finalizeRPCTimeout caps a single admin API call on the finalize hot path.
 	// Generous compared to a healthy call, short enough that one wedged peer
 	// (e.g. a bucket whose authorized_keys lookup never returns) cannot
@@ -530,7 +532,16 @@ func GetRPCSecret(ctx context.Context, c client.Reader, cluster *garagev1beta2.G
 // (svc.<clusterDomain>) and authenticated via a bearer token. For TLS, deploy a
 // service mesh (Istio/Linkerd) with mTLS or an in-cluster reverse proxy.
 func GetGarageClient(ctx context.Context, c client.Client, cluster *garagev1beta2.GarageCluster, clusterDomain string) (*garage.Client, error) {
-	return getGarageClient(ctx, c, cluster, clusterDomain, make(map[types.NamespacedName]struct{}))
+	return getGarageClient(ctx, c, cluster, clusterDomain, make(map[types.NamespacedName]struct{}), false)
+}
+
+// GetGarageClientForCleanup resolves the same fully validated local
+// management-handle chain as GetGarageClient, but permits referenced clusters
+// that are already deleting. This is cleanup-only: dependent finalizers must
+// still reach the dying root in order to remove their remote resources before
+// the root finalizer can finish.
+func GetGarageClientForCleanup(ctx context.Context, c client.Client, cluster *garagev1beta2.GarageCluster, clusterDomain string) (*garage.Client, error) {
+	return getGarageClient(ctx, c, cluster, clusterDomain, make(map[types.NamespacedName]struct{}), true)
 }
 
 // resolveGarageLayoutOwner follows connection-only and edge-gateway
@@ -547,6 +558,27 @@ func resolveGarageLayoutOwner(
 	ctx context.Context,
 	reader client.Reader,
 	cluster *garagev1beta2.GarageCluster,
+) (*garagev1beta2.GarageCluster, error) {
+	return resolveGarageLayoutOwnerWithPolicy(ctx, reader, cluster, false)
+}
+
+// resolveGarageLayoutOwnerForCleanup preserves the same validated, cycle-safe
+// chain traversal while allowing a referenced owner that is already deleting.
+// Dependent finalizers need the dying root's durable layout transaction until
+// their exact roles and workloads have been retired.
+func resolveGarageLayoutOwnerForCleanup(
+	ctx context.Context,
+	reader client.Reader,
+	cluster *garagev1beta2.GarageCluster,
+) (*garagev1beta2.GarageCluster, error) {
+	return resolveGarageLayoutOwnerWithPolicy(ctx, reader, cluster, true)
+}
+
+func resolveGarageLayoutOwnerWithPolicy(
+	ctx context.Context,
+	reader client.Reader,
+	cluster *garagev1beta2.GarageCluster,
+	allowDeletingReferences bool,
 ) (*garagev1beta2.GarageCluster, error) {
 	if cluster == nil {
 		return nil, fmt.Errorf("garageCluster is nil")
@@ -568,14 +600,9 @@ func resolveGarageLayoutOwner(
 		if reader == nil {
 			return nil, fmt.Errorf("kubernetes reader is required to resolve GarageCluster connectTo.clusterRef")
 		}
-		ref := current.Spec.ConnectTo.ClusterRef
-		nextKey := types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}
-		if nextKey.Namespace == "" {
-			nextKey.Namespace = current.Namespace
-		}
-		next := &garagev1beta2.GarageCluster{}
-		if err := reader.Get(ctx, nextKey, next); err != nil {
-			return nil, fmt.Errorf("reading Garage layout owner %s: %w", nextKey.String(), err)
+		next, err := getLocalConnectToClusterWithPolicy(ctx, reader, current, allowDeletingReferences)
+		if err != nil {
+			return nil, fmt.Errorf("resolving Garage layout owner from %s: %w", key.String(), err)
 		}
 		current = next
 	}
@@ -587,6 +614,7 @@ func getGarageClient(
 	cluster *garagev1beta2.GarageCluster,
 	clusterDomain string,
 	visited map[types.NamespacedName]struct{},
+	allowDeletingReferences bool,
 ) (*garage.Client, error) {
 	if cluster == nil {
 		return nil, fmt.Errorf("garageCluster is nil")
@@ -603,7 +631,7 @@ func getGarageClient(
 	// through this function, so they all transparently manage the external
 	// cluster's Admin-API state.
 	if cluster.IsManagementHandle() {
-		return resolveConnectToClientWithVisited(ctx, c, cluster, clusterDomain, visited)
+		return resolveConnectToClientWithVisited(ctx, c, cluster, clusterDomain, visited, allowDeletingReferences)
 	}
 
 	adminPort := getAdminPort(cluster)
@@ -627,6 +655,7 @@ func resolveConnectToClientWithVisited(
 	cluster *garagev1beta2.GarageCluster,
 	clusterDomain string,
 	visited map[types.NamespacedName]struct{},
+	allowDeletingReferences bool,
 ) (*garage.Client, error) {
 	ct := cluster.Spec.ConnectTo
 	if ct == nil {
@@ -653,27 +682,52 @@ func resolveConnectToClientWithVisited(
 	}
 
 	if ct.ClusterRef != nil {
-		ref := &garagev1beta2.GarageCluster{}
-		nn := types.NamespacedName{Name: ct.ClusterRef.Name, Namespace: ct.ClusterRef.Namespace}
-		if nn.Namespace == "" {
-			nn.Namespace = cluster.Namespace
+		ref, err := getLocalConnectToClusterWithPolicy(ctx, c, cluster, allowDeletingReferences)
+		if err != nil {
+			return nil, err
 		}
-		if err := c.Get(ctx, nn, ref); err != nil {
-			return nil, fmt.Errorf("failed to get connectTo clusterRef %s: %w", nn, err)
-		}
-		return getGarageClient(ctx, c, ref, clusterDomain, visited)
+		return getGarageClient(ctx, c, ref, clusterDomain, visited, allowDeletingReferences)
 	}
 
 	return nil, fmt.Errorf("management handle connectTo missing adminApiEndpoint or clusterRef")
 }
 
+func getLocalConnectToClusterWithPolicy(
+	ctx context.Context,
+	reader client.Reader,
+	cluster *garagev1beta2.GarageCluster,
+	allowDeleting bool,
+) (*garagev1beta2.GarageCluster, error) {
+	if cluster == nil || cluster.Spec.ConnectTo == nil || cluster.Spec.ConnectTo.ClusterRef == nil {
+		return nil, fmt.Errorf("GarageCluster connectTo.clusterRef is required")
+	}
+	ref := cluster.Spec.ConnectTo.ClusterRef
+	if ref.KubeConfigSecretRef != nil {
+		return nil, fmt.Errorf("spec.connectTo.clusterRef.kubeConfigSecretRef is not supported; the operator can reference GarageClusters only through its configured Kubernetes client")
+	}
+	if err := garageconfig.ValidateNamespacedObjectReference(ref.Name, ref.Namespace, "spec.connectTo.clusterRef"); err != nil {
+		return nil, err
+	}
+	if ref.Namespace != "" && ref.Namespace != cluster.Namespace {
+		return nil, fmt.Errorf("spec.connectTo.clusterRef.namespace must be empty or match metadata.namespace")
+	}
+	objectKey := types.NamespacedName{Name: ref.Name, Namespace: cluster.Namespace}
+	next := &garagev1beta2.GarageCluster{}
+	if err := reader.Get(ctx, objectKey, next); err != nil {
+		return nil, fmt.Errorf("failed to get connectTo clusterRef %s: %w", objectKey, err)
+	}
+	if !allowDeleting && !next.DeletionTimestamp.IsZero() {
+		return nil, fmt.Errorf("connectTo clusterRef %s is deleting", objectKey)
+	}
+	return next, nil
+}
+
 // UpdateStatusWithRetry updates the status subresource with retry on conflict.
 // This handles the race condition where concurrent reconciliations may conflict.
 //
-// An optional mutate callback can be provided to re-apply status fields after
-// the object is re-fetched on conflict. Without a mutate callback, the re-fetched
-// object's status would overwrite any pending status changes — effectively losing
-// the update the caller intended to persist.
+// An optional mutate callback can recompute status fields after the object is
+// re-fetched on conflict. Without a callback, the helper snapshots and restores
+// the caller's complete desired Status field before retrying.
 //
 // Usage:
 //
@@ -683,6 +737,14 @@ func resolveConnectToClientWithVisited(
 //	})
 func UpdateStatusWithRetry(ctx context.Context, c client.Client, obj client.Object, mutate ...func()) error {
 	originalUID := obj.GetUID()
+	var desired client.Object
+	if len(mutate) == 0 {
+		var ok bool
+		desired, ok = obj.DeepCopyObject().(client.Object)
+		if !ok {
+			return fmt.Errorf("cannot snapshot status for %T", obj)
+		}
+	}
 	for i := 0; i < StatusUpdateMaxRetries; i++ {
 		err := c.Status().Update(ctx, obj)
 		if err == nil {
@@ -704,12 +766,37 @@ func UpdateStatusWithRetry(ctx context.Context, c client.Client, obj client.Obje
 				)
 			}
 			// Re-apply desired status changes on the freshly-fetched object
-			for _, fn := range mutate {
-				fn()
+			if len(mutate) == 0 {
+				if err := copyStatusField(obj, desired); err != nil {
+					return err
+				}
+			} else {
+				for _, fn := range mutate {
+					fn()
+				}
 			}
 		}
 	}
 	return fmt.Errorf("failed to update status after %d retries due to conflicts", StatusUpdateMaxRetries)
+}
+
+func copyStatusField(dst, src client.Object) error {
+	dstValue := reflect.ValueOf(dst)
+	srcValue := reflect.ValueOf(src)
+	if dstValue.Kind() != reflect.Pointer || dstValue.IsNil() ||
+		srcValue.Kind() != reflect.Pointer || srcValue.IsNil() {
+		return fmt.Errorf("status objects must be non-nil pointers, got %T and %T", dst, src)
+	}
+	if dstValue.Elem().Kind() != reflect.Struct || srcValue.Elem().Kind() != reflect.Struct {
+		return fmt.Errorf("status objects must point to structs, got %T and %T", dst, src)
+	}
+	dstStatus := dstValue.Elem().FieldByName("Status")
+	srcStatus := srcValue.Elem().FieldByName("Status")
+	if !dstStatus.IsValid() || !srcStatus.IsValid() || !dstStatus.CanSet() || dstStatus.Type() != srcStatus.Type() {
+		return fmt.Errorf("cannot copy status from %T to %T", src, dst)
+	}
+	dstStatus.Set(srcStatus)
+	return nil
 }
 
 // adoptGarageClusterSnapshot keeps an in-flight reconcile's object internally
@@ -750,11 +837,6 @@ func IncrementFinalizationRetryCount(obj client.Object) {
 	count := GetFinalizationRetryCount(obj)
 	annotations[FinalizationRetryAnnotation] = strconv.Itoa(count + 1)
 	obj.SetAnnotations(annotations)
-}
-
-// ShouldSkipFinalization returns true if finalization has failed too many times
-func ShouldSkipFinalization(obj client.Object) bool {
-	return GetFinalizationRetryCount(obj) >= FinalizationMaxRetries
 }
 
 // tagSetEqual compares two layout-role tag slices for equality as multisets
@@ -1049,7 +1131,7 @@ func boundedDNS1123LabelNameTo(identity string, maxLength int) string {
 		prefix = strings.TrimRight(prefix[:maxPrefix], "-")
 	}
 	if prefix == "" {
-		prefix = "garage"
+		prefix = defaultAppName
 	}
 	return prefix + suffix
 }
@@ -1414,13 +1496,19 @@ func reconcileService(ctx context.Context, c client.Client, desired *corev1.Serv
 	if err != nil {
 		return err
 	}
+	if !metav1.IsControlledBy(existing, owner) {
+		return fmt.Errorf("refusing to mutate Service %s/%s because it is not controlled by exact %T UID %s", existing.Namespace, existing.Name, owner, owner.GetUID())
+	}
 
 	existing.Labels = desired.Labels
 	existing.Annotations = desired.Annotations
+	existing.OwnerReferences = desired.OwnerReferences
 	existing.Spec.Type = desired.Spec.Type
 	existing.Spec.Selector = desired.Spec.Selector
 	existing.Spec.PublishNotReadyAddresses = desired.Spec.PublishNotReadyAddresses
 	existing.Spec.ExternalTrafficPolicy = desired.Spec.ExternalTrafficPolicy
+	existing.Spec.LoadBalancerIP = desired.Spec.LoadBalancerIP
+	existing.Spec.LoadBalancerSourceRanges = append([]string(nil), desired.Spec.LoadBalancerSourceRanges...)
 	// Merge ports: preserve Kubernetes-allocated NodePort values when the desired
 	// port has NodePort == 0 (i.e. caller did not request a specific port).
 	existing.Spec.Ports = mergeServicePorts(existing.Spec.Ports, desired.Spec.Ports)

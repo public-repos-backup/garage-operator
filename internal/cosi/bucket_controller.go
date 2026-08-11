@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -46,6 +47,9 @@ type BucketReconciler struct {
 	DriverName  string
 	Namespace   string // namespace for shadow GarageBucket resources
 	Provisioner *Provisioner
+	// WatchNamespaces limits new provisioning to BucketClaims in the manager's
+	// configured namespace scope. Empty means cluster-wide.
+	WatchNamespaces []string
 }
 
 func (r *BucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -68,10 +72,67 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (rec
 	if bucket.Spec.DriverName != r.DriverName {
 		return reconcile.Result{}, nil
 	}
+	if !r.watchesNamespace(bucket.Spec.BucketClaimRef.Namespace) {
+		// Buckets are cluster-scoped, so namespace-scoped manager caches still see
+		// objects owned by other operator instances using the same driver. Ignore
+		// them completely: writing even an error status causes the instances to
+		// fight over the shared object and can erase the owning instance's Ready
+		// status.
+		if bucket.DeletionTimestamp.IsZero() {
+			return reconcile.Result{}, nil
+		}
+		owned, err := r.Provisioner.OwnsBucketCleanup(ctx, bucket.Name, bucket.Status.BucketID)
+		if err != nil {
+			return reconcile.Result{}, fmt.Errorf("prove out-of-scope Bucket cleanup ownership: %w", err)
+		}
+		if !owned {
+			return reconcile.Result{}, nil
+		}
+		logger.Info("Continuing cleanup for previously managed Bucket after namespace scope change",
+			"claimNamespace", bucket.Spec.BucketClaimRef.Namespace, "bucketId", bucket.Status.BucketID)
+	}
+	if !bucket.GetDeletionTimestamp().IsZero() && bucket.Spec.DeletionPolicy == cosiv1alpha2.BucketDeletionPolicyRetain {
+		done, err := r.Provisioner.RetainBucketProvisioning(ctx, bucket.Name, bucket.Status.BucketID)
+		if err != nil {
+			return r.fail(ctx, bucket, fmt.Errorf("retain bucket: %w", err))
+		}
+		if !done {
+			return reconcile.Result{RequeueAfter: time.Second}, nil
+		}
+		r.removeCleanupFinalizers(bucket)
+		if err := r.Update(ctx, bucket); err != nil {
+			return reconcile.Result{}, err
+		}
+		logger.Info("Bucket retained", "bucketId", bucket.Status.BucketID)
+		return reconcile.Result{}, nil
+	}
+	if !bucket.GetDeletionTimestamp().IsZero() && bucket.Status.BucketID == "" {
+		done, err := r.Provisioner.CancelBucketProvisioning(ctx, bucket.Name)
+		if err != nil {
+			return r.fail(ctx, bucket, fmt.Errorf("cancel pending bucket provisioning: %w", err))
+		}
+		if !done {
+			return reconcile.Result{RequeueAfter: time.Second}, nil
+		}
+		r.removeCleanupFinalizers(bucket)
+		if err := r.Update(ctx, bucket); err != nil {
+			return reconcile.Result{}, err
+		}
+		logger.Info("Pending Bucket provisioning cancelled")
+		return reconcile.Result{}, nil
+	}
 
 	params, err := ParseBucketClassParameters(bucket.Spec.Parameters, r.Namespace)
 	if err != nil {
-		return r.fail(ctx, bucket, fmt.Errorf("parse parameters: %w", err))
+		if bucket.DeletionTimestamp.IsZero() || bucket.Status.BucketID == "" {
+			return r.fail(ctx, bucket, fmt.Errorf("parse parameters: %w", err))
+		}
+		// Provisioning-only parameters may have been valid in an older release
+		// but be rejected now. A provisioned Bucket must remain deletable: keep
+		// only the cluster identity needed for cleanup and ignore quotas,
+		// website flags, and unknown legacy keys. If even that identity is gone,
+		// DeleteBucket recovers it from the bound shadow by exact bucket ID.
+		params = bucketDeletionParameters(bucket.Spec.Parameters, r.Namespace)
 	}
 
 	if !bucket.GetDeletionTimestamp().IsZero() {
@@ -80,7 +141,7 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (rec
 				return r.fail(ctx, bucket, err)
 			}
 		}
-		ctrlutil.RemoveFinalizer(bucket, cosiv1alpha2.ProtectionFinalizer)
+		r.removeCleanupFinalizers(bucket)
 		if err := r.Update(ctx, bucket); err != nil {
 			return reconcile.Result{}, err
 		}
@@ -91,8 +152,14 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (rec
 	if bucket.Spec.ExistingBucketID != "" {
 		return r.fail(ctx, bucket, errors.New("static provisioning not supported"))
 	}
+	if err := validateS3BucketProtocols(bucket.Spec.Protocols); err != nil {
+		return r.fail(ctx, bucket, err)
+	}
+	if err := validateDynamicBucketClaimRef(bucket.Spec.BucketClaimRef); err != nil {
+		return r.fail(ctx, bucket, err)
+	}
 
-	if ctrlutil.AddFinalizer(bucket, cosiv1alpha2.ProtectionFinalizer) {
+	if ctrlutil.AddFinalizer(bucket, GarageProtectionFinalizer) {
 		if err := r.Update(ctx, bucket); err != nil {
 			return reconcile.Result{}, err
 		}
@@ -108,10 +175,10 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (rec
 	bucket.Status.BucketID = result.BucketID
 	bucket.Status.Protocols = []cosiv1alpha2.ObjectProtocol{cosiv1alpha2.ObjectProtocolS3}
 	bucket.Status.BucketInfo = map[string]string{
-		"s3.bucketId":        result.GlobalAlias,
-		"s3.endpoint":        result.Endpoint,
-		"s3.region":          result.Region,
-		"s3.addressingStyle": "Path",
+		string(cosiv1alpha2.BucketInfoVar_S3_BucketId):        result.GlobalAlias,
+		string(cosiv1alpha2.BucketInfoVar_S3_Endpoint):        result.Endpoint,
+		string(cosiv1alpha2.BucketInfoVar_S3_Region):          result.Region,
+		string(cosiv1alpha2.BucketInfoVar_S3_AddressingStyle): "path",
 	}
 	bucket.Status.Error = nil
 	if err := r.Status().Update(ctx, bucket); err != nil {
@@ -119,6 +186,46 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (rec
 	}
 	logger.Info("Bucket ready", "bucketId", result.BucketID)
 	return reconcile.Result{}, nil
+}
+
+func (r *BucketReconciler) watchesNamespace(namespace string) bool {
+	return len(r.WatchNamespaces) == 0 || slices.Contains(r.WatchNamespaces, namespace)
+}
+
+func bucketDeletionParameters(params map[string]string, defaultNamespace string) *BucketClassParameters {
+	clusterRef := params[paramClusterRef]
+	if clusterRef == "" {
+		return nil
+	}
+	clusterNamespace := params[paramClusterNamespace]
+	if clusterNamespace == "" {
+		clusterNamespace = defaultNamespace
+	}
+	return &BucketClassParameters{ClusterRef: clusterRef, ClusterNamespace: clusterNamespace}
+}
+
+func validateS3BucketProtocols(protocols []cosiv1alpha2.ObjectProtocol) error {
+	if len(protocols) != 1 || protocols[0] != cosiv1alpha2.ObjectProtocolS3 {
+		return fmt.Errorf("garage requires exactly one bucket protocol, S3; got %q", protocols)
+	}
+	return nil
+}
+
+func validateDynamicBucketClaimRef(ref cosiv1alpha2.BucketClaimReference) error {
+	if ref.Name == "" || ref.Namespace == "" || ref.UID == "" {
+		return fmt.Errorf("dynamic provisioning requires bucketClaimRef name, namespace, and UID")
+	}
+	return nil
+}
+
+// removeCleanupFinalizers releases the Garage-owned finalizer and the shared
+// COSI protection finalizer used by older garage-operator releases. Unlike the
+// BucketAccess handoff, the pinned COSI controller does not reconcile Bucket
+// finalization; upgraded Buckets would otherwise remain terminating after
+// Garage cleanup succeeds.
+func (r *BucketReconciler) removeCleanupFinalizers(bucket *cosiv1alpha2.Bucket) {
+	ctrlutil.RemoveFinalizer(bucket, GarageProtectionFinalizer)
+	ctrlutil.RemoveFinalizer(bucket, cosiv1alpha2.ProtectionFinalizer)
 }
 
 func (r *BucketReconciler) fail(ctx context.Context, bucket *cosiv1alpha2.Bucket, in error) (reconcile.Result, error) {

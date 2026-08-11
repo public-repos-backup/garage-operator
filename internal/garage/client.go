@@ -39,6 +39,7 @@ const (
 	workerStateDone      = "done"
 	workerStateNull      = "null"
 	workerNodeKey        = "node"
+	workerNodeSelf       = "self"
 )
 
 // APIError represents an error returned by the Garage Admin API
@@ -187,7 +188,7 @@ type Client struct {
 // NewClient creates a new Garage Admin API client
 func NewClient(baseURL, adminToken string) *Client {
 	return &Client{
-		baseURL:    baseURL,
+		baseURL:    strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		adminToken: adminToken,
 		httpClient: &http.Client{
 			Timeout: 90 * time.Second,
@@ -461,7 +462,7 @@ func (c *Client) GetSelfNodeInfo(ctx context.Context) (*LocalNodeInfo, error) {
 		ctx,
 		http.MethodGet,
 		"/v2/GetNodeInfo",
-		map[string]string{workerNodeKey: "self"},
+		map[string]string{workerNodeKey: workerNodeSelf},
 		nil,
 	)
 	if err != nil {
@@ -1631,20 +1632,16 @@ type SetWorkerVariableRequest struct {
 func (c *Client) SetWorkerVariable(ctx context.Context, nodeID, variable, value string) error {
 	query := map[string]string{workerNodeKey: nodeID}
 	req := SetWorkerVariableRequest{Variable: variable, Value: value}
-	_, err := c.doRequestWithQuery(ctx, http.MethodPost, "/v2/SetWorkerVariable", query, req)
-	return err
+	resp, err := c.doRequestWithQuery(ctx, http.MethodPost, "/v2/SetWorkerVariable", query, req)
+	if err != nil {
+		return err
+	}
+	return validateMultiNodeCommandResponse(resp, nodeID, "SetWorkerVariable")
 }
 
 // LaunchRepairRequest is the request to launch a repair operation
 type LaunchRepairRequest struct {
 	RepairType string `json:"repairType"` // Tables, Blocks, Versions, Rebalance, Scrub, etc.
-}
-
-// LaunchRepairResponse preserves the per-node dispatch result returned by
-// Garage. A 200 response can still contain individual node failures.
-type LaunchRepairResponse struct {
-	Success map[string]json.RawMessage `json:"success"`
-	Error   map[string]string          `json:"error"`
 }
 
 // LaunchRepair starts a repair operation on a node.
@@ -1662,26 +1659,7 @@ func (c *Client) LaunchRepair(ctx context.Context, nodeID, repairType string) er
 	if err != nil {
 		return err
 	}
-	var result LaunchRepairResponse
-	if err := json.Unmarshal(resp, &result); err != nil {
-		return fmt.Errorf("failed to unmarshal repair launch response: %w", err)
-	}
-	if len(result.Error) > 0 {
-		failed := make([]string, 0, len(result.Error))
-		for id, message := range result.Error {
-			failed = append(failed, fmt.Sprintf("%s: %s", id, message))
-		}
-		sort.Strings(failed)
-		return fmt.Errorf("garage rejected repair launch on node(s): %s", strings.Join(failed, "; "))
-	}
-	if nodeID != "*" {
-		if _, ok := result.Success[nodeID]; !ok {
-			return fmt.Errorf("garage repair launch returned no success result for node %s", nodeID)
-		}
-	} else if len(result.Success) == 0 {
-		return fmt.Errorf("garage repair launch returned no successful nodes")
-	}
-	return nil
+	return validateMultiNodeCommandResponse(resp, nodeID, "LaunchRepairOperation")
 }
 
 // LaunchScrubCommand sends a scrub control command to nodes.
@@ -1697,15 +1675,21 @@ func (c *Client) LaunchScrubCommand(ctx context.Context, nodeID, command string)
 	}
 	query := map[string]string{workerNodeKey: nodeID}
 	req := scrubRequest{RepairType: scrubType{Scrub: command}}
-	_, err := c.doRequestWithQuery(ctx, http.MethodPost, "/v2/LaunchRepairOperation", query, req)
-	return err
+	resp, err := c.doRequestWithQuery(ctx, http.MethodPost, "/v2/LaunchRepairOperation", query, req)
+	if err != nil {
+		return err
+	}
+	return validateMultiNodeCommandResponse(resp, nodeID, "LaunchRepairOperation")
 }
 
 // CreateMetadataSnapshot triggers a metadata snapshot on a node
 func (c *Client) CreateMetadataSnapshot(ctx context.Context, nodeID string) error {
 	query := map[string]string{workerNodeKey: nodeID}
-	_, err := c.doRequestWithQuery(ctx, http.MethodPost, "/v2/CreateMetadataSnapshot", query, nil)
-	return err
+	resp, err := c.doRequestWithQuery(ctx, http.MethodPost, "/v2/CreateMetadataSnapshot", query, nil)
+	if err != nil {
+		return err
+	}
+	return validateMultiNodeCommandResponse(resp, nodeID, "CreateMetadataSnapshot")
 }
 
 // multiNodeResponse mirrors Garage's MultiResponse<T> (src/api/admin/api.rs).
@@ -1731,6 +1715,33 @@ func aggregateNodeErrors(errs map[string]string) error {
 	}
 	sort.Strings(parts)
 	return fmt.Errorf("%d node(s) reported errors: %s", len(errs), strings.Join(parts, "; "))
+}
+
+// validateMultiNodeSuccess checks the dispatch envelope used by Garage's
+// node-scoped Admin API. These endpoints return HTTP 200 even when every node
+// failed, so callers must validate both maps before recording an operation as
+// successful.
+func validateMultiNodeSuccess[T any](result multiNodeResponse[T], nodeID, operation string) error {
+	if err := aggregateNodeErrors(result.Error); err != nil {
+		return fmt.Errorf("%s failed: %w", operation, err)
+	}
+	if len(result.Success) == 0 {
+		return fmt.Errorf("%s returned no successful nodes", operation)
+	}
+	if nodeID != "*" && nodeID != workerNodeSelf {
+		if _, ok := result.Success[nodeID]; !ok {
+			return fmt.Errorf("%s returned no success result for node %s", operation, nodeID)
+		}
+	}
+	return nil
+}
+
+func validateMultiNodeCommandResponse(resp []byte, nodeID, operation string) error {
+	var result multiNodeResponse[json.RawMessage]
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return fmt.Errorf("failed to unmarshal %s response: %w", operation, err)
+	}
+	return validateMultiNodeSuccess(result, nodeID, operation)
 }
 
 // RetryBlockResyncResult is the per-node response payload from RetryBlockResync.
@@ -1768,7 +1779,7 @@ func (c *Client) RetryBlockResync(ctx context.Context, nodeID string, all bool, 
 	if err := json.Unmarshal(resp, &multi); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
-	if err := aggregateNodeErrors(multi.Error); err != nil {
+	if err := validateMultiNodeSuccess(multi, nodeID, "RetryBlockResync"); err != nil {
 		return nil, err
 	}
 	var agg RetryBlockResyncResult
@@ -1863,7 +1874,7 @@ func (c *Client) PurgeBlocks(ctx context.Context, nodeID string, hashes []string
 	if err := json.Unmarshal(resp, &multi); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
-	if err := aggregateNodeErrors(multi.Error); err != nil {
+	if err := validateMultiNodeSuccess(multi, nodeID, "PurgeBlocks"); err != nil {
 		return nil, err
 	}
 	var agg PurgeBlocksResult
