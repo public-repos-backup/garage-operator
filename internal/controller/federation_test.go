@@ -860,13 +860,19 @@ var _ = Describe("Federation - addRemoteNodesToLayout", func() {
 			}))
 			defer server.Close()
 
-			remoteStatus := &garage.ClusterStatus{Nodes: []garage.NodeInfo{{
-				ID: remoteID, IsUp: true,
-				Role: &garage.NodeAssignedRole{
-					Zone: testZoneRemote, Capacity: &remoteCapacity,
-					Tags: []string{"cluster:garage/remote-ns", "cluster-uid:remote-uid", testTierStorageTag},
+			remoteStatus := &garage.ClusterStatus{Nodes: []garage.NodeInfo{
+				// A connected remote Admin API reports Garage's global node set,
+				// including this site's still-uncommitted local node. It must not
+				// be reinterpreted through the remote site's zone policy.
+				{ID: localID, IsUp: true},
+				{
+					ID: remoteID, IsUp: true,
+					Role: &garage.NodeAssignedRole{
+						Zone: testZoneRemote, Capacity: &remoteCapacity,
+						Tags: []string{"cluster:garage/remote-ns", "cluster-uid:remote-uid", testTierStorageTag},
+					},
 				},
-			}}}
+			}}
 			remote := garagev1beta2.RemoteClusterConfig{Name: testTagRemoteCluster, Zone: testZoneRemote}
 			localClient := garage.NewClient(server.URL, adminToken)
 

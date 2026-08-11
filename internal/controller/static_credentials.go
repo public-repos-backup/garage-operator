@@ -615,8 +615,58 @@ func (r *GarageClusterReconciler) cleanupUnusedStaticCredentialSnapshots(
 	cluster *garagev1beta2.GarageCluster,
 ) error {
 	inUse := map[string]struct{}{}
+	// The reconcile object can have been replaced by a conflict-driven cached
+	// status read after ensureStaticCredentialSnapshot published a new annotation.
+	// Cleanup is destructive, so establish the current pin again through the
+	// uncached reader and retain both views. Retaining one obsolete revision for
+	// another reconcile is safe; deleting the freshly published revision is not.
 	if current := currentStaticCredentialsSecretName(cluster); current != "" {
 		inUse[current] = struct{}{}
+	}
+	freshCluster := &garagev1beta2.GarageCluster{}
+	clusterKey := client.ObjectKeyFromObject(cluster)
+	if err := r.safetyReader().Get(ctx, clusterKey, freshCluster); err != nil {
+		return fmt.Errorf("re-reading GarageCluster before static credential cleanup: %w", err)
+	}
+	if freshCluster.UID != cluster.UID {
+		return fmt.Errorf("GarageCluster %s was recreated before static credential cleanup", clusterKey)
+	}
+	if current := currentStaticCredentialsSecretName(freshCluster); current != "" {
+		inUse[current] = struct{}{}
+	}
+
+	retainPodSpecSecrets := func(spec corev1.PodSpec) {
+		for i := range spec.Volumes {
+			if secret := spec.Volumes[i].Secret; secret != nil && secret.SecretName != "" {
+				inUse[secret.SecretName] = struct{}{}
+			}
+		}
+		for i := range spec.ImagePullSecrets {
+			if spec.ImagePullSecrets[i].Name != "" {
+				inUse[spec.ImagePullSecrets[i].Name] = struct{}{}
+			}
+		}
+		retainContainerSecrets := func(env []corev1.EnvVar, envFrom []corev1.EnvFromSource) {
+			for i := range env {
+				if source := env[i].ValueFrom; source != nil && source.SecretKeyRef != nil && source.SecretKeyRef.Name != "" {
+					inUse[source.SecretKeyRef.Name] = struct{}{}
+				}
+			}
+			for i := range envFrom {
+				if source := envFrom[i].SecretRef; source != nil && source.Name != "" {
+					inUse[source.Name] = struct{}{}
+				}
+			}
+		}
+		for i := range spec.InitContainers {
+			retainContainerSecrets(spec.InitContainers[i].Env, spec.InitContainers[i].EnvFrom)
+		}
+		for i := range spec.Containers {
+			retainContainerSecrets(spec.Containers[i].Env, spec.Containers[i].EnvFrom)
+		}
+		for i := range spec.EphemeralContainers {
+			retainContainerSecrets(spec.EphemeralContainers[i].Env, spec.EphemeralContainers[i].EnvFrom)
+		}
 	}
 	pods := &corev1.PodList{}
 	if err := r.safetyReader().List(ctx, pods,
@@ -626,18 +676,7 @@ func (r *GarageClusterReconciler) cleanupUnusedStaticCredentialSnapshots(
 		return err
 	}
 	for i := range pods.Items {
-		for _, volume := range pods.Items[i].Spec.Volumes {
-			if volume.Secret != nil && volume.Secret.SecretName != "" {
-				inUse[volume.Secret.SecretName] = struct{}{}
-			}
-		}
-	}
-	retainTemplateSecrets := func(spec corev1.PodSpec) {
-		for i := range spec.Volumes {
-			if secret := spec.Volumes[i].Secret; secret != nil && secret.SecretName != "" {
-				inUse[secret.SecretName] = struct{}{}
-			}
-		}
+		retainPodSpecSecrets(pods.Items[i].Spec)
 	}
 	statefulSets := &appsv1.StatefulSetList{}
 	if err := r.safetyReader().List(ctx, statefulSets,
@@ -646,7 +685,7 @@ func (r *GarageClusterReconciler) cleanupUnusedStaticCredentialSnapshots(
 		return err
 	}
 	for i := range statefulSets.Items {
-		retainTemplateSecrets(statefulSets.Items[i].Spec.Template.Spec)
+		retainPodSpecSecrets(statefulSets.Items[i].Spec.Template.Spec)
 	}
 	daemonSets := &appsv1.DaemonSetList{}
 	if err := r.safetyReader().List(ctx, daemonSets,
@@ -655,7 +694,7 @@ func (r *GarageClusterReconciler) cleanupUnusedStaticCredentialSnapshots(
 		return err
 	}
 	for i := range daemonSets.Items {
-		retainTemplateSecrets(daemonSets.Items[i].Spec.Template.Spec)
+		retainPodSpecSecrets(daemonSets.Items[i].Spec.Template.Spec)
 	}
 	deployments := &appsv1.DeploymentList{}
 	if err := r.safetyReader().List(ctx, deployments,
@@ -664,7 +703,7 @@ func (r *GarageClusterReconciler) cleanupUnusedStaticCredentialSnapshots(
 		return err
 	}
 	for i := range deployments.Items {
-		retainTemplateSecrets(deployments.Items[i].Spec.Template.Spec)
+		retainPodSpecSecrets(deployments.Items[i].Spec.Template.Spec)
 	}
 	secrets := &corev1.SecretList{}
 	if err := r.safetyReader().List(ctx, secrets,
@@ -680,7 +719,23 @@ func (r *GarageClusterReconciler) cleanupUnusedStaticCredentialSnapshots(
 		if _, retained := inUse[secret.Name]; retained || !metav1.IsControlledBy(secret, cluster) {
 			continue
 		}
-		if err := r.Delete(ctx, secret); err != nil && !errors.IsNotFound(err) {
+		// Recheck the cross-object publication immediately before deletion. This
+		// also protects HA operators if another reconciler rotates back to an
+		// existing content-addressed snapshot after the initial inventory.
+		latest := &garagev1beta2.GarageCluster{}
+		if err := r.safetyReader().Get(ctx, clusterKey, latest); err != nil {
+			return fmt.Errorf("re-reading GarageCluster before deleting static credential snapshot %s/%s: %w", secret.Namespace, secret.Name, err)
+		}
+		if latest.UID != cluster.UID {
+			return fmt.Errorf("GarageCluster %s was recreated before deleting static credential snapshot %s/%s", clusterKey, secret.Namespace, secret.Name)
+		}
+		if currentStaticCredentialsSecretName(latest) == secret.Name {
+			continue
+		}
+		uid := secret.UID
+		if err := r.Delete(ctx, secret, &client.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &uid},
+		}); err != nil && !errors.IsNotFound(err) {
 			return fmt.Errorf("deleting unused static credential snapshot %s/%s: %w", secret.Namespace, secret.Name, err)
 		}
 	}

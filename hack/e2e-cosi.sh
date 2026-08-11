@@ -423,7 +423,7 @@ spec:
           printf '%s' "\$expected" > /tmp/input
           aws --endpoint-url "\$S3_ENDPOINT" --region "\$S3_REGION" \
             s3api put-object --bucket "\$S3_BUCKET_ID" \
-            --key e2e/data-plane.txt --body fileb:///tmp/input
+            --key e2e/data-plane.txt --body /tmp/input
           aws --endpoint-url "\$S3_ENDPOINT" --region "\$S3_REGION" \
             s3api get-object --bucket "\$S3_BUCKET_ID" \
             --key e2e/data-plane.txt /tmp/output

@@ -5898,6 +5898,14 @@ spec:
 		})
 
 		It("should leave the external workload running after the handle is deleted", func() {
+			By("removing the data-plane fixture before finalizing its bucket")
+			script := fmt.Sprintf(
+				`aws s3api delete-object --endpoint-url %s --region garage --bucket %s --key obj`,
+				s3Endpoint, bucketName)
+			Eventually(func(g Gomega) {
+				_ = runAWSCLI(g, testNamespace, "handle-s3-cleanup", script, keyName, true)
+			}, 3*time.Minute, 30*time.Second).Should(Succeed())
+
 			By("deleting the CRs the operator manages")
 			for _, args := range [][]string{
 				{"garagekey", keyName}, {"garagekey", deniedKeyName},

@@ -6615,6 +6615,10 @@ func (r *GarageClusterReconciler) addRemoteNodesToLayoutLocked(
 	// Determine the set of remote nodes to process.
 	// Prefer remoteStatus (queried from remote API) when available.
 	// Fall back to localStatus filtered by zone (recovery path when remote is unreachable).
+	localGarageNodes, err := r.liveGarageNodesByID(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("listing local GarageNodes before federated import: %w", err)
+	}
 	var nodesToProcess []garage.NodeInfo
 	if remoteStatus != nil {
 		nodesToProcess = remoteStatus.Nodes
@@ -6630,6 +6634,14 @@ func (r *GarageClusterReconciler) addRemoteNodesToLayoutLocked(
 	newRoles := make([]garage.NodeRoleChange, 0, len(nodesToProcess))
 	intendedRoles := make([]garage.NodeRoleChange, 0, len(nodesToProcess))
 	for _, node := range nodesToProcess {
+		// Once the RPC mesh connects, every site's Admin API reports the same
+		// global node set. During replication-factor bootstrap the local role is
+		// not committed yet, so existingNodes cannot identify it. Do not import
+		// that exact local GarageNode through the remote site's zone/tag policy;
+		// includeLocalGarageNodeStagingIntent proves and admits it below.
+		if localGarageNodes[canonicalGarageNodeID(node.ID)] != nil {
+			continue
+		}
 		if existingNodes[node.ID] {
 			continue // Already in local layout
 		}
@@ -6750,25 +6762,9 @@ func (r *GarageClusterReconciler) includeLocalGarageNodeStagingIntent(
 		seen[intended[i].ID] = true
 	}
 
-	nodes := &garagev1beta1.GarageNodeList{}
-	if err := r.safetyReader().List(ctx, nodes, client.InNamespace(cluster.Namespace)); err != nil {
+	byID, err := r.liveGarageNodesByID(ctx, cluster)
+	if err != nil {
 		return nil, fmt.Errorf("listing GarageNodes to validate federated bootstrap staging: %w", err)
-	}
-	byID := make(map[string]*garagev1beta1.GarageNode)
-	for i := range nodes.Items {
-		node := &nodes.Items[i]
-		if node.Spec.ClusterRef.Name != cluster.Name ||
-			(node.Spec.ClusterRef.Namespace != "" && node.Spec.ClusterRef.Namespace != cluster.Namespace) ||
-			!node.DeletionTimestamp.IsZero() {
-			continue
-		}
-		id := canonicalGarageNodeID(node.Status.NodeID)
-		if id == "" {
-			id = canonicalGarageNodeID(node.Spec.NodeID)
-		}
-		if id != "" {
-			byID[id] = node
-		}
 	}
 
 	nodeReconciler := &GarageNodeReconciler{Client: r.Client, APIReader: r.APIReader}
@@ -6795,6 +6791,33 @@ func (r *GarageClusterReconciler) includeLocalGarageNodeStagingIntent(
 		seen[expected.ID] = true
 	}
 	return intended, nil
+}
+
+func (r *GarageClusterReconciler) liveGarageNodesByID(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+) (map[string]*garagev1beta1.GarageNode, error) {
+	nodes := &garagev1beta1.GarageNodeList{}
+	if err := r.safetyReader().List(ctx, nodes, client.InNamespace(cluster.Namespace)); err != nil {
+		return nil, err
+	}
+	byID := make(map[string]*garagev1beta1.GarageNode)
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		if node.Spec.ClusterRef.Name != cluster.Name ||
+			(node.Spec.ClusterRef.Namespace != "" && node.Spec.ClusterRef.Namespace != cluster.Namespace) ||
+			!node.DeletionTimestamp.IsZero() {
+			continue
+		}
+		id := canonicalGarageNodeID(node.Status.NodeID)
+		if id == "" {
+			id = canonicalGarageNodeID(node.Spec.NodeID)
+		}
+		if id != "" {
+			byID[id] = node
+		}
+	}
+	return byID, nil
 }
 
 // getRemoteAdminToken retrieves the admin token for a remote cluster.
