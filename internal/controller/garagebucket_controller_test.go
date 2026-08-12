@@ -712,6 +712,11 @@ func TestReconcileAliases_RemovesOnlyPreviouslyManaged(t *testing.T) {
 		switch req.URL.Path {
 		case "/v2/AddBucketAlias":
 			adds = append(adds, body)
+			if body.LocalAlias != "" {
+				_, _ = fmt.Fprintf(w, `{"id":%q,"keys":[{"accessKeyId":%q,"name":"alias-key","bucketLocalAliases":[%q]}]}`,
+					bucketID, keyID, body.LocalAlias)
+				return
+			}
 		case testRemoveAliasPath:
 			removes = append(removes, body)
 		default:
@@ -727,8 +732,12 @@ func TestReconcileAliases_RemovesOnlyPreviouslyManaged(t *testing.T) {
 		t.Fatal(err)
 	}
 	currentKeys := []garage.BucketKeyInfo{{AccessKeyID: keyID, BucketLocalAliases: []string{testOldLocalAlias, "manual-local"}}}
-	if err := r.reconcileLocalAliases(ctx, bucket, gc, bucketID, currentKeys); err != nil {
+	aliasSnapshot, err := r.reconcileLocalAliases(ctx, bucket, gc, bucketID, currentKeys)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if aliasSnapshot == nil || !bucketHasLocalAlias(aliasSnapshot.Keys, keyID, "new-local") {
+		t.Fatalf("aliasSnapshot=%+v, want authoritative AddBucketAlias response", aliasSnapshot)
 	}
 	if len(adds) != 2 {
 		t.Fatalf("adds=%+v, want new global and local aliases", adds)
@@ -743,6 +752,63 @@ func TestReconcileAliases_RemovesOnlyPreviouslyManaged(t *testing.T) {
 	}
 	if removes[0].GlobalAlias != testOldGlobalAlias || removes[1].LocalAlias != testOldLocalAlias {
 		t.Fatalf("removes=%+v, want only prior managed aliases", removes)
+	}
+}
+
+func TestUpdateStatusFromGarageUsesAuthoritativeMutationSnapshot(t *testing.T) {
+	const (
+		bucketID = "bucket-alias-snapshot"
+		keyID    = "GKsnapshot"
+		alias    = "local-snapshot"
+	)
+	s := runtime.NewScheme()
+	_ = garagev1beta1.AddToScheme(s)
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "bucket-alias-snapshot",
+			Namespace:  testNamespace,
+			Generation: 2,
+		},
+		Status: garagev1beta1.GarageBucketStatus{BucketID: bucketID},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(bucket).
+		WithStatusSubresource(&garagev1beta1.GarageBucket{}).Build()
+	r := &GarageBucketReconciler{Client: fc, Scheme: s}
+
+	var getCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		getCalls.Add(1)
+		_, _ = w.Write([]byte(`{"id":"stale","keys":[]}`))
+	}))
+	defer srv.Close()
+
+	snapshot := &garage.Bucket{
+		ID: bucketID,
+		Keys: []garage.BucketKeyInfo{{
+			AccessKeyID:        keyID,
+			Name:               "snapshot-key",
+			BucketLocalAliases: []string{alias},
+		}},
+	}
+	if _, err := r.updateStatusFromGarage(
+		context.Background(), bucket, garage.NewClient(srv.URL, "tok"),
+		&garagev1beta2.GarageCluster{}, snapshot,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := getCalls.Load(); got != 0 {
+		t.Fatalf("GetBucketInfo calls=%d, want 0 when an authoritative mutation snapshot is available", got)
+	}
+
+	fresh := &garagev1beta1.GarageBucket{}
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: bucket.Name, Namespace: bucket.Namespace}, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if len(fresh.Status.LocalAliases) != 1 ||
+		fresh.Status.LocalAliases[0].KeyID != keyID ||
+		fresh.Status.LocalAliases[0].KeyName != "snapshot-key" ||
+		fresh.Status.LocalAliases[0].Alias != alias {
+		t.Fatalf("localAliases=%+v, want exact authoritative alias status", fresh.Status.LocalAliases)
 	}
 }
 

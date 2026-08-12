@@ -300,7 +300,8 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Reconcile the bucket
-	if err := r.reconcileBucket(ctx, bucket, garageClient); err != nil {
+	reconcileSnapshot, err := r.reconcileBucket(ctx, bucket, garageClient)
+	if err != nil {
 		// A wedged GetBucketInfo is informational, not a reconcile failure.
 		// Bail with a stuck-bucket signal instead of marking PhaseFailed; the
 		// rest of the reconcile (cluster ref, owner ref, finalizer) already
@@ -316,7 +317,7 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.updateStatus(ctx, bucket, PhaseFailed, err)
 	}
 
-	return r.updateStatusFromGarage(ctx, bucket, garageClient, cluster)
+	return r.updateStatusFromGarage(ctx, bucket, garageClient, cluster, reconcileSnapshot)
 }
 
 func isCOSIManagedPendingOrBoundShadow(object metav1.Object) bool {
@@ -403,7 +404,7 @@ func (r *GarageBucketReconciler) validatedCOSIRetain(ctx context.Context, bucket
 	return true, nil
 }
 
-func (r *GarageBucketReconciler) reconcileBucket(ctx context.Context, bucket *garagev1beta1.GarageBucket, garageClient *garage.Client) error {
+func (r *GarageBucketReconciler) reconcileBucket(ctx context.Context, bucket *garagev1beta1.GarageBucket, garageClient *garage.Client) (*garage.Bucket, error) {
 	log := logf.FromContext(ctx)
 
 	alias := bucket.Name
@@ -414,7 +415,7 @@ func (r *GarageBucketReconciler) reconcileBucket(ctx context.Context, bucket *ga
 	prevBucketID := bucket.Status.BucketID
 	existingBucket, err := r.getOrCreateBucket(ctx, bucket, garageClient, alias)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Persist status.BucketID immediately whenever it is newly learned or created.
@@ -422,29 +423,30 @@ func (r *GarageBucketReconciler) reconcileBucket(ctx context.Context, bucket *ga
 	// causes the next reconcile to lose track of the bucket and create a duplicate.
 	if bucket.Status.BucketID != prevBucketID {
 		if err := UpdateStatusWithRetry(ctx, r.Client, bucket); err != nil {
-			return fmt.Errorf("failed to persist bucket ID: %w", err)
+			return nil, fmt.Errorf("failed to persist bucket ID: %w", err)
 		}
 	}
 
 	// Ensure the global alias is set. This is an explicit idempotent step because
 	// CreateBucket no longer sets the alias atomically — see getOrCreateBucket for why.
 	if err := r.reconcileGlobalAlias(ctx, bucket, garageClient, existingBucket.ID, alias, existingBucket.GlobalAliases); err != nil {
-		return err
+		return nil, err
 	}
 	if err := r.clearBucketReservationAlias(ctx, bucket, garageClient, existingBucket, alias); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := r.updateBucketSettings(ctx, bucket, garageClient, existingBucket); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := r.reconcileKeyPermissions(ctx, bucket, garageClient, existingBucket); err != nil {
-		return err
+		return nil, err
 	}
 
-	if err := r.reconcileLocalAliases(ctx, bucket, garageClient, existingBucket.ID, existingBucket.Keys); err != nil {
-		return err
+	aliasSnapshot, err := r.reconcileLocalAliases(ctx, bucket, garageClient, existingBucket.ID, existingBucket.Keys)
+	if err != nil {
+		return nil, err
 	}
 
 	// lifecycle is auxiliary: failures flip the LifecycleConfigured condition
@@ -452,7 +454,7 @@ func (r *GarageBucketReconciler) reconcileBucket(ctx context.Context, bucket *ga
 	r.reconcileLifecycleSafe(ctx, bucket, existingBucket.ID, garageClient)
 
 	log.V(1).Info("Bucket reconciled successfully", "bucketID", existingBucket.ID)
-	return nil
+	return aliasSnapshot, nil
 }
 
 func (r *GarageBucketReconciler) getOrCreateBucket(ctx context.Context, bucket *garagev1beta1.GarageBucket, garageClient *garage.Client, alias string) (*garage.Bucket, error) {
@@ -1078,26 +1080,27 @@ func keyPermissionsForBucket(key *garagev1beta1.GarageKey, bucket *garagev1beta1
 	return desired, found
 }
 
-func (r *GarageBucketReconciler) reconcileLocalAliases(ctx context.Context, bucket *garagev1beta1.GarageBucket, garageClient *garage.Client, bucketID string, currentKeys []garage.BucketKeyInfo) error {
+func (r *GarageBucketReconciler) reconcileLocalAliases(ctx context.Context, bucket *garagev1beta1.GarageBucket, garageClient *garage.Client, bucketID string, currentKeys []garage.BucketKeyInfo) (*garage.Bucket, error) {
 	log := logf.FromContext(ctx)
 	desired := make(map[string]garagev1beta1.LocalAliasStatus, len(bucket.Spec.LocalAliases))
+	var authoritativeSnapshot *garage.Bucket
 
 	for _, localAlias := range bucket.Spec.LocalAliases {
 		key := &garagev1beta1.GarageKey{}
 		if err := r.Get(ctx, types.NamespacedName{Name: localAlias.KeyRef, Namespace: bucket.Namespace}, key); err != nil {
 			if errors.IsNotFound(err) {
 				log.Info("Key for local alias not found, will retry", "keyRef", localAlias.KeyRef, "alias", localAlias.Alias)
-				return fmt.Errorf("waiting for key %s to be ready before reconciling local aliases", localAlias.KeyRef)
+				return nil, fmt.Errorf("waiting for key %s to be ready before reconciling local aliases", localAlias.KeyRef)
 			}
-			return fmt.Errorf("failed to get key %s for local alias: %w", localAlias.KeyRef, err)
+			return nil, fmt.Errorf("failed to get key %s for local alias: %w", localAlias.KeyRef, err)
 		}
 
 		if key.Status.AccessKeyID == "" {
 			log.Info("Key for local alias not yet created, will retry", "keyRef", localAlias.KeyRef, "alias", localAlias.Alias)
-			return fmt.Errorf("waiting for key %s to be ready before reconciling local aliases", localAlias.KeyRef)
+			return nil, fmt.Errorf("waiting for key %s to be ready before reconciling local aliases", localAlias.KeyRef)
 		}
 		if !sameClusterForBucketAndKey(bucket, key) {
-			return fmt.Errorf("local alias key GarageKey %s/%s targets a different GarageCluster", key.Namespace, key.Name)
+			return nil, fmt.Errorf("local alias key GarageKey %s/%s targets a different GarageCluster", key.Namespace, key.Name)
 		}
 		desired[key.Status.AccessKeyID+"\x00"+localAlias.Alias] = garagev1beta1.LocalAliasStatus{KeyID: key.Status.AccessKeyID, Alias: localAlias.Alias}
 	}
@@ -1111,25 +1114,32 @@ func (r *GarageBucketReconciler) reconcileLocalAliases(ctx context.Context, buck
 	if !apiequality.Semantic.DeepEqual(bucket.Status.ManagedLocalAliases, reserved) {
 		bucket.Status.ManagedLocalAliases = reserved
 		if err := UpdateStatusWithRetry(ctx, r.Client, bucket); err != nil {
-			return fmt.Errorf("failed to reserve managed local aliases: %w", err)
+			return nil, fmt.Errorf("failed to reserve managed local aliases: %w", err)
 		}
 	}
 
 	// Add before removing so a rename never leaves the bucket without an alias.
 	for _, item := range desired {
-		_, err := garageClient.AddBucketAlias(ctx, garage.AddBucketAliasRequest{
+		updated, err := garageClient.AddBucketAlias(ctx, garage.AddBucketAliasRequest{
 			BucketID:    bucketID,
 			LocalAlias:  item.Alias,
 			AccessKeyID: item.KeyID,
 		})
 		if err != nil {
 			if !garage.IsConflict(err) {
-				return fmt.Errorf("failed to add local alias %s:%s: %w", item.KeyID, item.Alias, err)
+				return nil, fmt.Errorf("failed to add local alias %s:%s: %w", item.KeyID, item.Alias, err)
 			}
 			resolved, lookupErr := garageClient.GetBucket(ctx, garage.GetBucketRequest{ID: bucketID})
-			if lookupErr != nil || !bucketHasLocalAlias(resolved.Keys, item.KeyID, item.Alias) {
-				return fmt.Errorf("local alias %s:%s conflicts with another bucket: add failed: %w", item.KeyID, item.Alias, err)
+			if lookupErr != nil || resolved.ID != bucketID || !bucketHasLocalAlias(resolved.Keys, item.KeyID, item.Alias) {
+				return nil, fmt.Errorf("local alias %s:%s conflicts with another bucket: add failed: %w", item.KeyID, item.Alias, err)
 			}
+			authoritativeSnapshot = resolved
+		} else if updated != nil && updated.ID == bucketID {
+			// AddBucketAlias returns the post-mutation bucket from the Garage node
+			// that committed the write. Preserve it for status publication: an
+			// immediate GetBucketInfo through the Service can hit another replica
+			// before that replica observes the alias.
+			authoritativeSnapshot = updated
 		}
 	}
 
@@ -1153,21 +1163,24 @@ func (r *GarageBucketReconciler) reconcileLocalAliases(ctx context.Context, buck
 		if !previousExists {
 			continue
 		}
-		_, err := garageClient.RemoveBucketAlias(ctx, garage.RemoveBucketAliasRequest{
+		updated, err := garageClient.RemoveBucketAlias(ctx, garage.RemoveBucketAliasRequest{
 			BucketID: bucketID, LocalAlias: previous.Alias, AccessKeyID: previous.KeyID,
 		})
 		if err != nil && !garage.IsNotFound(err) {
-			return fmt.Errorf("failed to remove previously managed local alias %s:%s: %w", previous.KeyID, previous.Alias, err)
+			return nil, fmt.Errorf("failed to remove previously managed local alias %s:%s: %w", previous.KeyID, previous.Alias, err)
+		}
+		if err == nil && updated != nil && updated.ID == bucketID {
+			authoritativeSnapshot = updated
 		}
 	}
 
 	if !apiequality.Semantic.DeepEqual(bucket.Status.ManagedLocalAliases, managed) {
 		bucket.Status.ManagedLocalAliases = managed
 		if err := UpdateStatusWithRetry(ctx, r.Client, bucket); err != nil {
-			return fmt.Errorf("failed to persist managed local aliases: %w", err)
+			return nil, fmt.Errorf("failed to persist managed local aliases: %w", err)
 		}
 	}
-	return nil
+	return authoritativeSnapshot, nil
 }
 
 func sortLocalAliasStatuses(aliases []garagev1beta1.LocalAliasStatus) {
@@ -1348,21 +1361,25 @@ func (r *GarageBucketReconciler) updateStatus(ctx context.Context, bucket *garag
 	return ctrl.Result{}, nil
 }
 
-func (r *GarageBucketReconciler) updateStatusFromGarage(ctx context.Context, bucket *garagev1beta1.GarageBucket, garageClient *garage.Client, cluster *garagev1beta2.GarageCluster) (ctrl.Result, error) {
+func (r *GarageBucketReconciler) updateStatusFromGarage(ctx context.Context, bucket *garagev1beta1.GarageBucket, garageClient *garage.Client, cluster *garagev1beta2.GarageCluster, reconcileSnapshot *garage.Bucket) (ctrl.Result, error) {
 	if bucket.Status.BucketID == "" {
 		return r.updateStatus(ctx, bucket, "Pending", nil)
 	}
 
-	// Get bucket info from Garage
-	garageBucket, err := getBucketWithTimeout(ctx, garageClient, garage.GetBucketRequest{ID: bucket.Status.BucketID})
-	if err != nil {
-		if isBucketLookupTimeout(err) {
-			return r.handleBucketLookupTimeout(ctx, bucket)
+	garageBucket := reconcileSnapshot
+	if garageBucket == nil {
+		// No mutation response is available, so read the current Garage state.
+		var err error
+		garageBucket, err = getBucketWithTimeout(ctx, garageClient, garage.GetBucketRequest{ID: bucket.Status.BucketID})
+		if err != nil {
+			if isBucketLookupTimeout(err) {
+				return r.handleBucketLookupTimeout(ctx, bucket)
+			}
+			if garage.IsMetadataDecodeError(err) {
+				return r.handleBucketDecodeError(ctx, bucket, cluster)
+			}
+			return r.updateStatus(ctx, bucket, PhaseFailed, fmt.Errorf("failed to get bucket info: %w", err))
 		}
-		if garage.IsMetadataDecodeError(err) {
-			return r.handleBucketDecodeError(ctx, bucket, cluster)
-		}
-		return r.updateStatus(ctx, bucket, PhaseFailed, fmt.Errorf("failed to get bucket info: %w", err))
 	}
 	// First success after one or more timeouts/decode errors → reset counters
 	// and clear transient conditions so they self-heal.
