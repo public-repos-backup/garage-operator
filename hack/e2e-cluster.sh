@@ -2539,9 +2539,12 @@ EOF
             -o jsonpath='{.status.bucketId}' 2>/dev/null)
         local alias_deadline=$((SECONDS + 60))
         while [ "$SECONDS" -lt "$alias_deadline" ]; do
-            alias_count=$(garage_admin_get "/v2/GetBucketInfo?id=${alias_bucket_id}" 2>/dev/null | \
-                jq -r --arg key_id "$test_key_id" \
-                '[.keys[]? | select(.accessKeyId == $key_id and any(.bucketLocalAliases[]?; . == "my-local-alias"))] | length' \
+            # Garage v2.2 omits local-alias-only keys from GetBucketInfo unless
+            # they also have bucket permissions. ListBuckets is the canonical
+            # v2.2 API surface for the exact key-to-local-alias association.
+            alias_count=$(garage_admin_get "/v2/ListBuckets" 2>/dev/null | \
+                jq -r --arg bucket_id "$alias_bucket_id" --arg key_id "$test_key_id" \
+                '[.[]? | select(.id == $bucket_id) | .localAliases[]? | select(.accessKeyId == $key_id and .alias == "my-local-alias")] | length' \
                 2>/dev/null || echo "0")
             if [ "$alias_count" -ge 1 ] 2>/dev/null; then
                 test_pass "Garage reports local alias my-local-alias for GarageKey/test-key's exact access key"
