@@ -2534,21 +2534,24 @@ EOF
 
     if check_resource_phase "garagebucket" "alias-test-bucket" "Ready" 60; then
         local alias_count=0
+        local alias_bucket_id
+        alias_bucket_id=$(kubectl get garagebucket alias-test-bucket -n "$NAMESPACE" \
+            -o jsonpath='{.status.bucketId}' 2>/dev/null)
         local alias_deadline=$((SECONDS + 60))
         while [ "$SECONDS" -lt "$alias_deadline" ]; do
-            alias_count=$(kubectl get garagebucket alias-test-bucket -n "$NAMESPACE" -o json 2>/dev/null | \
+            alias_count=$(garage_admin_get "/v2/GetBucketInfo?id=${alias_bucket_id}" 2>/dev/null | \
                 jq -r --arg key_id "$test_key_id" \
-                '[.status.localAliases[]? | select(.keyId == $key_id and .alias == "my-local-alias")] | length' \
+                '[.keys[]? | select(.accessKeyId == $key_id and any(.bucketLocalAliases[]?; . == "my-local-alias"))] | length' \
                 2>/dev/null || echo "0")
             if [ "$alias_count" -ge 1 ] 2>/dev/null; then
-                test_pass "Local alias my-local-alias is reported for GarageKey/test-key's exact access key"
+                test_pass "Garage reports local alias my-local-alias for GarageKey/test-key's exact access key"
                 kubectl delete garagebucket alias-test-bucket -n "$NAMESPACE" 2>/dev/null || true
                 return 0
             fi
             sleep 3
         done
     fi
-    test_fail "Local alias my-local-alias was not reported for GarageKey/test-key's exact access key"
+    test_fail "Garage did not report local alias my-local-alias for GarageKey/test-key's exact access key"
     kubectl delete garagebucket alias-test-bucket -n "$NAMESPACE" 2>/dev/null || true
     return 1
 }

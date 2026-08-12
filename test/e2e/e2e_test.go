@@ -1606,12 +1606,27 @@ spec:
 			}, 3*time.Minute, 30*time.Second).Should(Succeed())
 
 			By("cleaning up drift test resources")
-			cmd := exec.Command("kubectl", "delete", "garagekey", driftKeyName,
-				"-n", testNamespace, "--ignore-not-found")
-			_, _ = utils.Run(cmd)
-			cmd = exec.Command("kubectl", "delete", "garagebucket", "drift-test-bucket",
-				"-n", testNamespace, "--ignore-not-found")
-			_, _ = utils.Run(cmd)
+			deleteObjectCmd := fmt.Sprintf(
+				`aws s3api delete-object --endpoint-url %s --region garage --bucket %s --key %s`,
+				endpoint, driftBucketID, testObject,
+			)
+			Eventually(func(g Gomega) {
+				output := runAWSCLI(g, testNamespace, "drift-s3-delete-object", deleteObjectCmd, driftKeyName, true)
+				g.Expect(output).NotTo(ContainSubstring("An error occurred"),
+					"DeleteObject failed. Full output: %s", output)
+			}, 2*time.Minute, 10*time.Second).Should(Succeed())
+
+			// Finalize the now-empty bucket while the recovered key and its Secret
+			// still exist. Deleting the key first needlessly removes the exact
+			// credential path that this cleanup has just proven works.
+			cmd := exec.Command("kubectl", "delete", "garagebucket", "drift-test-bucket",
+				"-n", testNamespace, "--ignore-not-found", "--timeout=2m")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete empty drift test bucket: %s", output)
+			cmd = exec.Command("kubectl", "delete", "garagekey", driftKeyName,
+				"-n", testNamespace, "--ignore-not-found", "--timeout=2m")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete drift test key: %s", output)
 		})
 
 		It("should register gateway nodes in the cluster layout with capacity=nil", func() {
