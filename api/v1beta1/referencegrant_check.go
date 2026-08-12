@@ -23,6 +23,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const (
+	garageBucketKind = "GarageBucket"
+	garageKeyKind    = "GarageKey"
+)
+
 // checkReferenceGrant returns nil if a cross-namespace reference is permitted by a
 // GarageReferenceGrant in the target namespace, or an error describing the missing grant.
 //
@@ -33,7 +38,7 @@ import (
 // toName: name of the resource being referenced
 //
 // Same-namespace references always pass without a grant.
-func checkReferenceGrant(ctx context.Context, c client.Client, fromKind, fromNamespace, toKind, toNamespace, toName string) error {
+func checkReferenceGrant(ctx context.Context, c client.Reader, fromKind, fromNamespace, toKind, toNamespace, toName string) error {
 	if fromNamespace == toNamespace {
 		return nil
 	}
@@ -58,6 +63,13 @@ func checkReferenceGrant(ctx context.Context, c client.Client, fromKind, fromNam
 	)
 }
 
+// CheckReferenceGrant applies the same cross-namespace authorization during
+// reconciliation as admission. This prevents persisted objects from continuing
+// to mutate Garage after a grant is removed or when admission was bypassed.
+func CheckReferenceGrant(ctx context.Context, c client.Reader, fromKind, fromNamespace, toKind, toNamespace, toName string) error {
+	return checkReferenceGrant(ctx, c, fromKind, fromNamespace, toKind, toNamespace, toName)
+}
+
 // grantPermits reports whether a GarageReferenceGrant permits the described reference.
 func grantPermits(grant *GarageReferenceGrant, fromKind, fromNamespace, toKind, toName string) bool {
 	fromMatched := false
@@ -71,9 +83,12 @@ func grantPermits(grant *GarageReferenceGrant, fromKind, fromNamespace, toKind, 
 		return false
 	}
 
-	// No To entries means all resources in this namespace are accessible.
+	// Preserve the original API contract: an omitted To list grants only the
+	// resource kinds that existed when GarageReferenceGrant was introduced.
+	// Newly referenceable kinds require an explicit opt-in so an old broad grant
+	// cannot silently expand its authority after an operator upgrade.
 	if len(grant.Spec.To) == 0 {
-		return true
+		return toKind == garageClusterKind || toKind == garageBucketKind
 	}
 
 	for _, t := range grant.Spec.To {
@@ -82,4 +97,11 @@ func grantPermits(grant *GarageReferenceGrant, fromKind, fromNamespace, toKind, 
 		}
 	}
 	return false
+}
+
+// GrantPermits reports whether this exact grant authorizes a reference. Status
+// accounting uses it to avoid attributing every reference in a destination
+// namespace to every grant there.
+func GrantPermits(grant *GarageReferenceGrant, fromKind, fromNamespace, toKind, toName string) bool {
+	return grantPermits(grant, fromKind, fromNamespace, toKind, toName)
 }

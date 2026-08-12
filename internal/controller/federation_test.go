@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
@@ -801,6 +802,91 @@ var _ = Describe("Federation - addRemoteNodesToLayout", func() {
 	})
 
 	Context("when remoteStatus is provided (normal path)", func() {
+		It("refuses an unknown staged role during federated bootstrap", func() {
+			intended := []garage.NodeRoleChange{{ID: strings.Repeat("b", 64), Zone: testZoneRemote}}
+			layout := &garage.ClusterLayout{StagedRoleChanges: []garage.NodeRoleChange{{
+				ID: strings.Repeat("c", 64), Zone: testZoneLocal,
+			}}}
+
+			_, err := reconciler.includeLocalGarageNodeStagingIntent(ctx, cluster, layout, intended)
+			Expect(err).To(MatchError(ContainSubstring("is not an assignable live GarageNode")))
+		})
+
+		It("commits an exact staged local GarageNode role with the remote bootstrap role", func() {
+			localID := strings.Repeat("a", 64)
+			remoteID := strings.Repeat("b", 64)
+			localCapacity := uint64(10 * 1024 * 1024 * 1024)
+			remoteCapacity := uint64(10 * 1024 * 1024 * 1024)
+			localRole := garage.NodeRoleChange{
+				ID:       localID,
+				Zone:     testZoneLocal,
+				Capacity: &localCapacity,
+				Tags: desiredNodeRoleTags(nil, "",
+					"cluster:"+clusterName+"/"+testNamespace,
+					testTierStorageTag,
+				),
+			}
+			staged := []garage.NodeRoleChange{localRole}
+			var updateCalls, applyCalls atomic.Int32
+
+			node := &garagev1beta1.GarageNode{
+				ObjectMeta: metav1.ObjectMeta{Name: "local-storage", Namespace: testNamespace},
+				Spec: garagev1beta1.GarageNodeSpec{
+					ClusterRef: garagev1beta1.ClusterReference{Name: clusterName},
+					NodeID:     localID,
+					Zone:       testZoneLocal,
+					Capacity:   ptrQuantity(resource.MustParse("10Gi")),
+				},
+			}
+			Expect(k8sClient.Create(ctx, node)).To(Succeed())
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch req.URL.Path {
+				case pathGetLayoutHistory:
+					_ = json.NewEncoder(w).Encode(settledLayoutHistoryResponse())
+				case pathGetClusterLayout:
+					_ = json.NewEncoder(w).Encode(garage.ClusterLayout{Version: 1, StagedRoleChanges: staged})
+				case pathUpdateLayout:
+					var update garage.UpdateClusterLayoutRequest
+					_ = json.NewDecoder(req.Body).Decode(&update)
+					staged = append(staged, update.Roles...)
+					updateCalls.Add(1)
+				case pathApplyLayout:
+					applyCalls.Add(1)
+				default:
+					w.WriteHeader(http.StatusOK)
+				}
+			}))
+			defer server.Close()
+
+			remoteStatus := &garage.ClusterStatus{Nodes: []garage.NodeInfo{
+				// A connected remote Admin API reports Garage's global node set,
+				// including this site's still-uncommitted local node. It must not
+				// be reinterpreted through the remote site's zone policy.
+				{ID: localID, IsUp: true},
+				{
+					ID: remoteID, IsUp: true,
+					Role: &garage.NodeAssignedRole{
+						Zone: testZoneRemote, Capacity: &remoteCapacity,
+						Tags: []string{"cluster:garage/remote-ns", "cluster-uid:remote-uid", testTierStorageTag},
+					},
+				},
+			}}
+			remote := garagev1beta2.RemoteClusterConfig{Name: testTagRemoteCluster, Zone: testZoneRemote}
+			localClient := garage.NewClient(server.URL, adminToken)
+
+			err := reconciler.addRemoteNodesToLayout(
+				ctx, cluster, localClient, localClient, remoteStatus, &garage.ClusterStatus{}, remote,
+			)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(updateCalls.Load()).To(Equal(int32(1)))
+			Expect(applyCalls.Load()).To(Equal(int32(1)))
+			Expect(staged).To(HaveLen(2))
+			Expect(staged[0]).To(Equal(localRole))
+			Expect(staged[1].ID).To(Equal(remoteID))
+		})
+
 		It("should use remoteStatus nodes for layout updates", func() {
 			cap := uint64(107374182400)
 			var updatedRoles []garage.NodeRoleChange

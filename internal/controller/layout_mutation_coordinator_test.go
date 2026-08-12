@@ -626,13 +626,13 @@ func TestResolveGarageLayoutOwnerFollowsCanonicalChains(t *testing.T) {
 		}},
 	}
 	handleA := &garagev1beta2.GarageCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "handle-a", Namespace: testEdgeValue},
+		ObjectMeta: metav1.ObjectMeta{Name: "handle-a", Namespace: testGarageValue},
 		Spec: garagev1beta2.GarageClusterSpec{ConnectTo: &garagev1beta2.ConnectToConfig{
 			ClusterRef: &garagev1beta2.ClusterReference{Name: handleB.Name, Namespace: handleB.Namespace},
 		}},
 	}
 	edge := &garagev1beta2.GarageCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: testEdgeValue, Namespace: testEdgeValue},
+		ObjectMeta: metav1.ObjectMeta{Name: testEdgeValue, Namespace: testGarageValue},
 		Spec: garagev1beta2.GarageClusterSpec{
 			Gateway:   &garagev1beta2.GatewaySpec{},
 			ConnectTo: &garagev1beta2.ConnectToConfig{ClusterRef: &garagev1beta2.ClusterReference{Name: handleA.Name}},

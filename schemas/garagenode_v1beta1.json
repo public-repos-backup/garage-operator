@@ -829,7 +829,7 @@
           "description": "ClusterRef references the GarageCluster this node belongs to.\nThe GarageNode inherits configuration from this cluster.",
           "properties": {
             "kubeConfigSecretRef": {
-              "description": "KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.\nOnly needed for multi-cluster federation where the GarageCluster lives in a different\nKubernetes cluster entirely (not just a different namespace).",
+              "description": "KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.\nIt is currently rejected by admission because the operator does not use it.",
               "properties": {
                 "key": {
                   "description": "The key of the secret to select from.  Must be a valid secret key.",
@@ -1235,10 +1235,10 @@
               "type": "integer"
             },
             "remoteClusterRef": {
-              "description": "RemoteClusterRef references a GarageCluster in another namespace/cluster",
+              "description": "RemoteClusterRef is retained for API compatibility but is not supported.\nSetting it is rejected because the operator has no remote-cluster client\nintegration for GarageNode reconciliation.",
               "properties": {
                 "kubeConfigSecretRef": {
-                  "description": "KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.\nOnly needed for multi-cluster federation where the GarageCluster lives in a different\nKubernetes cluster entirely (not just a different namespace).",
+                  "description": "KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.\nIt is currently rejected by admission because the operator does not use it.",
                   "properties": {
                     "key": {
                       "description": "The key of the secret to select from.  Must be a valid secret key.",
@@ -1404,17 +1404,17 @@
           "description": "PublicEndpoint configures a Kubernetes Service exposing this node's RPC port.\nParallel to GarageCluster's spec.publicEndpoint. When set to LoadBalancer type\nwithout network.rpcPublicAddr, the operator derives rpc_public_addr from the\nassigned ingress IP automatically.",
           "properties": {
             "externalIP": {
-              "description": "ExternalIP configuration",
+              "description": "ExternalIP is retained for API compatibility but is not supported.\nSetting it is rejected because the operator does not consume the explicit\naddress mapping or template.",
               "properties": {
                 "addressTemplate": {
-                  "description": "AddressTemplate uses go template to generate addresses from pod info\nExample: \"garage-{{.Index}}.example.com\"",
+                  "description": "AddressTemplate is retained for API compatibility but is unsupported.",
                   "type": "string"
                 },
                 "addresses": {
                   "additionalProperties": {
                     "type": "string"
                   },
-                  "description": "Addresses maps pod names to external IPs",
+                  "description": "Addresses is retained for API compatibility but is unsupported.",
                   "type": "object"
                 }
               },
@@ -2271,7 +2271,7 @@
           "type": "string"
         },
         "blockErrors": {
-          "description": "BlockErrors is the count of blocks with sync errors on this node",
+          "description": "BlockErrors is retained for API compatibility but is not currently populated;\nGarage's node-status API does not expose a per-node block error count.",
           "format": "int32",
           "type": "integer"
         },
@@ -2423,11 +2423,11 @@
           "additionalProperties": false
         },
         "dbEngine": {
-          "description": "DBEngine is the database engine used by this node (lmdb, sqlite, fjall)",
+          "description": "DBEngine is retained for API compatibility but is not currently populated;\nGarage's node-status API does not report the active database engine.",
           "type": "string"
         },
         "garageFeatures": {
-          "description": "GarageFeatures lists the enabled Cargo features on this node",
+          "description": "GarageFeatures is retained for API compatibility but is not currently\npopulated because Garage's node-status API does not report build features.",
           "items": {
             "type": "string"
           },
@@ -2450,6 +2450,43 @@
           "description": "LayoutVersion is the layout version when this node was added",
           "format": "int64",
           "type": "integer"
+        },
+        "managedPVCs": {
+          "description": "ManagedPVCs records convention-named PVC reservations made by this\ncontroller. A pending entry contains only a one-way nonce commitment; a\nbound entry contains the exact server-assigned UID. Names and public\nannotations are not ownership proof. Legacy claims are pinned here once\nwhile their exact live StatefulSet and Pod still prove continuity.",
+          "items": {
+            "description": "ManagedNodePVCStatus is the controller-owned identity reservation for one\nconvention-named GarageNode PVC.",
+            "properties": {
+              "name": {
+                "description": "Name is the exact PersistentVolumeClaim name.",
+                "type": "string"
+              },
+              "pendingReservationHash": {
+                "description": "PendingReservationHash is a SHA-256 commitment to a cryptographically\nrandom nonce stamped on a PVC before its UID can be observed. It closes\nthe create/status-update crash window without making the public status\nvalue sufficient to forge a controller reservation.\nExactly one of UID and PendingReservationHash is set.",
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "uid": {
+                "description": "UID is the immutable API-server identity observed when the claim was\ncreated or safely migrated.\nExactly one of UID and PendingReservationHash is set.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object",
+            "x-kubernetes-validations": [
+              {
+                "message": "exactly one of uid and pendingReservationHash must be set",
+                "rule": "has(self.uid) != has(self.pendingReservationHash)"
+              }
+            ],
+            "additionalProperties": false
+          },
+          "type": "array",
+          "x-kubernetes-list-map-keys": [
+            "name"
+          ],
+          "x-kubernetes-list-type": "map"
         },
         "metadataPartition": {
           "description": "MetadataPartition contains disk space info for the metadata partition",
@@ -2527,15 +2564,15 @@
           "type": "string"
         },
         "repairInProgress": {
-          "description": "RepairInProgress indicates if a repair operation is running",
+          "description": "RepairInProgress is retained for API compatibility but is not currently\npopulated because Garage's Admin API exposes no per-node repair status.",
           "type": "boolean"
         },
         "repairProgress": {
-          "description": "RepairProgress is a human-readable repair progress description",
+          "description": "RepairProgress is retained for API compatibility but is not currently populated.",
           "type": "string"
         },
         "repairType": {
-          "description": "RepairType is the type of repair operation in progress",
+          "description": "RepairType is retained for API compatibility but is not currently populated.",
           "type": "string"
         },
         "storedData": {
@@ -2547,7 +2584,7 @@
               "type": "string"
             }
           ],
-          "description": "StoredData is the amount of data stored on this node",
+          "description": "StoredData is retained for API compatibility but is not currently populated;\nGarage reports assigned partitions and disk free space, not per-node stored bytes.",
           "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))))?$",
           "x-kubernetes-int-or-string": true
         },

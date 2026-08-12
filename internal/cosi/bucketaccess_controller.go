@@ -81,34 +81,81 @@ func (r *BucketAccessReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if access.Status.DriverName != r.DriverName {
 		return reconcile.Result{}, nil
 	}
-
-	// Garage does not support ServiceAccount-based authentication.
-	if access.Status.AuthenticationType == cosiv1alpha2.BucketAccessAuthenticationTypeServiceAccount {
-		return r.fail(ctx, access, errors.New("ServiceAccount auth not supported by Garage"))
+	identity, err := r.Provisioner.ResolveBucketAccessIdentity(
+		ctx, access.Namespace, access.Name, string(access.UID), access.Status.AccountID, r.DriverName,
+	)
+	if err != nil {
+		return r.fail(ctx, access, fmt.Errorf("resolve BucketAccess identity: %w", err))
+	}
+	if identity.DuplicateCanonicalIdentity != "" {
+		done, err := r.Provisioner.CleanupDuplicateAccessIdentity(ctx, identity.DuplicateCanonicalIdentity)
+		if err != nil {
+			return r.fail(ctx, access, fmt.Errorf("clean duplicate BucketAccess identity: %w", err))
+		}
+		if !done {
+			return reconcile.Result{RequeueAfter: time.Second}, nil
+		}
+		return reconcile.Result{Requeue: true}, nil
+	}
+	accessIdentity := identity.Identity
+	ownsLegacyAccount := identity.OwnsLegacyAccount
+	sharedLegacyAccount := identity.SharedLegacyAccount
+	if !access.GetDeletionTimestamp().IsZero() && access.Status.AccountID == "" {
+		done, err := r.Provisioner.CancelAccessProvisioning(ctx, accessIdentity)
+		if err != nil {
+			return r.fail(ctx, access, fmt.Errorf("cancel pending access provisioning: %w", err))
+		}
+		if !done {
+			return reconcile.Result{RequeueAfter: time.Second}, nil
+		}
+		r.completeCleanupHandoff(access)
+		if err := r.Update(ctx, access); err != nil {
+			return reconcile.Result{}, err
+		}
+		logger.Info("Pending BucketAccess provisioning cancelled")
+		return reconcile.Result{}, nil
 	}
 
 	// Parameters are copied onto Status.Parameters by the upstream controller.
 	params, err := ParseBucketAccessClassParameters(access.Status.Parameters, r.Namespace)
 	if err != nil {
-		return r.fail(ctx, access, fmt.Errorf("parse params: %w", err))
+		if access.DeletionTimestamp.IsZero() {
+			return r.fail(ctx, access, fmt.Errorf("parse params: %w", err))
+		}
+		// Older sidecars could omit Parameters on revoke. RevokeAccess can
+		// recover the cluster from the authoritative shadow account ID.
+		params = nil
 	}
 
 	if !access.GetDeletionTimestamp().IsZero() {
 		if access.Status.AccountID != "" {
-			bucketIDs := r.resolveBucketIDs(ctx, access)
-			if err := r.Provisioner.RevokeAccess(ctx, access.Status.AccountID, bucketIDs, params); err != nil {
-				return r.fail(ctx, access, err)
+			if !sharedLegacyAccount {
+				bucketIDs := r.resolveBucketIDs(ctx, access)
+				if err := r.Provisioner.RevokeAccess(ctx, access.Status.AccountID, bucketIDs, params); err != nil {
+					return r.fail(ctx, access, err)
+				}
 			}
 		}
-		ctrlutil.RemoveFinalizer(access, cosiv1alpha2.ProtectionFinalizer)
+		r.completeCleanupHandoff(access)
 		if err := r.Update(ctx, access); err != nil {
 			return reconcile.Result{}, err
 		}
 		logger.Info("BucketAccess deleted", "accountId", access.Status.AccountID)
 		return reconcile.Result{}, nil
 	}
+	// Garage does not support ServiceAccount-based authentication. Validate this
+	// only for provisioning; an old malformed object must still be deletable.
+	if access.Status.AuthenticationType == cosiv1alpha2.BucketAccessAuthenticationTypeServiceAccount {
+		return r.fail(ctx, access, errors.New("ServiceAccount auth not supported by Garage"))
+	}
+	if err := validateS3AccessProtocol(access.Spec.Protocol); err != nil {
+		return r.fail(ctx, access, err)
+	}
+	if sharedLegacyAccount && !ownsLegacyAccount {
+		return r.fail(ctx, access, fmt.Errorf("legacy Garage account %s is shared by multiple same-name BucketAccesses; delete and recreate this non-owning BucketAccess to rotate credentials safely", access.Status.AccountID))
+	}
 
-	if ctrlutil.AddFinalizer(access, cosiv1alpha2.ProtectionFinalizer) {
+	if ctrlutil.AddFinalizer(access, GarageProtectionFinalizer) {
 		if err := r.Update(ctx, access); err != nil {
 			return reconcile.Result{}, err
 		}
@@ -116,6 +163,9 @@ func (r *BucketAccessReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Reserve secrets first — any race condition fails before we mutate Garage state.
+	if err := validateUniqueAccessSecretNames(access.Spec.BucketClaims); err != nil {
+		return r.fail(ctx, access, err)
+	}
 	for _, bca := range access.Spec.BucketClaims {
 		if err := r.reserveSecret(ctx, access, bca.AccessSecretName); err != nil {
 			return r.fail(ctx, access, fmt.Errorf("reserve secret %s: %w", bca.AccessSecretName, err))
@@ -127,8 +177,11 @@ func (r *BucketAccessReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		return r.fail(ctx, access, err)
 	}
+	if err := r.Provisioner.ValidateBucketAccessCluster(ctx, slots, params); err != nil {
+		return r.fail(ctx, access, err)
+	}
 
-	result, err := r.Provisioner.GrantAccess(ctx, access.Name, access.Status.AccountID, slots, params, access.Spec.ServiceAccountName)
+	result, err := r.Provisioner.GrantAccess(ctx, accessIdentity, access.Status.AccountID, slots, params, access.Spec.ServiceAccountName)
 	if err != nil {
 		return r.fail(ctx, access, err)
 	}
@@ -151,6 +204,37 @@ func (r *BucketAccessReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return reconcile.Result{}, nil
 }
 
+func validateS3AccessProtocol(protocol cosiv1alpha2.ObjectProtocol) error {
+	if protocol != cosiv1alpha2.ObjectProtocolS3 {
+		return fmt.Errorf("garage supports only the S3 protocol, not %q", protocol)
+	}
+	return nil
+}
+
+func validateUniqueAccessSecretNames(claims []cosiv1alpha2.BucketClaimAccess) error {
+	secretNames := make(map[string]struct{}, len(claims))
+	for _, claim := range claims {
+		if _, duplicate := secretNames[claim.AccessSecretName]; duplicate {
+			return fmt.Errorf("multiple referenced BucketClaims use the same accessSecretName %q", claim.AccessSecretName)
+		}
+		secretNames[claim.AccessSecretName] = struct{}{}
+	}
+	return nil
+}
+
+// completeCleanupHandoff records the pinned COSI sidecar-to-controller deletion
+// handoff and releases only Garage's private cleanup finalizer. The upstream
+// controller owns objectstorage.k8s.io/protection and removes it after its
+// BucketClaim bookkeeping completes. Both metadata changes belong in one
+// update so either finalizer keeps the object alive across a process crash.
+func (r *BucketAccessReconciler) completeCleanupHandoff(access *cosiv1alpha2.BucketAccess) {
+	if access.Annotations == nil {
+		access.Annotations = make(map[string]string)
+	}
+	access.Annotations[cosiv1alpha2.SidecarCleanupFinishedAnnotation] = ""
+	ctrlutil.RemoveFinalizer(access, GarageProtectionFinalizer)
+}
+
 // resolveBuckets walks Spec.BucketClaims, looks up the bound Bucket for each,
 // and pairs each Garage bucketID with that claim's AccessMode.
 func (r *BucketAccessReconciler) resolveBuckets(ctx context.Context, access *cosiv1alpha2.BucketAccess) ([]BucketAccessSlot, []cosiv1alpha2.AccessedBucket, error) {
@@ -170,6 +254,19 @@ func (r *BucketAccessReconciler) resolveBuckets(ctx context.Context, access *cos
 		}
 		if bucket.Status.BucketID == "" {
 			return nil, nil, fmt.Errorf("bucket %s not yet provisioned", bucket.Name)
+		}
+		if bucket.Spec.DriverName != r.DriverName {
+			return nil, nil, fmt.Errorf("bucket %s belongs to driver %q, not %q", bucket.Name, bucket.Spec.DriverName, r.DriverName)
+		}
+		if !bucket.DeletionTimestamp.IsZero() {
+			return nil, nil, fmt.Errorf("bucket %s is deleting", bucket.Name)
+		}
+		if _, deleting := bucket.Annotations[cosiv1alpha2.BucketClaimBeingDeletedAnnotation]; deleting {
+			return nil, nil, fmt.Errorf("BucketClaim for bucket %s is deleting", bucket.Name)
+		}
+		ref := bucket.Spec.BucketClaimRef
+		if ref.Name != claim.Name || ref.Namespace != claim.Namespace || ref.UID == "" || ref.UID != claim.UID {
+			return nil, nil, fmt.Errorf("bucket %s does not belong to BucketClaim %s/%s UID %s", bucket.Name, claim.Namespace, claim.Name, claim.UID)
 		}
 		slots = append(slots, BucketAccessSlot{
 			BucketID:   bucket.Status.BucketID,
@@ -205,12 +302,7 @@ func (r *BucketAccessReconciler) reserveSecret(ctx context.Context, access *cosi
 	existing := &corev1.Secret{}
 	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: access.Namespace}, existing)
 	if err == nil {
-		for _, ref := range existing.OwnerReferences {
-			if ref.UID == access.UID && ref.Kind == "BucketAccess" {
-				return nil
-			}
-		}
-		return fmt.Errorf("secret %s exists and is not owned by this BucketAccess", name)
+		return validateAccessSecretOwnership(existing, access)
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
@@ -224,15 +316,28 @@ func (r *BucketAccessReconciler) reserveSecret(ctx context.Context, access *cosi
 			},
 		},
 	}
-	if err := r.Create(ctx, sec); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := r.Create(ctx, sec); err == nil {
+		return nil
+	} else if !apierrors.IsAlreadyExists(err) {
 		return err
 	}
-	return nil
+	// A different actor can win the Get/Create race. Re-read and verify exact
+	// controller ownership before treating AlreadyExists as a reservation.
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: access.Namespace}, existing); err != nil {
+		return err
+	}
+	return validateAccessSecretOwnership(existing, access)
 }
 
 func (r *BucketAccessReconciler) populateSecret(ctx context.Context, access *cosiv1alpha2.BucketAccess, name string, b BucketResult, a *AccessResult) error {
 	sec := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: access.Namespace}, sec); err != nil {
+		return err
+	}
+	// Ownership can change if the originally reserved Secret is deleted and
+	// recreated while Garage provisioning is in flight. Never write credentials
+	// into a replacement object that this BucketAccess does not control.
+	if err := validateAccessSecretOwnership(sec, access); err != nil {
 		return err
 	}
 	if sec.Data == nil {
@@ -243,7 +348,26 @@ func (r *BucketAccessReconciler) populateSecret(ctx context.Context, access *cos
 	sec.Data["S3_REGION"] = []byte(b.Region)
 	sec.Data["S3_ACCESS_KEY_ID"] = []byte(a.AccessKeyID)
 	sec.Data["S3_ACCESS_SECRET_KEY"] = []byte(a.SecretAccessKey)
+	// Canonical v1alpha2 names. Keep the historical S3_* aliases above so an
+	// in-place operator upgrade does not break existing consumers.
+	sec.Data[string(cosiv1alpha2.BucketInfoVar_Protocol)] = []byte(cosiv1alpha2.ObjectProtocolS3)
+	sec.Data[string(cosiv1alpha2.BucketInfoVar_S3_BucketId)] = []byte(b.GlobalAlias)
+	sec.Data[string(cosiv1alpha2.BucketInfoVar_S3_Endpoint)] = []byte(b.Endpoint)
+	sec.Data[string(cosiv1alpha2.BucketInfoVar_S3_Region)] = []byte(b.Region)
+	sec.Data[string(cosiv1alpha2.BucketInfoVar_S3_AddressingStyle)] = []byte("path")
+	sec.Data[string(cosiv1alpha2.CredentialVar_S3_AccessKeyId)] = []byte(a.AccessKeyID)
+	sec.Data[string(cosiv1alpha2.CredentialVar_S3_AccessSecretKey)] = []byte(a.SecretAccessKey)
 	return r.Update(ctx, sec)
+}
+
+func validateAccessSecretOwnership(secret *corev1.Secret, access *cosiv1alpha2.BucketAccess) error {
+	controller := metav1.GetControllerOf(secret)
+	if controller == nil || !metav1.IsControlledBy(secret, access) ||
+		controller.APIVersion != cosiv1alpha2.GroupVersion.String() || controller.Kind != "BucketAccess" ||
+		controller.Name != access.Name || controller.UID != access.UID {
+		return fmt.Errorf("secret %s exists and is not controlled by this BucketAccess", client.ObjectKeyFromObject(secret))
+	}
+	return nil
 }
 
 func mapAccessModeFromAPI(m cosiv1alpha2.BucketAccessMode) AccessMode {

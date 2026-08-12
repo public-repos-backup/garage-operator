@@ -274,3 +274,22 @@ webhooks:
     resources:
     - garagereferencegrants
   sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-core-v1-managed-pvc-finalizer
+  failurePolicy: Fail
+  name: vmanagedpvcfinalizer.kb.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - UPDATE
+    resources:
+    - persistentvolumeclaims
+  sideEffects: None

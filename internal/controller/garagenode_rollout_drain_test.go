@@ -60,6 +60,7 @@ var _ = Describe("GarageNode rollout-to-drain handoff", func() {
 			_ = k8sClient.Update(ctx, cluster)
 			_ = k8sClient.Delete(ctx, cluster)
 		}
+		_ = deleteTestManagedNodePVCs(ctx, k8sClient, testNamespace, nodeName)
 	})
 
 	DescribeTable("publishes the retiring StatefulSet's current-generation acknowledgment before preparing its drain",

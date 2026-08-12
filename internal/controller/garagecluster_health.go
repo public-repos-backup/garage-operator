@@ -102,7 +102,7 @@ func clusterRPCAddressGaps(
 	garageNodeSnapshots ...[]garagev1beta1.GarageNode,
 ) []string {
 	if cluster == nil {
-		return []string{"cluster"}
+		return []string{rpcAddressGapCluster}
 	}
 	if strings.TrimSpace(cluster.Spec.Network.RPCPublicAddrSubnet) != "" {
 		return nil
@@ -164,6 +164,8 @@ func clusterRPCAddressGaps(
 	sort.Strings(gaps)
 	return gaps
 }
+
+const rpcAddressGapCluster = "cluster"
 
 // setClusterHealthConditions derives the actionable health conditions
 // (QuorumAtRisk, RemoteClustersHealthy, FederationConfigured) from already-

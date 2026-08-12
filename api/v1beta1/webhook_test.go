@@ -42,6 +42,7 @@ const (
 	testTargetNS           = "ns-b"
 	testCluster            = "cluster"
 	testBucket             = "my-bucket"
+	testValidBucketAlias   = "valid-bucket"
 	testKey                = "my-key"
 	testWebhookNS          = "ns"
 	testField              = "s3Api"
@@ -621,12 +622,27 @@ func TestCheckReferenceGrant_CrossNamespace_WithMatchingGrant(t *testing.T) {
 }
 
 func TestCheckReferenceGrant_CrossNamespace_WildcardTo(t *testing.T) {
-	// Grant with no To entries permits all resources in the namespace.
+	// Grant with no To entries preserves the historical cluster/bucket wildcard.
 	g := grant(kindGarageKey, testSourceNS, "", "")
 	c := fake.NewClientBuilder().WithScheme(fakeScheme(t)).WithObjects(g).Build()
 	err := checkReferenceGrant(context.Background(), c, kindGarageKey, testSourceNS, garageClusterKind, testTargetNS, "any-cluster")
 	if err != nil {
 		t.Errorf("wildcard To should allow any resource, got: %v", err)
+	}
+}
+
+func TestCheckReferenceGrant_EmptyToDoesNotAuthorizeGarageKey(t *testing.T) {
+	g := grant("GarageBucket", testSourceNS, "", "")
+	c := fake.NewClientBuilder().WithScheme(fakeScheme(t)).WithObjects(g).Build()
+	err := checkReferenceGrant(context.Background(), c, "GarageBucket", testSourceNS, "GarageKey", testTargetNS, "key")
+	if err == nil {
+		t.Fatal("historical empty-to grant unexpectedly authorized newly referenceable GarageKey kind")
+	}
+
+	explicit := grant("GarageBucket", testSourceNS, "GarageKey", "")
+	explicitClient := fake.NewClientBuilder().WithScheme(fakeScheme(t)).WithObjects(explicit).Build()
+	if err := checkReferenceGrant(context.Background(), explicitClient, "GarageBucket", testSourceNS, "GarageKey", testTargetNS, "key"); err != nil {
+		t.Fatalf("explicit GarageKey target rejected: %v", err)
 	}
 }
 
@@ -726,6 +742,524 @@ func TestGarageKeyValidator_CrossNamespaceClusterRef_WithGrant(t *testing.T) {
 	}
 }
 
+func TestRevokedClusterGrantAllowsOnlyUnchangedDependentCleanupUpdates(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+
+	t.Run("GarageKey", func(t *testing.T) {
+		clusterGrant := grant(kindGarageKey, testSourceNS, garageClusterKind, testCluster)
+		bucketGrant := grant(kindGarageKey, testSourceNS, "GarageBucket", testBucket)
+		bucketGrant.Name = "bucket-grant"
+		c := fake.NewClientBuilder().WithScheme(fakeScheme(t)).WithObjects(clusterGrant, bucketGrant).Build()
+		validator := &GarageKeyValidator{Client: c}
+		key := &GarageKey{
+			ObjectMeta: metav1.ObjectMeta{Name: testKey, Namespace: testSourceNS},
+			Spec: GarageKeySpec{
+				ClusterRef: ClusterReference{Name: testCluster, Namespace: testTargetNS},
+				BucketPermissions: []BucketPermission{{
+					BucketRef: &BucketRef{Name: testBucket, Namespace: testTargetNS}, Read: true,
+				}},
+			},
+		}
+		if err := (&GarageKeyDefaulter{}).Default(ctx, key); err != nil {
+			t.Fatalf("default: %v", err)
+		}
+		if _, err := validator.ValidateCreate(ctx, key); err != nil {
+			t.Fatalf("create with grant: %v", err)
+		}
+		if err := c.Delete(ctx, clusterGrant); err != nil {
+			t.Fatalf("revoke cluster grant: %v", err)
+		}
+		if err := c.Delete(ctx, bucketGrant); err != nil {
+			t.Fatalf("revoke bucket grant: %v", err)
+		}
+
+		key.DeletionTimestamp = &now
+		key.Finalizers = []string{testCleanupFinalizer}
+		cleanup := key.DeepCopy()
+		cleanup.Finalizers = nil
+		cleanup.Labels = map[string]string{"repair": "true"}
+		if _, err := validator.ValidateUpdate(ctx, key, cleanup); err != nil {
+			t.Fatalf("unchanged cross-namespace finalizer/metadata cleanup after grant revocation: %v", err)
+		}
+
+		changed := cleanup.DeepCopy()
+		changed.Spec.BucketPermissions[0].Write = true
+		if _, err := validator.ValidateUpdate(ctx, key, changed); err == nil || !strings.Contains(err.Error(), "GarageReferenceGrant") {
+			t.Fatalf("spec change after grant revocation was not denied: %v", err)
+		}
+		createAfterRevocation := key.DeepCopy()
+		createAfterRevocation.DeletionTimestamp = nil
+		createAfterRevocation.Finalizers = nil
+		if _, err := validator.ValidateCreate(ctx, createAfterRevocation); err == nil || !strings.Contains(err.Error(), "GarageReferenceGrant") {
+			t.Fatalf("create after grant revocation was not denied: %v", err)
+		}
+	})
+
+	t.Run("GarageBucket", func(t *testing.T) {
+		g := grant("GarageBucket", testSourceNS, garageClusterKind, testCluster)
+		c := fake.NewClientBuilder().WithScheme(fakeScheme(t)).WithObjects(g).Build()
+		validator := &GarageBucketValidator{Client: c}
+		bucket := &GarageBucket{
+			ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+			Spec: GarageBucketSpec{
+				ClusterRef:  ClusterReference{Name: testCluster, Namespace: testTargetNS},
+				GlobalAlias: testValidBucketAlias,
+			},
+		}
+		if err := (&GarageBucketDefaulter{}).Default(ctx, bucket); err != nil {
+			t.Fatalf("default: %v", err)
+		}
+		if _, err := validator.ValidateCreate(ctx, bucket); err != nil {
+			t.Fatalf("create with grant: %v", err)
+		}
+		if err := c.Delete(ctx, g); err != nil {
+			t.Fatalf("revoke grant: %v", err)
+		}
+
+		bucket.DeletionTimestamp = &now
+		bucket.Finalizers = []string{testCleanupFinalizer}
+		cleanup := bucket.DeepCopy()
+		cleanup.Finalizers = nil
+		cleanup.Annotations = map[string]string{"repair": "true"}
+		if _, err := validator.ValidateUpdate(ctx, bucket, cleanup); err != nil {
+			t.Fatalf("unchanged cross-namespace finalizer/metadata cleanup after grant revocation: %v", err)
+		}
+
+		changed := cleanup.DeepCopy()
+		changed.Spec.GlobalAlias = "changed-bucket"
+		if _, err := validator.ValidateUpdate(ctx, bucket, changed); err == nil || !strings.Contains(err.Error(), "GarageReferenceGrant") {
+			t.Fatalf("spec change after grant revocation was not denied: %v", err)
+		}
+		createAfterRevocation := bucket.DeepCopy()
+		createAfterRevocation.DeletionTimestamp = nil
+		createAfterRevocation.Finalizers = nil
+		if _, err := validator.ValidateCreate(ctx, createAfterRevocation); err == nil || !strings.Contains(err.Error(), "GarageReferenceGrant") {
+			t.Fatalf("create after grant revocation was not denied: %v", err)
+		}
+	})
+}
+
+func TestGarageKeyValidatorAllowsOnlyUnchangedLegacyAliasCleanup(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	validator := &GarageKeyValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}
+	old := &GarageKey{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testKey, Namespace: testSourceNS, DeletionTimestamp: &now,
+			Finalizers: []string{testCleanupFinalizer},
+		},
+		Spec: GarageKeySpec{
+			ClusterRef: ClusterReference{Name: testCluster},
+			BucketPermissions: []BucketPermission{{
+				GlobalAlias: "127.0.0.1", Read: true,
+			}},
+		},
+	}
+	if err := (&GarageKeyDefaulter{}).Default(ctx, old); err != nil {
+		t.Fatalf("default legacy key: %v", err)
+	}
+	cleanup := old.DeepCopy()
+	cleanup.Finalizers = nil
+	cleanup.Labels = map[string]string{"repair": "true"}
+	if _, err := validator.ValidateUpdate(ctx, old, cleanup); err != nil {
+		t.Fatalf("unchanged legacy alias blocked finalizer cleanup: %v", err)
+	}
+
+	changed := cleanup.DeepCopy()
+	changed.Spec.BucketPermissions[0].GlobalAlias = "127.0.0.2"
+	if _, err := validator.ValidateUpdate(ctx, old, changed); err == nil || !strings.Contains(err.Error(), "IP address") {
+		t.Fatalf("changed invalid legacy alias was not rejected: %v", err)
+	}
+	create := old.DeepCopy()
+	create.DeletionTimestamp = nil
+	create.Finalizers = nil
+	if _, err := validator.ValidateCreate(ctx, create); err == nil || !strings.Contains(err.Error(), "IP address") {
+		t.Fatalf("new invalid alias was not rejected: %v", err)
+	}
+}
+
+func TestBucketAndKeyValidatorsAllowOnlyUnchangedLegacyReferenceCleanup(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+
+	t.Run("GarageKey bucketRef", func(t *testing.T) {
+		validator := &GarageKeyValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}
+		old := &GarageKey{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testKey, Namespace: testSourceNS, DeletionTimestamp: &now,
+				Finalizers: []string{testCleanupFinalizer},
+			},
+			Spec: GarageKeySpec{
+				ClusterRef: ClusterReference{Name: testCluster},
+				BucketPermissions: []BucketPermission{{
+					BucketRef: &BucketRef{Name: "Bad_Bucket"}, Read: true,
+				}},
+			},
+		}
+		if err := (&GarageKeyDefaulter{}).Default(ctx, old); err != nil {
+			t.Fatalf("default legacy key: %v", err)
+		}
+		cleanup := old.DeepCopy()
+		cleanup.Finalizers = nil
+		if _, err := validator.ValidateUpdate(ctx, old, cleanup); err != nil {
+			t.Fatalf("unchanged invalid bucketRef blocked finalizer cleanup: %v", err)
+		}
+		changed := cleanup.DeepCopy()
+		changed.Spec.BucketPermissions[0].BucketRef.Name = "Other_Bad_Bucket"
+		if _, err := validator.ValidateUpdate(ctx, old, changed); err == nil || !strings.Contains(err.Error(), "is invalid") {
+			t.Fatalf("changed invalid bucketRef was accepted: %v", err)
+		}
+	})
+
+	t.Run("GarageBucket keyRef", func(t *testing.T) {
+		validator := &GarageBucketValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}
+		old := &GarageBucket{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testBucket, Namespace: testSourceNS, DeletionTimestamp: &now,
+				Finalizers: []string{testCleanupFinalizer},
+			},
+			Spec: GarageBucketSpec{
+				ClusterRef:  ClusterReference{Name: testCluster},
+				GlobalAlias: testValidBucketAlias,
+				KeyPermissions: []KeyPermission{{
+					KeyRef: KeyRef{Name: "Bad_Key"}, Read: true,
+				}},
+			},
+		}
+		cleanup := old.DeepCopy()
+		cleanup.Finalizers = nil
+		if _, err := validator.ValidateUpdate(ctx, old, cleanup); err != nil {
+			t.Fatalf("unchanged invalid keyRef blocked finalizer cleanup: %v", err)
+		}
+		changed := cleanup.DeepCopy()
+		changed.Spec.KeyPermissions[0].KeyRef.Name = "Other_Bad_Key"
+		if _, err := validator.ValidateUpdate(ctx, old, changed); err == nil || !strings.Contains(err.Error(), "is invalid") {
+			t.Fatalf("changed invalid keyRef was accepted: %v", err)
+		}
+	})
+
+	t.Run("GarageKey equivalent bucketRefs", func(t *testing.T) {
+		validator := &GarageKeyValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}
+		old := &GarageKey{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testKey, Namespace: testSourceNS, DeletionTimestamp: &now,
+				Finalizers: []string{testCleanupFinalizer},
+			},
+			Spec: GarageKeySpec{
+				ClusterRef: ClusterReference{Name: testCluster},
+				BucketPermissions: []BucketPermission{
+					{BucketRef: &BucketRef{Name: testBucket}, Read: true},
+					{BucketRef: &BucketRef{Name: testBucket, Namespace: testSourceNS}, Write: true},
+				},
+			},
+		}
+		if err := (&GarageKeyDefaulter{}).Default(ctx, old); err != nil {
+			t.Fatalf("default legacy key: %v", err)
+		}
+		cleanup := old.DeepCopy()
+		cleanup.Finalizers = nil
+		if _, err := validator.ValidateUpdate(ctx, old, cleanup); err != nil {
+			t.Fatalf("unchanged equivalent bucketRefs blocked finalizer cleanup: %v", err)
+		}
+	})
+
+	t.Run("GarageBucket equivalent keyRefs", func(t *testing.T) {
+		validator := &GarageBucketValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}
+		old := &GarageBucket{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testBucket, Namespace: testSourceNS, DeletionTimestamp: &now,
+				Finalizers: []string{testCleanupFinalizer},
+			},
+			Spec: GarageBucketSpec{
+				ClusterRef:  ClusterReference{Name: testCluster},
+				GlobalAlias: testValidBucketAlias,
+				KeyPermissions: []KeyPermission{
+					{KeyRef: KeyRef{Name: testKey}, Read: true},
+					{KeyRef: KeyRef{Name: testKey, Namespace: testSourceNS}, Write: true},
+				},
+			},
+		}
+		cleanup := old.DeepCopy()
+		cleanup.Finalizers = nil
+		if _, err := validator.ValidateUpdate(ctx, old, cleanup); err != nil {
+			t.Fatalf("unchanged equivalent keyRefs blocked finalizer cleanup: %v", err)
+		}
+	})
+}
+
+func TestValidateGarageKeySpecNormalizesBucketRefNamespaceForDuplicates(t *testing.T) {
+	key := &GarageKey{
+		ObjectMeta: metav1.ObjectMeta{Name: testKey, Namespace: testSourceNS},
+		Spec: GarageKeySpec{
+			ClusterRef: ClusterReference{Name: testCluster},
+			BucketPermissions: []BucketPermission{
+				{BucketRef: &BucketRef{Name: testBucket}, Read: true},
+				{BucketRef: &BucketRef{Name: testBucket, Namespace: testSourceNS}, Write: true},
+			},
+		},
+	}
+	if err := ValidateGarageKeySpec(key); err == nil || !strings.Contains(err.Error(), "duplicate bucket reference") {
+		t.Fatalf("empty and explicit object namespace were not treated as the same bucketRef: %v", err)
+	}
+}
+
+func TestValidateGarageBucketSpecNormalizesKeyRefNamespaceForDuplicates(t *testing.T) {
+	bucket := &GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+		Spec: GarageBucketSpec{
+			ClusterRef: ClusterReference{Name: testCluster},
+			KeyPermissions: []KeyPermission{
+				{KeyRef: KeyRef{Name: testKey}, Read: true},
+				{KeyRef: KeyRef{Name: testKey, Namespace: testSourceNS}, Write: true},
+			},
+		},
+	}
+	if err := ValidateGarageBucketSpec(bucket); err == nil || !strings.Contains(err.Error(), "duplicate keyRef") {
+		t.Fatalf("empty and explicit object namespace were not treated as the same keyRef: %v", err)
+	}
+}
+
+func TestReferencedObjectNamesAndNamespacesMustBeValid(t *testing.T) {
+	tests := []struct {
+		name string
+		err  func() error
+	}{
+		{
+			name: "GarageKey bucketRef name",
+			err: func() error {
+				return ValidateGarageKeySpec(&GarageKey{
+					ObjectMeta: metav1.ObjectMeta{Name: testKey, Namespace: testSourceNS},
+					Spec: GarageKeySpec{
+						ClusterRef:        ClusterReference{Name: testCluster},
+						BucketPermissions: []BucketPermission{{BucketRef: &BucketRef{Name: "Bad_Bucket"}, Read: true}},
+					},
+				})
+			},
+		},
+		{
+			name: "GarageKey bucketRef namespace",
+			err: func() error {
+				return ValidateGarageKeySpec(&GarageKey{
+					ObjectMeta: metav1.ObjectMeta{Name: testKey, Namespace: testSourceNS},
+					Spec: GarageKeySpec{
+						ClusterRef:        ClusterReference{Name: testCluster},
+						BucketPermissions: []BucketPermission{{BucketRef: &BucketRef{Name: testBucket, Namespace: "Bad_Namespace"}, Read: true}},
+					},
+				})
+			},
+		},
+		{
+			name: "GarageBucket keyRef name",
+			err: func() error {
+				return ValidateGarageBucketSpec(&GarageBucket{
+					ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+					Spec: GarageBucketSpec{
+						ClusterRef:     ClusterReference{Name: testCluster},
+						KeyPermissions: []KeyPermission{{KeyRef: KeyRef{Name: "Bad_Key"}, Read: true}},
+					},
+				})
+			},
+		},
+		{
+			name: "GarageBucket keyRef namespace",
+			err: func() error {
+				return ValidateGarageBucketSpec(&GarageBucket{
+					ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+					Spec: GarageBucketSpec{
+						ClusterRef:     ClusterReference{Name: testCluster},
+						KeyPermissions: []KeyPermission{{KeyRef: KeyRef{Name: testKey, Namespace: "Bad_Namespace"}, Read: true}},
+					},
+				})
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.err(); err == nil || !strings.Contains(err.Error(), "is invalid") {
+				t.Fatalf("invalid reference was accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestEveryClusterReferenceConsumerRejectsMalformedReferences(t *testing.T) {
+	size := resource.MustParse("1Gi")
+	consumers := []struct {
+		name     string
+		validate func(ClusterReference) error
+	}{
+		{
+			name: "GarageKey",
+			validate: func(ref ClusterReference) error {
+				return ValidateGarageKeySpec(&GarageKey{ObjectMeta: metav1.ObjectMeta{Namespace: testSourceNS}, Spec: GarageKeySpec{
+					ClusterRef: ref, AllBuckets: &AllBucketsPermission{Read: true},
+				}})
+			},
+		},
+		{
+			name: "GarageBucket",
+			validate: func(ref ClusterReference) error {
+				return ValidateGarageBucketSpec(&GarageBucket{ObjectMeta: metav1.ObjectMeta{Namespace: testSourceNS}, Spec: GarageBucketSpec{
+					ClusterRef: ref, GlobalAlias: testValidBucketAlias,
+				}})
+			},
+		},
+		{
+			name: "GarageAdminToken",
+			validate: func(ref ClusterReference) error {
+				_, err := (&GarageAdminTokenValidator{}).validateGarageAdminTokenWithOptions(t.Context(), &GarageAdminToken{
+					ObjectMeta: metav1.ObjectMeta{Namespace: testSourceNS}, Spec: GarageAdminTokenSpec{ClusterRef: ref},
+				}, false)
+				return err
+			},
+		},
+		{
+			name: "GarageNode",
+			validate: func(ref ClusterReference) error {
+				_, err := (&GarageNode{ObjectMeta: metav1.ObjectMeta{Name: "node", Namespace: testSourceNS}, Spec: GarageNodeSpec{
+					ClusterRef: ref, Zone: testZone, Gateway: true,
+					Storage: &NodeStorageConfig{Metadata: &NodeVolumeConfig{Size: &size}},
+				}}).validateGarageNode()
+				return err
+			},
+		},
+		{
+			name: "v1beta1 GarageCluster connectTo",
+			validate: func(ref ClusterReference) error {
+				return (&GarageCluster{ObjectMeta: metav1.ObjectMeta{Namespace: testSourceNS}, Spec: GarageClusterSpec{
+					Gateway: true, ConnectTo: &ConnectToConfig{ClusterRef: &ref},
+				}}).validateGateway()
+			},
+		},
+	}
+	for _, consumer := range consumers {
+		for _, ref := range []ClusterReference{
+			{Name: "Bad_Cluster"},
+			{Name: testCluster, Namespace: "Bad_Namespace"},
+		} {
+			t.Run(consumer.name+"/"+ref.Name+"/"+ref.Namespace, func(t *testing.T) {
+				if err := consumer.validate(ref); err == nil {
+					t.Fatal("malformed cluster reference was accepted")
+				}
+			})
+		}
+	}
+}
+
+func TestMalformedLegacyClusterReferencesAreCleanableButNotChangeable(t *testing.T) {
+	ctx := t.Context()
+	size := resource.MustParse("1Gi")
+	tests := []struct {
+		name     string
+		validate func() (cleanupErr, changedErr error)
+	}{
+		{
+			name: "GarageAdminToken",
+			validate: func() (error, error) {
+				old := &GarageAdminToken{ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: testSourceNS, Finalizers: []string{testCleanupFinalizer}}, Spec: GarageAdminTokenSpec{
+					ClusterRef: ClusterReference{Name: "Bad_Cluster"},
+				}}
+				cleanup := old.DeepCopy()
+				cleanup.Finalizers = nil
+				cleanup.Labels = map[string]string{"repair": "true"}
+				_, cleanupErr := (&GarageAdminTokenValidator{}).ValidateUpdate(ctx, old, cleanup)
+				changed := cleanup.DeepCopy()
+				changed.Spec.ClusterRef.Name = "Other_Bad_Cluster"
+				_, changedErr := (&GarageAdminTokenValidator{}).ValidateUpdate(ctx, old, changed)
+				return cleanupErr, changedErr
+			},
+		},
+		{
+			name: "GarageNode",
+			validate: func() (error, error) {
+				old := &GarageNode{ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: testSourceNS, Finalizers: []string{testCleanupFinalizer}}, Spec: GarageNodeSpec{
+					ClusterRef: ClusterReference{Name: "Bad_Cluster"}, Zone: testZone, Gateway: true,
+					Storage: &NodeStorageConfig{Metadata: &NodeVolumeConfig{Size: &size}},
+				}}
+				cleanup := old.DeepCopy()
+				cleanup.Finalizers = nil
+				cleanup.Labels = map[string]string{"repair": "true"}
+				validator := &GarageNodeValidator{}
+				_, cleanupErr := validator.ValidateUpdate(ctx, old, cleanup)
+				changed := cleanup.DeepCopy()
+				changed.Spec.ClusterRef.Name = "Other_Bad_Cluster"
+				_, changedErr := validator.ValidateUpdate(ctx, old, changed)
+				return cleanupErr, changedErr
+			},
+		},
+		{
+			name: "v1beta1 GarageCluster",
+			validate: func() (error, error) {
+				old := &GarageCluster{ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: testSourceNS, Finalizers: []string{testCleanupFinalizer}}, Spec: GarageClusterSpec{
+					ConnectTo: &ConnectToConfig{ClusterRef: &ClusterReference{Name: "Bad_Cluster"}},
+				}}
+				cleanup := old.DeepCopy()
+				cleanup.Finalizers = nil
+				cleanup.Labels = map[string]string{"repair": "true"}
+				if err := (&GarageClusterDefaulter{}).Default(ctx, cleanup); err != nil {
+					return err, err
+				}
+				validator := &GarageClusterValidator{}
+				_, cleanupErr := validator.ValidateUpdate(ctx, old, cleanup)
+				changed := cleanup.DeepCopy()
+				changed.Spec.ConnectTo.ClusterRef.Name = "Other_Bad_Cluster"
+				_, changedErr := validator.ValidateUpdate(ctx, old, changed)
+				return cleanupErr, changedErr
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cleanupErr, changedErr := test.validate()
+			if cleanupErr != nil {
+				t.Fatalf("metadata/finalizer cleanup was rejected: %v", cleanupErr)
+			}
+			if changedErr == nil {
+				t.Fatal("changed malformed cluster reference was accepted")
+			}
+		})
+	}
+}
+
+func TestGarageAuthorizationWebhooksIgnoreStaleCachedGrants(t *testing.T) {
+	ctx := context.Background()
+	scheme := fakeScheme(t)
+	authoritative := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	t.Run("GarageKey", func(t *testing.T) {
+		cached := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(grant(kindGarageKey, testSourceNS, garageClusterKind, testCluster)).Build()
+		validator := &GarageKeyValidator{Client: cached, AuthorizationReader: authoritative}
+		key := &GarageKey{
+			ObjectMeta: metav1.ObjectMeta{Name: testKey, Namespace: testSourceNS},
+			Spec: GarageKeySpec{
+				ClusterRef: ClusterReference{Name: testCluster, Namespace: testTargetNS},
+				AllBuckets: &AllBucketsPermission{Read: true},
+			},
+		}
+		if _, err := validator.ValidateCreate(ctx, key); err == nil || !strings.Contains(err.Error(), "GarageReferenceGrant") {
+			t.Fatalf("stale cached GarageKey grant authorized create: %v", err)
+		}
+	})
+
+	t.Run("GarageBucket", func(t *testing.T) {
+		cached := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(grant("GarageBucket", testSourceNS, garageClusterKind, testCluster)).Build()
+		validator := &GarageBucketValidator{Client: cached, AuthorizationReader: authoritative}
+		bucket := &GarageBucket{
+			ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+			Spec: GarageBucketSpec{
+				ClusterRef:  ClusterReference{Name: testCluster, Namespace: testTargetNS},
+				GlobalAlias: testValidBucketAlias,
+			},
+		}
+		if _, err := validator.ValidateCreate(ctx, bucket); err == nil || !strings.Contains(err.Error(), "GarageReferenceGrant") {
+			t.Fatalf("stale cached GarageBucket grant authorized create: %v", err)
+		}
+	})
+}
+
 func TestGarageKeyValidator_CrossNamespaceBucketRef_NoGrant(t *testing.T) {
 	g := grant(kindGarageKey, testSourceNS, garageClusterKind, "") // only cluster grant, no bucket grant
 	c := fake.NewClientBuilder().WithScheme(fakeScheme(t)).WithObjects(g).Build()
@@ -817,7 +1351,7 @@ func TestGarageBucketValidator_SameNamespaceClusterRef(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()
 	v := &GarageBucketValidator{Client: c}
 	bucket := &GarageBucket{
-		ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: testSourceNS},
+		ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
 		Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster}},
 	}
 	_, err := v.validateGarageBucket(context.Background(), bucket)
@@ -826,11 +1360,36 @@ func TestGarageBucketValidator_SameNamespaceClusterRef(t *testing.T) {
 	}
 }
 
+func TestGarageBucketValidator_RejectsNegativeQuotas(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()
+	v := &GarageBucketValidator{Client: c}
+	negativeObjects := int64(-1)
+	negativeSize := resource.MustParse("-1Gi")
+	for name, quotas := range map[string]*BucketQuotas{
+		"maxObjects": {MaxObjects: &negativeObjects},
+		"maxSize":    {MaxSize: &negativeSize},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bucket := &GarageBucket{
+				ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+				Spec: GarageBucketSpec{
+					ClusterRef: ClusterReference{Name: testCluster},
+					Quotas:     quotas,
+				},
+			}
+			_, err := v.ValidateCreate(context.Background(), bucket)
+			if err == nil || !strings.Contains(err.Error(), "must be >= 0") {
+				t.Fatalf("negative quota should be rejected, got %v", err)
+			}
+		})
+	}
+}
+
 func TestGarageBucketValidator_CrossNamespaceClusterRef_NoGrant(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()
 	v := &GarageBucketValidator{Client: c}
 	bucket := &GarageBucket{
-		ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: testSourceNS},
+		ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
 		Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster, Namespace: testTargetNS}},
 	}
 	_, err := v.validateGarageBucket(context.Background(), bucket)
@@ -844,7 +1403,7 @@ func TestGarageBucketValidator_CrossNamespaceClusterRef_WithGrant(t *testing.T) 
 	c := fake.NewClientBuilder().WithScheme(fakeScheme(t)).WithObjects(g).Build()
 	v := &GarageBucketValidator{Client: c}
 	bucket := &GarageBucket{
-		ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: testSourceNS},
+		ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
 		Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster, Namespace: testTargetNS}},
 	}
 	_, err := v.validateGarageBucket(context.Background(), bucket)
@@ -994,6 +1553,26 @@ func TestGarageNodeValidator_SameNamespaceExplicit(t *testing.T) {
 	_, err := node.validateGarageNode()
 	if err != nil {
 		t.Errorf("same-namespace explicit clusterRef on GarageNode should be allowed: %v", err)
+	}
+}
+
+func TestGarageNodeValidator_RejectsUnsupportedRemoteClusterRef(t *testing.T) {
+	node := &GarageNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "n", Namespace: testSourceNS},
+		Spec: GarageNodeSpec{
+			ClusterRef: ClusterReference{Name: testCluster},
+			Zone:       testZone,
+			Gateway:    true,
+			External: &ExternalNodeConfig{
+				Address:          "garage.example.test",
+				Port:             3901,
+				RemoteClusterRef: &ClusterReference{Name: "remote"},
+			},
+		},
+	}
+	_, err := node.validateGarageNode()
+	if err == nil || !strings.Contains(err.Error(), "external.remoteClusterRef is not supported") {
+		t.Fatalf("unsupported external remoteClusterRef should be rejected, got %v", err)
 	}
 }
 
@@ -1906,10 +2485,11 @@ func TestValidateBindAddress(t *testing.T) {
 		field   string
 		wantErr bool
 	}{
-		{"valid port only", ":3900", testField, false},
+		{"invalid port only", ":3900", testField, true},
 		{"valid host:port", "0.0.0.0:3900", testField, false},
 		{"valid IPv6", "[::]:3900", testField, false},
-		{"valid unix socket", "unix:///run/garage/s3.sock", testField, false},
+		{"invalid unix socket", "unix:///run/garage/s3.sock", testField, true},
+		{"invalid loopback", "127.0.0.1:3900", testField, true},
 		{"invalid - no port", "localhost", testField, true},
 		{"invalid - empty", "", testField, true},
 	}
@@ -2792,7 +3372,7 @@ func TestValidateKeyPermissions(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateKeyPermissions(tt.permissions)
+			err := validateKeyPermissions(testWebhookNS, tt.permissions, false)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateKeyPermissions() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -2816,6 +3396,143 @@ func TestGarageKey_ExpiresAt_Valid(t *testing.T) {
 	_, err := v.ValidateCreate(context.Background(), key)
 	if err != nil {
 		t.Errorf("valid expiresAt should pass, got: %v", err)
+	}
+}
+
+func TestGarageBucketValidator_RejectsInvalidAndDuplicateAliases(t *testing.T) {
+	v := &GarageBucketValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}
+	for name, bucket := range map[string]*GarageBucket{
+		"uppercase global": {
+			ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+			Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster}, GlobalAlias: "Bad-Alias"},
+		},
+		"ip global": {
+			ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+			Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster}, GlobalAlias: "127.0.0.1"},
+		},
+		"duplicate local": {
+			ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+			Spec: GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster}, GlobalAlias: testValidBucketAlias, LocalAliases: []LocalAlias{
+				{KeyRef: testKey, Alias: "local-alias"}, {KeyRef: testKey, Alias: "local-alias"},
+			}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := v.ValidateCreate(context.Background(), bucket); err == nil {
+				t.Fatalf("invalid aliases accepted: %+v", bucket.Spec)
+			}
+		})
+	}
+}
+
+func TestGarageBucketValidator_CrossNamespaceKeyRefRequiresGrant(t *testing.T) {
+	bucket := &GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+		Spec: GarageBucketSpec{
+			ClusterRef:  ClusterReference{Name: testCluster},
+			GlobalAlias: testValidBucketAlias,
+			KeyPermissions: []KeyPermission{{
+				KeyRef: KeyRef{Name: testKey, Namespace: testTargetNS}, Read: true,
+			}},
+		},
+	}
+	withoutGrant := &GarageBucketValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}
+	if _, err := withoutGrant.ValidateCreate(context.Background(), bucket); err == nil {
+		t.Fatal("cross-namespace GarageKey reference accepted without GarageReferenceGrant")
+	}
+	keyGrant := grant("GarageBucket", testSourceNS, "GarageKey", testKey)
+	withGrant := &GarageBucketValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).WithObjects(keyGrant).Build()}
+	if _, err := withGrant.ValidateCreate(context.Background(), bucket); err != nil {
+		t.Fatalf("valid cross-namespace GarageKey grant rejected: %v", err)
+	}
+}
+
+func TestGarageBucketAndKeyValidator_ClusterRefIsImmutable(t *testing.T) {
+	bucketValidator := &GarageBucketValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}
+	oldBucket := &GarageBucket{ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS}, Spec: GarageBucketSpec{
+		ClusterRef: ClusterReference{Name: "cluster-a"}, GlobalAlias: testValidBucketAlias,
+	}}
+	newBucket := oldBucket.DeepCopy()
+	newBucket.Spec.ClusterRef.Name = "cluster-b"
+	if _, err := bucketValidator.ValidateUpdate(context.Background(), oldBucket, newBucket); err == nil {
+		t.Fatal("GarageBucket clusterRef mutation accepted")
+	}
+
+	keyValidator := &GarageKeyValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}
+	oldKey := &GarageKey{ObjectMeta: metav1.ObjectMeta{Name: testKey, Namespace: testSourceNS}, Spec: GarageKeySpec{
+		ClusterRef: ClusterReference{Name: "cluster-a"}, AllBuckets: &AllBucketsPermission{Read: true},
+	}}
+	newKey := oldKey.DeepCopy()
+	newKey.Spec.ClusterRef.Name = "cluster-b"
+	if _, err := keyValidator.ValidateUpdate(context.Background(), oldKey, newKey); err == nil {
+		t.Fatal("GarageKey clusterRef mutation accepted")
+	}
+}
+
+func TestGarageKeyValidator_RejectsUnsafeImportAndSecretTemplates(t *testing.T) {
+	foreignNS := testTargetNS
+	for name, spec := range map[string]GarageKeySpec{
+		"empty import": {
+			ClusterRef: ClusterReference{Name: testCluster}, ImportKey: &ImportKeyConfig{},
+		},
+		"cross namespace import secret": {
+			ClusterRef: ClusterReference{Name: testCluster}, ImportKey: &ImportKeyConfig{SecretRef: &corev1.SecretReference{Name: "credentials", Namespace: foreignNS}},
+		},
+		"missing import secret name": {
+			ClusterRef: ClusterReference{Name: testCluster}, ImportKey: &ImportKeyConfig{SecretRef: &corev1.SecretReference{}},
+		},
+		"generated key collision": {
+			ClusterRef: ClusterReference{Name: testCluster}, SecretTemplate: &SecretTemplate{AccessKeyIDKey: "same", SecretAccessKeyKey: "same"},
+		},
+		"additional data collision": {
+			ClusterRef: ClusterReference{Name: testCluster}, SecretTemplate: &SecretTemplate{AdditionalData: map[string]string{"access-key-id": "overwrite"}},
+		},
+		"invalid data key": {
+			ClusterRef: ClusterReference{Name: testCluster}, SecretTemplate: &SecretTemplate{AccessKeyIDKey: "bad key"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := &GarageKeyValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}
+			key := &GarageKey{ObjectMeta: metav1.ObjectMeta{Name: testKey, Namespace: testSourceNS}, Spec: spec}
+			if _, err := v.ValidateCreate(context.Background(), key); err == nil {
+				t.Fatalf("unsafe key spec accepted: %+v", spec)
+			}
+		})
+	}
+}
+
+func TestGarageKeyValidator_ImportKeyIsImmutable(t *testing.T) {
+	validator := &GarageKeyValidator{}
+	importKey := &ImportKeyConfig{AccessKeyID: "GKoriginal", SecretAccessKey: "original-secret"}
+	for name, pair := range map[string][2]*ImportKeyConfig{
+		"credential mutation": {importKey, &ImportKeyConfig{AccessKeyID: "GKoriginal", SecretAccessKey: "replacement-secret"}},
+		"removal":             {importKey, nil},
+		"addition":            {nil, importKey},
+	} {
+		t.Run(name, func(t *testing.T) {
+			oldKey := &GarageKey{Spec: GarageKeySpec{ClusterRef: ClusterReference{Name: testCluster}, ImportKey: pair[0]}}
+			newKey := oldKey.DeepCopy()
+			newKey.Spec.ImportKey = pair[1]
+			if _, err := validator.ValidateUpdate(context.Background(), oldKey, newKey); err == nil || !strings.Contains(err.Error(), "importKey is immutable") {
+				t.Fatalf("importKey mutation accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestBucketAndKeyValidators_RejectUnsupportedKubeConfigReference(t *testing.T) {
+	selector := &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "remote-kubeconfig"}}
+	bucket := &GarageBucket{ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS}, Spec: GarageBucketSpec{
+		ClusterRef: ClusterReference{Name: testCluster, KubeConfigSecretRef: selector}, GlobalAlias: testValidBucketAlias,
+	}}
+	if _, err := (&GarageBucketValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}).ValidateCreate(context.Background(), bucket); err == nil {
+		t.Fatal("GarageBucket accepted unsupported kubeConfigSecretRef")
+	}
+	key := &GarageKey{ObjectMeta: metav1.ObjectMeta{Name: testKey, Namespace: testSourceNS}, Spec: GarageKeySpec{
+		ClusterRef: ClusterReference{Name: testCluster, KubeConfigSecretRef: selector}, AllBuckets: &AllBucketsPermission{Read: true},
+	}}
+	if _, err := (&GarageKeyValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}).ValidateCreate(context.Background(), key); err == nil {
+		t.Fatal("GarageKey accepted unsupported kubeConfigSecretRef")
 	}
 }
 

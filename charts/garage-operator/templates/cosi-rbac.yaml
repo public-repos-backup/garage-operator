@@ -1,20 +1,27 @@
-{{- if .Values.cosi.enabled }}
+{{- if and .Values.cosi.enabled .Values.rbac.create }}
+{{- $scoped := include "garage-operator.isNamespaceScoped" . -}}
+{{- $fullname := include "garage-operator.fullname" . -}}
+{{- $labels := include "garage-operator.labels" . -}}
+{{- $saName := include "garage-operator.serviceAccountName" . -}}
+{{- $releaseNamespace := .Release.Namespace -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "garage-operator.fullname" . }}-cosi
+  name: {{ $fullname }}-cosi
   labels:
-    {{- include "garage-operator.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
 rules:
-# COSI resources
+# Cluster-scoped COSI resources
 - apiGroups:
   - objectstorage.k8s.io
   resources:
   - buckets
-  - bucketclaims
-  - bucketaccesses
   - bucketaccessclasses
   - bucketclasses
+  {{- if not $scoped }}
+  - bucketclaims
+  - bucketaccesses
+  {{- end }}
   verbs:
   - get
   - list
@@ -25,54 +32,99 @@ rules:
   - objectstorage.k8s.io
   resources:
   - buckets/status
+  {{- if not $scoped }}
+  - bucketclaims/status
+  - bucketaccesses/status
+  {{- end }}
+  verbs:
+  - get
+  - update
+  - patch
+# Finalizers for namespaced BucketAccess resources are cluster-wide only when
+# the manager itself is cluster-wide. Scoped installs receive Roles below.
+{{- if not $scoped }}
+- apiGroups:
+  - objectstorage.k8s.io
+  resources:
+  - bucketaccesses/finalizers
+  verbs:
+  - update
+{{- end }}
+# Finalizer for the cluster-scoped Bucket resource
+- apiGroups:
+  - objectstorage.k8s.io
+  resources:
+  - buckets/finalizers
+  verbs:
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-cosi
+  labels:
+    {{- $labels | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-cosi
+subjects:
+- kind: ServiceAccount
+  name: {{ $saName }}
+  namespace: {{ $releaseNamespace }}
+{{- if $scoped }}
+{{- range $ns := splitList "," (include "garage-operator.watchedNamespaces" .) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-cosi
+  namespace: {{ $ns }}
+  labels:
+    {{- $labels | nindent 4 }}
+rules:
+- apiGroups:
+  - objectstorage.k8s.io
+  resources:
+  - bucketclaims
+  - bucketaccesses
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+- apiGroups:
+  - objectstorage.k8s.io
+  resources:
   - bucketclaims/status
   - bucketaccesses/status
   verbs:
   - get
   - update
   - patch
-# Secrets for credentials
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
-# Finalizers for Bucket and BucketAccess
 - apiGroups:
   - objectstorage.k8s.io
   resources:
-  - buckets/finalizers
   - bucketaccesses/finalizers
   verbs:
   - update
-# Events
-- apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - create
-  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
-  name: {{ include "garage-operator.fullname" . }}-cosi
+  name: {{ $fullname }}-cosi
+  namespace: {{ $ns }}
   labels:
-    {{- include "garage-operator.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {{ include "garage-operator.fullname" . }}-cosi
+  kind: Role
+  name: {{ $fullname }}-cosi
 subjects:
 - kind: ServiceAccount
-  name: {{ include "garage-operator.serviceAccountName" . }}
-  namespace: {{ .Release.Namespace }}
+  name: {{ $saName }}
+  namespace: {{ $releaseNamespace }}
+{{- end }}
+{{- end }}
 {{- end }}

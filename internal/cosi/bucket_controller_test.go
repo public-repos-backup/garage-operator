@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -51,6 +52,7 @@ var _ = Describe("BucketReconciler", func() {
 	Context("happy path: create bucket", func() {
 		const bucketName = "cosi-test-bucket"
 		var nn types.NamespacedName
+		var claim *cosiv1alpha2.BucketClaim
 
 		BeforeEach(func() {
 			nn = types.NamespacedName{Name: bucketName}
@@ -85,6 +87,18 @@ var _ = Describe("BucketReconciler", func() {
 				},
 			}
 			Expect(k8sClient.Status().Update(ctx, cluster)).To(Succeed())
+
+			claim = &cosiv1alpha2.BucketClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-claim", Namespace: cosiTestNamespace},
+				Spec: cosiv1alpha2.BucketClaimSpec{
+					BucketClassName: "test-class",
+					Protocols:       []cosiv1alpha2.ObjectProtocol{cosiv1alpha2.ObjectProtocolS3},
+				},
+			}
+			Expect(k8sClient.Create(ctx, claim)).To(Succeed())
+			claim.Status.BoundBucketName = bucketName
+			claim.Status.ReadyToUse = ptr.To(false)
+			Expect(k8sClient.Status().Update(ctx, claim)).To(Succeed())
 		})
 
 		AfterEach(func() {
@@ -94,6 +108,9 @@ var _ = Describe("BucketReconciler", func() {
 				b.Finalizers = nil
 				_ = k8sClient.Update(ctx, b)
 				_ = k8sClient.Delete(ctx, b)
+			}
+			if claim != nil {
+				_ = k8sClient.Delete(ctx, claim)
 			}
 			// Clean up GarageCluster
 			gc := &garagev1beta2.GarageCluster{}
@@ -113,11 +130,13 @@ var _ = Describe("BucketReconciler", func() {
 			By("creating the COSI Bucket resource")
 			bucket := &cosiv1alpha2.Bucket{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: bucketName,
+					Name:       bucketName,
+					Finalizers: []string{cosiv1alpha2.ProtectionFinalizer},
 				},
 				Spec: cosiv1alpha2.BucketSpec{
 					DriverName:     cosiTestDriver,
 					DeletionPolicy: cosiv1alpha2.BucketDeletionPolicyDelete,
+					Protocols:      []cosiv1alpha2.ObjectProtocol{cosiv1alpha2.ObjectProtocolS3},
 					Parameters: map[string]string{
 						paramClusterRef:       cosiClusterName,
 						paramClusterNamespace: cosiGarageNS,
@@ -125,6 +144,7 @@ var _ = Describe("BucketReconciler", func() {
 					BucketClaimRef: cosiv1alpha2.BucketClaimReference{
 						Name:      "test-claim",
 						Namespace: cosiTestNamespace,
+						UID:       claim.UID,
 					},
 				},
 			}
@@ -148,6 +168,7 @@ var _ = Describe("BucketReconciler", func() {
 			Expect(err).NotTo(HaveOccurred())
 			withFinalizer := &cosiv1alpha2.Bucket{}
 			Expect(k8sClient.Get(ctx, nn, withFinalizer)).To(Succeed())
+			Expect(withFinalizer.Finalizers).To(ContainElement(GarageProtectionFinalizer))
 			Expect(withFinalizer.Finalizers).To(ContainElement(cosiv1alpha2.ProtectionFinalizer))
 
 			By("second reconcile provisions bucket")
@@ -160,9 +181,33 @@ var _ = Describe("BucketReconciler", func() {
 			Expect(updated.Status.ReadyToUse).NotTo(BeNil())
 			Expect(*updated.Status.ReadyToUse).To(BeTrue())
 			Expect(updated.Status.BucketID).NotTo(BeEmpty())
+			Expect(updated.Status.BucketInfo).To(HaveKeyWithValue(string(cosiv1alpha2.BucketInfoVar_S3_Endpoint), cosiS3Endpoint))
+			Expect(updated.Status.BucketInfo).To(HaveKeyWithValue(string(cosiv1alpha2.BucketInfoVar_S3_AddressingStyle), "path"))
+
+			By("publishing readiness to the exact bound BucketClaim")
+			updatedClaim := &cosiv1alpha2.BucketClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, updatedClaim)).To(Succeed())
+			Expect(updatedClaim.Status.BoundBucketName).To(Equal(bucketName))
+			Expect(updatedClaim.Status.ReadyToUse).NotTo(BeNil())
+			Expect(*updatedClaim.Status.ReadyToUse).To(BeTrue())
+			Expect(updatedClaim.Status.Protocols).To(Equal([]cosiv1alpha2.ObjectProtocol{cosiv1alpha2.ObjectProtocolS3}))
+
+			By("avoiding a no-op Bucket status update on steady-state reconciliation")
+			bucketResourceVersion := updated.ResourceVersion
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+			Expect(err).NotTo(HaveOccurred())
+			steady := &cosiv1alpha2.Bucket{}
+			Expect(k8sClient.Get(ctx, nn, steady)).To(Succeed())
+			Expect(steady.ResourceVersion).To(Equal(bucketResourceVersion))
+
+			By("refusing to publish readiness through a mismatched claim UID")
+			forged := steady.DeepCopy()
+			forged.Spec.BucketClaimRef.UID = types.UID("22222222-2222-2222-2222-222222222222")
+			_, err = reconciler.syncBoundBucketClaimReady(ctx, forged)
+			Expect(err).To(MatchError(ContainSubstring("current UID is")))
 
 			By("verifying protection finalizer is present")
-			Expect(updated.Finalizers).To(ContainElement(cosiv1alpha2.ProtectionFinalizer))
+			Expect(updated.Finalizers).To(ContainElement(GarageProtectionFinalizer))
 
 			By("verifying a shadow GarageBucket was created")
 			gbList := &garagev1beta1.GarageBucketList{}
@@ -220,7 +265,7 @@ var _ = Describe("BucketReconciler", func() {
 			// No finalizer should be added, status should be unchanged
 			updated := &cosiv1alpha2.Bucket{}
 			Expect(k8sClient.Get(ctx, nn, updated)).To(Succeed())
-			Expect(updated.Finalizers).NotTo(ContainElement(cosiv1alpha2.ProtectionFinalizer))
+			Expect(updated.Finalizers).NotTo(ContainElement(GarageProtectionFinalizer))
 		})
 	})
 })

@@ -14,6 +14,12 @@ securityContext: {}
 # No resource limits for tests
 resources: {}
 
+# Exercise namespace-scoped manager/cache/RBAC behavior. The chart also adds
+# the release namespace automatically, so Garage and shadow resources remain
+# managed while ordinary COSI claims are accepted only from default.
+watchNamespaces:
+  - default
+
 # Enable COSI driver
 cosi:
   enabled: true

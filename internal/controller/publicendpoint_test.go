@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
@@ -259,6 +260,7 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 					Ports: []corev1.ServicePort{{Name: rpcPortName, Port: 3901}},
 				},
 			}
+			Expect(controllerutil.SetControllerReference(cluster, shared, k8sClient.Scheme())).To(Succeed())
 			Expect(k8sClient.Create(ctx, shared)).To(Succeed())
 
 			reconcileTwice()
@@ -491,14 +493,6 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 
 	Context("gateway connectTo missing admin token", func() {
 		It("sets GatewayConnected=False condition when connectTo is configured but admin token is missing", func() {
-			// Create the RPC secret that connectTo references
-			rpcSecret := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: "pe-unraid-rpc-secret", Namespace: peNamespace},
-				StringData: map[string]string{"rpc-secret": strings.Repeat("a", 64)},
-			}
-			_ = k8sClient.Delete(ctx, rpcSecret)
-			Expect(k8sClient.Create(ctx, rpcSecret)).To(Succeed())
-
 			cluster := &garagev1beta2.GarageCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: peClusterName, Namespace: peNamespace},
 				Spec: garagev1beta2.GarageClusterSpec{
@@ -518,13 +512,9 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 					// No spec.admin configured — gateway's own admin API is unauthenticated/unconfigured
 				},
 			}
-			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
-			reconcileTwice()
+			reconciler.reconcileGatewayConnection(ctx, cluster)
 
-			updated := &garagev1beta2.GarageCluster{}
-			Expect(k8sClient.Get(ctx, nn, updated)).To(Succeed())
-
-			cond := findCondition(updated.Status.Conditions, garagev1beta1.ConditionGatewayConnected)
+			cond := findCondition(cluster.Status.Conditions, garagev1beta1.ConditionGatewayConnected)
 			Expect(cond).NotTo(BeNil(), "GatewayConnected condition should be set")
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(garagev1beta1.ReasonAdminTokenMissing))

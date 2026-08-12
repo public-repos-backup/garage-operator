@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +36,7 @@ import (
 
 	v1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	"github.com/rajsinghtech/garage-operator/internal/factormigration"
+	"github.com/rajsinghtech/garage-operator/internal/garageconfig"
 	"github.com/rajsinghtech/garage-operator/internal/workloadidentity"
 )
 
@@ -61,6 +61,7 @@ const (
 	garageConfigFileEnv                  = "GARAGE_CONFIG_FILE"
 	storageClassNameJSONField            = "storageClassName"
 	selectorJSONField                    = "selector"
+	publicEndpointTypeExternalIP         = "ExternalIP"
 )
 
 var operatorReservedLayoutTagPrefixes = []string{
@@ -207,7 +208,10 @@ func (v *GarageClusterValidator) ValidateUpdate(ctx context.Context, oldObj, new
 		return nil, err
 	}
 	validationObj.Spec.PodLabels = workloadidentity.UserPodLabels(validationObj.Spec.PodLabels)
-	warnings, err := validationObj.validateGarageCluster()
+	oldDefaulted := oldObj.DeepCopy()
+	_ = (&GarageClusterDefaulter{}).Default(ctx, oldDefaulted)
+	allowUnchangedLegacy := equality.Semantic.DeepEqual(oldDefaulted.Spec, newObj.Spec)
+	warnings, err := validationObj.validateGarageClusterWithOptions(allowUnchangedLegacy)
 	if grandfatherManagedName {
 		warnings = append(warnings, "metadata.name is grandfathered for this non-expanding update; adding or rolling a managed workload remains blocked until the derived Kubernetes names are valid")
 	}
@@ -873,7 +877,19 @@ func (v *GarageClusterValidator) ValidateDelete(ctx context.Context, obj *Garage
 
 // validateGarageCluster validates the GarageCluster spec.
 func (r *GarageCluster) validateGarageCluster() (admission.Warnings, error) {
+	return r.validateGarageClusterWithOptions(false)
+}
+
+func (r *GarageCluster) validateGarageClusterWithOptions(allowUnchangedLegacy bool) (admission.Warnings, error) {
 	var warnings admission.Warnings
+	if !allowUnchangedLegacy {
+		if err := validateSupportedPublicEndpoint(r.Spec.PublicEndpoint, "spec.publicEndpoint"); err != nil {
+			return warnings, err
+		}
+		if err := validateServiceConfig(r.Spec.Network.Service); err != nil {
+			return warnings, err
+		}
+	}
 	if err := validateManagedGarageClusterName(r); err != nil {
 		return warnings, err
 	}
@@ -924,7 +940,7 @@ func (r *GarageCluster) validateGarageCluster() (admission.Warnings, error) {
 	if err := r.validateZoneRedundancy(); err != nil {
 		return warnings, err
 	}
-	if err := r.validateRemoteClusters(); err != nil {
+	if err := r.validateRemoteClusters(allowUnchangedLegacy); err != nil {
 		return warnings, err
 	}
 	if len(r.Spec.RemoteClusters) > 0 && r.Spec.DeletionPolicy == "" {
@@ -947,7 +963,7 @@ func (r *GarageCluster) validateGarageCluster() (admission.Warnings, error) {
 	}
 	warnings = append(warnings, v1beta1StorageDrainWarnings(r)...)
 
-	if err := r.validateGateway(); err != nil {
+	if err := r.validateGateway(allowUnchangedLegacy); err != nil {
 		return warnings, err
 	}
 
@@ -964,8 +980,13 @@ func (r *GarageCluster) validateGarageCluster() (admission.Warnings, error) {
 		}
 	}
 
-	if err := r.validateAPIs(); err != nil {
-		return warnings, err
+	if !allowUnchangedLegacy {
+		if err := r.validateAPIs(); err != nil {
+			return warnings, err
+		}
+		if err := r.validateGarageConfigValues(); err != nil {
+			return warnings, err
+		}
 	}
 
 	if err := r.validateLayoutManagement(); err != nil {
@@ -993,6 +1014,63 @@ func (r *GarageCluster) validateGarageCluster() (admission.Warnings, error) {
 	}
 
 	return warnings, nil
+}
+
+func validateSupportedPublicEndpoint(endpoint *PublicEndpointConfig, field string) error {
+	if endpoint == nil {
+		return nil
+	}
+	if endpoint.Type == publicEndpointTypeExternalIP || endpoint.ExternalIP != nil {
+		return fmt.Errorf("%s.externalIP is not supported; use LoadBalancer, NodePort, or set spec.network.rpcPublicAddr", field)
+	}
+	if endpoint.Type == "Headless" {
+		return fmt.Errorf("%s type Headless is not supported: managed pods do not have an externally resolvable per-node DNS address; use LoadBalancer, NodePort, or set spec.network.rpcPublicAddr", field)
+	}
+	switch endpoint.Type {
+	case "LoadBalancer":
+		if endpoint.NodePort != nil {
+			return fmt.Errorf("%s.nodePort is only valid with type NodePort", field)
+		}
+	case "NodePort":
+		if endpoint.LoadBalancer != nil {
+			return fmt.Errorf("%s.loadBalancer is only valid with type LoadBalancer", field)
+		}
+		if endpoint.NodePort == nil || len(endpoint.NodePort.ExternalAddresses) == 0 {
+			return fmt.Errorf("%s.nodePort.externalAddresses must contain at least one externally reachable address", field)
+		}
+	default:
+		return fmt.Errorf("%s.type must be LoadBalancer or NodePort", field)
+	}
+	return nil
+}
+
+// ValidateSupportedPublicEndpoint applies the public endpoint contract during
+// reconciliation as well as admission, so directly persisted legacy objects
+// cannot silently select an unimplemented exposure mode.
+func ValidateSupportedPublicEndpoint(endpoint *PublicEndpointConfig, field string) error {
+	return validateSupportedPublicEndpoint(endpoint, field)
+}
+
+func validateServiceConfig(service *ServiceConfig) error {
+	if service == nil {
+		return nil
+	}
+	serviceType := service.Type
+	if serviceType == "" {
+		serviceType = corev1.ServiceTypeClusterIP
+	}
+	if (service.LoadBalancerIP != "" || len(service.LoadBalancerSourceRanges) > 0) && serviceType != corev1.ServiceTypeLoadBalancer {
+		return fmt.Errorf("spec.network.service loadBalancerIP and loadBalancerSourceRanges require type: LoadBalancer")
+	}
+	if service.ExternalTrafficPolicy != "" {
+		if service.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyCluster && service.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
+			return fmt.Errorf("spec.network.service.externalTrafficPolicy must be Cluster or Local")
+		}
+		if serviceType != corev1.ServiceTypeLoadBalancer && serviceType != corev1.ServiceTypeNodePort {
+			return fmt.Errorf("spec.network.service.externalTrafficPolicy requires type: LoadBalancer or NodePort")
+		}
+	}
+	return nil
 }
 
 const maxManagedTierReplicas int32 = 50
@@ -1501,12 +1579,17 @@ func neutralizeLegacyV1Beta1GarageClusterReplicaBoundForValidation(
 	)}, nil
 }
 
-func (r *GarageCluster) validateRemoteClusters() error {
+func (r *GarageCluster) validateRemoteClusters(allowUnchangedLegacy ...bool) error {
+	allowLegacy := len(allowUnchangedLegacy) > 0 && allowUnchangedLegacy[0]
 	names := make(map[string]int, len(r.Spec.RemoteClusters))
 	zones := make(map[string]int, len(r.Spec.RemoteClusters))
 	for i := range r.Spec.RemoteClusters {
-		name := strings.TrimSpace(r.Spec.RemoteClusters[i].Name)
-		zone := strings.TrimSpace(r.Spec.RemoteClusters[i].Zone)
+		remote := &r.Spec.RemoteClusters[i]
+		if !allowLegacy && remote.DefaultCapacity != nil {
+			return fmt.Errorf("spec.remoteClusters[%d].defaultCapacity is not supported; remote role capacity is owned by the source cluster layout", i)
+		}
+		name := strings.TrimSpace(remote.Name)
+		zone := strings.TrimSpace(remote.Zone)
 		if name == "" || zone == "" {
 			return fmt.Errorf("spec.remoteClusters[%d] name and zone must not be empty or whitespace", i)
 		}
@@ -1518,6 +1601,14 @@ func (r *GarageCluster) validateRemoteClusters() error {
 			return fmt.Errorf("spec.remoteClusters[%d].zone %q duplicates spec.remoteClusters[%d]; each physical Garage site must have a unique zone", i, zone, previous)
 		}
 		zones[zone] = i
+		if !allowLegacy {
+			if err := garageconfig.ValidateAdminAPIEndpoint(
+				remote.Connection.AdminAPIEndpoint,
+				fmt.Sprintf("spec.remoteClusters[%d].connection.adminApiEndpoint", i),
+			); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -1569,7 +1660,8 @@ func (r *GarageCluster) isManagementHandle() bool {
 		r.Spec.Storage.Data == nil
 }
 
-func (r *GarageCluster) validateGateway() error {
+func (r *GarageCluster) validateGateway(allowUnchangedLegacy ...bool) error {
+	allowLegacy := len(allowUnchangedLegacy) > 0 && allowUnchangedLegacy[0]
 	if r.Spec.ConnectTo != nil && r.Spec.ConnectTo.ClusterRef != nil &&
 		r.Spec.ConnectTo.ClusterRef.Namespace != "" && r.Spec.ConnectTo.ClusterRef.Namespace != r.Namespace {
 		return fmt.Errorf("connectTo.clusterRef.namespace must be empty or match metadata.namespace; cross-namespace credential and layout inheritance is not permitted")
@@ -1606,6 +1698,16 @@ func (r *GarageCluster) validateGateway() error {
 	}
 
 	if r.Spec.ConnectTo != nil {
+		if !allowLegacy && r.Spec.ConnectTo.ClusterRef != nil {
+			if err := ValidateClusterReference(*r.Spec.ConnectTo.ClusterRef, "spec.connectTo.clusterRef"); err != nil {
+				return err
+			}
+		}
+		if !allowLegacy {
+			if err := garageconfig.ValidateAdminAPIEndpoint(r.Spec.ConnectTo.AdminAPIEndpoint, "spec.connectTo.adminApiEndpoint"); err != nil {
+				return err
+			}
+		}
 		// A management handle needs an Admin-API path; a gateway needs an RPC path.
 		// adminApiEndpoint is a valid handle path (the common Helm-adoption case).
 		if r.Spec.ConnectTo.ClusterRef == nil &&
@@ -2258,36 +2360,101 @@ func validateV1Beta1DataPathVolumeConfig(vc *DataPathVolumeConfig, field string)
 }
 
 func (r *GarageCluster) validateAPIs() error {
-	if r.Spec.Network.RPCBindAddress != "" {
-		if err := validateBindAddress(r.Spec.Network.RPCBindAddress, "network.rpcBindAddress"); err != nil {
+	if r.isManagementHandle() {
+		return nil
+	}
+	listeners := make([]garageconfig.ListenerPort, 0, 5)
+	add := func(address string, configuredPort, defaultPort int32, field string) error {
+		port, err := garageconfig.ManagedBindPort(address, configuredPort, defaultPort, field)
+		if err != nil {
+			return err
+		}
+		listeners = append(listeners, garageconfig.ListenerPort{Field: field, Port: port})
+		return nil
+	}
+	if err := add(r.Spec.Network.RPCBindAddress, r.Spec.Network.RPCBindPort, 3901, "spec.network.rpcBindAddress"); err != nil {
+		return err
+	}
+	if r.Spec.S3API == nil {
+		listeners = append(listeners, garageconfig.ListenerPort{Field: "spec.s3Api.bindAddress", Port: 3900})
+	} else if err := add(r.Spec.S3API.BindAddress, r.Spec.S3API.BindPort, 3900, "spec.s3Api.bindAddress"); err != nil {
+		return err
+	}
+	if r.Spec.K2VAPI != nil {
+		if err := add(r.Spec.K2VAPI.BindAddress, r.Spec.K2VAPI.BindPort, 3904, "spec.k2vApi.bindAddress"); err != nil {
 			return err
 		}
 	}
-
-	if r.Spec.S3API != nil && r.Spec.S3API.BindAddress != "" {
-		if err := validateBindAddress(r.Spec.S3API.BindAddress, "s3Api"); err != nil {
+	if r.Spec.WebAPI == nil {
+		listeners = append(listeners, garageconfig.ListenerPort{Field: "spec.webApi.bindAddress", Port: 3902})
+	} else if r.Spec.WebAPI.Enabled == nil || *r.Spec.WebAPI.Enabled {
+		if err := add(r.Spec.WebAPI.BindAddress, r.Spec.WebAPI.BindPort, 3902, "spec.webApi.bindAddress"); err != nil {
 			return err
 		}
 	}
+	if r.Spec.Admin == nil {
+		listeners = append(listeners, garageconfig.ListenerPort{Field: "spec.admin.bindAddress", Port: 3903})
+	} else if err := add(r.Spec.Admin.BindAddress, r.Spec.Admin.BindPort, 3903, "spec.admin.bindAddress"); err != nil {
+		return err
+	}
+	return garageconfig.ValidateDistinctListenerPorts(listeners)
+}
 
-	if r.Spec.K2VAPI != nil && r.Spec.K2VAPI.BindAddress != "" {
-		if err := validateBindAddress(r.Spec.K2VAPI.BindAddress, "k2vApi"); err != nil {
+func (r *GarageCluster) validateGarageConfigValues() error {
+	if r.Spec.Network.RPCPingTimeout != nil {
+		if err := garageconfig.ValidateRPCDuration(r.Spec.Network.RPCPingTimeout.Duration, "spec.network.rpcPingTimeout"); err != nil {
 			return err
 		}
 	}
-
-	if r.Spec.WebAPI != nil && r.Spec.WebAPI.BindAddress != "" {
-		if err := validateBindAddress(r.Spec.WebAPI.BindAddress, "webApi"); err != nil {
+	if r.Spec.Network.RPCTimeout != nil {
+		if err := garageconfig.ValidateRPCDuration(r.Spec.Network.RPCTimeout.Duration, "spec.network.rpcTimeout"); err != nil {
 			return err
 		}
 	}
-
-	if r.Spec.Admin != nil && r.Spec.Admin.BindAddress != "" {
-		if err := validateAdminBindAddress(r.Spec.Admin.BindAddress); err != nil {
+	if err := garageconfig.ValidateMetadataSnapshotInterval(
+		r.Spec.Storage.MetadataAutoSnapshotInterval,
+		"spec.storage.metadataAutoSnapshotInterval",
+	); err != nil {
+		return err
+	}
+	if r.Spec.Database != nil {
+		if err := validatePositiveQuantity(r.Spec.Database.LMDBMapSize, "spec.database.lmdbMapSize"); err != nil {
+			return err
+		}
+		if err := validatePositiveQuantity(r.Spec.Database.FjallBlockCacheSize, "spec.database.fjallBlockCacheSize"); err != nil {
 			return err
 		}
 	}
+	if r.Spec.Blocks != nil {
+		if err := validatePositiveQuantity(r.Spec.Blocks.Size, "spec.blocks.size"); err != nil {
+			return err
+		}
+		if err := validatePositiveQuantity(r.Spec.Blocks.RAMBufferMax, "spec.blocks.ramBufferMax"); err != nil {
+			return err
+		}
+		if r.Spec.Blocks.CompressionLevel != nil {
+			if err := garageconfig.ValidateCompressionLevel(*r.Spec.Blocks.CompressionLevel, "spec.blocks.compressionLevel"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
 
+// validateBindAddress is retained for focused package tests and delegates to
+// the shared managed-listener contract used by every API endpoint.
+func validateBindAddress(addr, field string) error {
+	if addr == "" {
+		return fmt.Errorf("%s.bindAddress must not be empty", field)
+	}
+	_, err := garageconfig.ManagedBindPort(addr, 0, 3900, field+".bindAddress")
+	return err
+}
+
+func validatePositiveQuantity(value *resource.Quantity, field string) error {
+	if value != nil && value.Sign() <= 0 {
+		return fmt.Errorf("%s must be greater than zero", field)
+	}
 	return nil
 }
 
@@ -2314,39 +2481,9 @@ func (r *GarageCluster) validateLayoutManagement() error {
 	return nil
 }
 
-func validateBindAddress(addr, field string) error {
-	if len(addr) > 7 && addr[:7] == "unix://" {
-		return nil
-	}
-
-	tcpPattern := regexp.MustCompile(`^(\[.*\]|[^:]+)?:\d+$`)
-	if !tcpPattern.MatchString(addr) {
-		return fmt.Errorf("%s.bindAddress: invalid format '%s' (expected '[host]:port' or 'unix:///path')", field, addr)
-	}
-
-	return nil
-}
-
 func validateAdminBindAddress(addr string) error {
-	if err := validateBindAddress(addr, "admin"); err != nil {
-		return err
-	}
-	host, portText, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("admin.bindAddress: managed workloads require an explicit wildcard TCP address such as '0.0.0.0:3903' or '[::]:3903'")
-	}
-	if host == "" {
-		return fmt.Errorf("admin.bindAddress: an explicit wildcard IP is required; Garage does not accept an empty host, so use 0.0.0.0 or [::]")
-	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsUnspecified() {
-		return fmt.Errorf("admin.bindAddress: host %q is not a wildcard address; managed Services and direct Pod probes require 0.0.0.0 or [::]", host)
-	}
-	port, err := strconv.ParseUint(portText, 10, 16)
-	if err != nil || port == 0 {
-		return fmt.Errorf("admin.bindAddress: port %q must be between 1 and 65535", portText)
-	}
-	return nil
+	_, err := garageconfig.ManagedBindPort(addr, 0, 3903, "admin.bindAddress")
+	return err
 }
 
 func adminPortForUpdateValidation(cluster *GarageCluster) (uint16, error) {

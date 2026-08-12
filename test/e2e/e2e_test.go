@@ -41,7 +41,11 @@ import (
 // namespace where the project is deployed in
 // e2eGarageImage is the upstream Garage the suite runs. Kept at v2.3.0 to match
 // the operator's defaultGarageImage; the topology suites cover v2.2.0.
-const e2eGarageImage = "dxflrs/garage:v2.3.0"
+const e2eGarageImage = "dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690"
+
+const e2eCurlImage = "curlimages/curl:8.14.1@sha256:9a1ed35addb45476afa911696297f8e115993df459278ed036182dd2cd22b67b"
+
+const e2eAWSCLIImage = "amazon/aws-cli:2.27.41@sha256:bc6b7bba44ce38f9604ede49c584824af919047ea03fbcc7c7610671fdef95d8"
 
 const namespace = "garage-operator-system"
 
@@ -550,13 +554,13 @@ var _ = Describe("Manager", Ordered, Label("manager"), func() {
 			metricsURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:8443/metrics", metricsServiceName, namespace)
 			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
 				"--namespace", namespace,
-				"--image=docker.io/curlimages/curl:latest",
+				"--image="+e2eCurlImage,
 				"--overrides",
 				fmt.Sprintf(`{
 					"spec": {
 						"containers": [{
 							"name": "curl",
-							"image": "docker.io/curlimages/curl:latest",
+							"image": %q,
 							"imagePullPolicy": "IfNotPresent",
 							"command": ["/bin/sh", "-c"],
 							"args": ["i=0; until [ $i -ge 120 ]; do curl -sfv -H 'Authorization: Bearer %s' %s && exit 0; i=$((i+1)); sleep 1; done; exit 1"],
@@ -575,7 +579,7 @@ var _ = Describe("Manager", Ordered, Label("manager"), func() {
 						}],
 						"serviceAccountName": "%s"
 					}
-				}`, token, metricsURL, serviceAccountName))
+				}`, e2eCurlImage, token, metricsURL, serviceAccountName))
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
 
@@ -1602,12 +1606,27 @@ spec:
 			}, 3*time.Minute, 30*time.Second).Should(Succeed())
 
 			By("cleaning up drift test resources")
-			cmd := exec.Command("kubectl", "delete", "garagekey", driftKeyName,
-				"-n", testNamespace, "--ignore-not-found")
-			_, _ = utils.Run(cmd)
-			cmd = exec.Command("kubectl", "delete", "garagebucket", "drift-test-bucket",
-				"-n", testNamespace, "--ignore-not-found")
-			_, _ = utils.Run(cmd)
+			deleteObjectCmd := fmt.Sprintf(
+				`aws s3api delete-object --endpoint-url %s --region garage --bucket %s --key %s`,
+				endpoint, driftBucketID, testObject,
+			)
+			Eventually(func(g Gomega) {
+				output := runAWSCLI(g, testNamespace, "drift-s3-delete-object", deleteObjectCmd, driftKeyName, true)
+				g.Expect(output).NotTo(ContainSubstring("An error occurred"),
+					"DeleteObject failed. Full output: %s", output)
+			}, 2*time.Minute, 10*time.Second).Should(Succeed())
+
+			// Finalize the now-empty bucket while the recovered key and its Secret
+			// still exist. Deleting the key first needlessly removes the exact
+			// credential path that this cleanup has just proven works.
+			cmd := exec.Command("kubectl", "delete", "garagebucket", "drift-test-bucket",
+				"-n", testNamespace, "--ignore-not-found", "--timeout=2m")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete empty drift test bucket: %s", output)
+			cmd = exec.Command("kubectl", "delete", "garagekey", driftKeyName,
+				"-n", testNamespace, "--ignore-not-found", "--timeout=2m")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete drift test key: %s", output)
 		})
 
 		It("should register gateway nodes in the cluster layout with capacity=nil", func() {
@@ -2218,30 +2237,7 @@ spec:
 		verifyGatewayRole := func(g Gomega) {
 			curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterLayout",
 				adminToken, clusterName, testNamespace)
-			cmd := exec.Command("kubectl", "run", "curl-unified-layout", "--rm", "-i", "--restart=Never",
-				"-n", testNamespace,
-				"--image=docker.io/curlimages/curl:latest",
-				"--overrides", fmt.Sprintf(`{
-					"spec": {
-						"containers": [{
-							"name": "curl-unified-layout",
-							"image": "docker.io/curlimages/curl:latest",
-							"imagePullPolicy": "IfNotPresent",
-							"command": ["/bin/sh", "-c"],
-							"args": [%q],
-							"securityContext": {
-								"readOnlyRootFilesystem": true,
-								"allowPrivilegeEscalation": false,
-								"capabilities": {"drop": ["ALL"]},
-								"runAsNonRoot": true,
-								"runAsUser": 1000,
-								"seccompProfile": {"type": "RuntimeDefault"}
-							}
-						}]
-					}
-				}`, curlCmd))
-			output, err := utils.Run(cmd)
-			g.Expect(err).NotTo(HaveOccurred(), "Failed to query layout: %s", output)
+			output := runCurlPod(g, testNamespace, "curl-unified-layout", curlCmd)
 
 			var layout struct {
 				Roles []struct {
@@ -3563,29 +3559,7 @@ spec:
 				// Use a separate curl pod to query the admin API (Garage containers are distroless)
 				curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterLayout",
 					adminToken, clusterName, testNamespace)
-				cmd := exec.Command("kubectl", "run", "curl-layout-zones", "--rm", "-i", "--restart=Never",
-					"-n", testNamespace, "--image=docker.io/curlimages/curl:latest",
-					fmt.Sprintf("--overrides=%s", fmt.Sprintf(`{
-						"spec": {
-							"containers": [{
-								"name": "curl-layout-zones",
-								"image": "docker.io/curlimages/curl:latest",
-								"imagePullPolicy": "IfNotPresent",
-								"command": ["/bin/sh", "-c"],
-								"args": [%q],
-								"securityContext": {
-									"readOnlyRootFilesystem": true,
-									"allowPrivilegeEscalation": false,
-									"capabilities": {"drop": ["ALL"]},
-									"runAsNonRoot": true,
-									"runAsUser": 1000,
-									"seccompProfile": {"type": "RuntimeDefault"}
-								}
-							}]
-						}
-					}`, curlCmd)))
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to query layout: %s", output)
+				output := runCurlPod(g, testNamespace, "curl-layout-zones", curlCmd)
 
 				// Parse the layout JSON to find zones
 				var layout struct {
@@ -4259,7 +4233,7 @@ metadata:
   name: %s
   namespace: %s
 spec:
-  image: dxflrs/garage:v2.3.0
+  image: dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690
   gateway:
     replicas: 1
     resources:
@@ -5824,7 +5798,7 @@ spec:
 			}, 2*time.Minute, 10*time.Second).Should(Succeed())
 		})
 
-		It("should render credentials whose endpoint comes from connectTo, not a managed Service", func() {
+		It("should render credentials without inferring S3 from the external Admin endpoint", func() {
 			keyYAML := fmt.Sprintf(`
 apiVersion: garage.rajsingh.info/v1beta1
 kind: GarageKey
@@ -5839,6 +5813,8 @@ spec:
         name: %s
       read: true
       write: true
+  secretTemplate:
+    includeEndpoint: false
 `, keyName, testNamespace, handleName, bucketName)
 
 			Eventually(func(g Gomega) {
@@ -5857,13 +5833,13 @@ spec:
 				g.Expect(o).NotTo(BeEmpty(), "access-key-id missing from secret")
 			}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-			By("verifying the endpoint is derived from connectTo.adminApiEndpoint's host")
+			By("verifying no endpoint is inferred from connectTo.adminApiEndpoint")
 			c := exec.Command("kubectl", "get", "secret", keyName, "-n", testNamespace,
-				"-o", `go-template={{ index .data "endpoint" | base64decode }}`)
+				"-o", `go-template={{ if index .data "endpoint" }}present{{ end }}`)
 			o, err := utils.Run(c)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(o).To(Equal(s3Endpoint),
-				"endpoint must point at the external cluster, not a nonexistent managed Service")
+			Expect(o).To(BeEmpty(),
+				"management-handle credentials must not derive an S3 endpoint from the Admin API URL")
 
 			By("verifying the key exists on the external cluster's Admin API")
 			accessKeyID := readSecretValue(testNamespace, keyName, "access-key-id")
@@ -5901,6 +5877,8 @@ metadata:
 spec:
   clusterRef:
     name: %s
+  secretTemplate:
+    includeEndpoint: false
 `, deniedKeyName, testNamespace, handleName)
 
 			Eventually(func(g Gomega) {
@@ -5935,6 +5913,14 @@ spec:
 		})
 
 		It("should leave the external workload running after the handle is deleted", func() {
+			By("removing the data-plane fixture before finalizing its bucket")
+			script := fmt.Sprintf(
+				`aws s3api delete-object --endpoint-url %s --region garage --bucket %s --key obj`,
+				s3Endpoint, bucketName)
+			Eventually(func(g Gomega) {
+				_ = runAWSCLI(g, testNamespace, "handle-s3-cleanup", script, keyName, true)
+			}, 3*time.Minute, 30*time.Second).Should(Succeed())
+
 			By("deleting the CRs the operator manages")
 			for _, args := range [][]string{
 				{"garagekey", keyName}, {"garagekey", deniedKeyName},
@@ -6044,7 +6030,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: garage
-          image: dxflrs/garage:v2.3.0
+          image: dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690
           command: ["/garage", "server"]
           securityContext:
             allowPrivilegeEscalation: false
@@ -6126,13 +6112,13 @@ func runCurlPod(g Gomega, ns, podName, script string) string {
 	defer deletePod()
 
 	cmd := exec.Command("kubectl", "run", podName, "--restart=Never", "--attach=false",
-		"-n", ns, "--image=docker.io/curlimages/curl:latest",
+		"-n", ns, "--image="+e2eCurlImage,
 		"--overrides", fmt.Sprintf(`{
 			"spec": {
 				"restartPolicy": "Never",
 				"containers": [{
 					"name": %q,
-					"image": "docker.io/curlimages/curl:latest",
+					"image": %q,
 					"imagePullPolicy": "IfNotPresent",
 					"command": ["/bin/sh", "-c"],
 					"args": [%q],
@@ -6146,7 +6132,7 @@ func runCurlPod(g Gomega, ns, podName, script string) string {
 					}
 				}]
 			}
-		}`, podName, script))
+		}`, podName, e2eCurlImage, script))
 	out, err := utils.Run(cmd)
 	g.Expect(err).NotTo(HaveOccurred(), "failed to start curl pod: %s", out)
 
@@ -6231,12 +6217,12 @@ func runAWSCLI(g Gomega, ns, podName, script, credentialSecretName string, expec
 
 	// readOnlyRootFilesystem is omitted: aws-cli writes its credential cache to /tmp.
 	cmd := exec.Command("kubectl", "run", podName, "--restart=Never", "--attach=false",
-		"-n", ns, "--image=docker.io/amazon/aws-cli:latest",
+		"-n", ns, "--image="+e2eAWSCLIImage,
 		"--overrides", fmt.Sprintf(`{
 			"spec": {
 				"containers": [{
 					"name": %q,
-					"image": "docker.io/amazon/aws-cli:latest",
+					"image": %q,
 					"imagePullPolicy": "IfNotPresent",
 					"command": ["/bin/sh", "-c"],
 					"args": [%q],
@@ -6260,7 +6246,7 @@ func runAWSCLI(g Gomega, ns, podName, script, credentialSecretName string, expec
 					}
 				}]
 			}
-		}`, podName, script, credentialSecretName, credentialSecretName))
+		}`, podName, e2eAWSCLIImage, script, credentialSecretName, credentialSecretName))
 	out, err := utils.Run(cmd)
 	g.Expect(err).NotTo(HaveOccurred(), "failed to start aws-cli pod: %s", out)
 
@@ -8134,31 +8120,7 @@ var _ = Describe("Auto Mode zoneFrom", Ordered, Label("zone-from"), func() {
 		EventuallyWithOffset(1, func(g Gomega) {
 			script := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterLayout",
 				adminToken, clusterName, testNamespace)
-			_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", "zf-layout-check",
-				"-n", testNamespace, "--ignore-not-found", "--force", "--grace-period=0"))
-			cmd := exec.Command("kubectl", "run", "zf-layout-check", "--rm", "-i", "--restart=Never",
-				"-n", testNamespace, "--image=docker.io/curlimages/curl:latest",
-				"--overrides", fmt.Sprintf(`{
-					"spec": {
-						"containers": [{
-							"name": "zf-layout-check",
-							"image": "docker.io/curlimages/curl:latest",
-							"imagePullPolicy": "IfNotPresent",
-							"command": ["/bin/sh", "-c"],
-							"args": [%q],
-							"securityContext": {
-								"readOnlyRootFilesystem": true,
-								"allowPrivilegeEscalation": false,
-								"capabilities": {"drop": ["ALL"]},
-								"runAsNonRoot": true,
-								"runAsUser": 1000,
-								"seccompProfile": {"type": "RuntimeDefault"}
-							}
-						}]
-					}
-				}`, script))
-			out, err := utils.Run(cmd)
-			g.Expect(err).NotTo(HaveOccurred(), "layout query failed: %s", out)
+			out := runCurlPod(g, testNamespace, "zf-layout-check", script)
 			// Garage pretty-prints, so match the field rather than a compact substring.
 			g.Expect(out).To(MatchRegexp(`"zone":\s*"`+regexp.QuoteMeta(want)+`"`),
 				"layout should carry zone %q, got: %s", want, out)

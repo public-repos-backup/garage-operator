@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	v1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
+	"github.com/rajsinghtech/garage-operator/internal/garageconfig"
 	"github.com/rajsinghtech/garage-operator/internal/storagecontract"
 	"github.com/rajsinghtech/garage-operator/internal/workloadidentity"
 )
@@ -227,7 +228,7 @@ func (v *GarageNodeValidator) ValidateUpdate(ctx context.Context, oldObj, newObj
 	validationObj.Spec.Env = safeEnv
 	validationObj.Spec.EnvFrom = safeEnvFrom
 	validationObj.Spec.PodLabels = workloadidentity.UserPodLabels(validationObj.Spec.PodLabels)
-	warnings, err := validationObj.validateGarageNode()
+	warnings, err := validationObj.validateGarageNode(!specChanged)
 	if grandfatherManagedName {
 		warnings = append(warnings, "metadata.name is grandfathered for this non-expanding update; creating or rolling a StatefulSet-backed workload remains blocked until <name>-0 is a valid Kubernetes label value")
 	}
@@ -1259,8 +1260,15 @@ func (v *GarageNodeValidator) validateNodeLocalPoolControllerOwner(
 }
 
 // validateGarageNode validates the GarageNode spec.
-func (r *GarageNode) validateGarageNode() (admission.Warnings, error) {
+func (r *GarageNode) validateGarageNode(allowUnchangedLegacy ...bool) (admission.Warnings, error) {
 	var warnings admission.Warnings
+	allowLegacy := len(allowUnchangedLegacy) > 0 && allowUnchangedLegacy[0]
+	if r.Spec.External != nil && r.Spec.External.RemoteClusterRef != nil {
+		return warnings, fmt.Errorf("external.remoteClusterRef is not supported")
+	}
+	if err := ValidateSupportedPublicEndpoint(r.Spec.PublicEndpoint, "spec.publicEndpoint"); err != nil {
+		return warnings, err
+	}
 	if r.Spec.Backing != "" && r.Spec.Backing != NodeBackingStatefulSet && r.Spec.Backing != NodeBackingNodeLocalPool {
 		return warnings, fmt.Errorf("backing must be StatefulSet or NodeLocalPool, got %q", r.Spec.Backing)
 	}
@@ -1315,6 +1323,11 @@ func (r *GarageNode) validateGarageNode() (admission.Warnings, error) {
 
 	if r.Spec.ClusterRef.Name == "" {
 		return warnings, fmt.Errorf("clusterRef.name is required")
+	}
+	if !allowLegacy {
+		if err := ValidateClusterReference(r.Spec.ClusterRef, "clusterRef"); err != nil {
+			return warnings, err
+		}
 	}
 
 	// GarageNode does not support cross-namespace cluster references.
@@ -1623,6 +1636,12 @@ func (r *GarageNode) validateExternalNode() error {
 
 func (r *GarageNode) validateStorage() error {
 	storage := r.Spec.Storage
+	if err := garageconfig.ValidateMetadataSnapshotInterval(
+		storage.MetadataAutoSnapshotInterval,
+		"spec.storage.metadataAutoSnapshotInterval",
+	); err != nil {
+		return err
+	}
 
 	if storage.Metadata != nil {
 		if storage.Metadata.ReadOnly {

@@ -713,6 +713,30 @@ func TestConvert_ManagementHandleRoundTrip(t *testing.T) {
 	}
 }
 
+func TestConvert_AutoModePVCHandoffStatusRoundTrip(t *testing.T) {
+	original := &v1beta2.GarageCluster{
+		Status: v1beta2.GarageClusterStatus{AutoModePVCHandoffs: []v1beta2.AutoModePVCHandoffStatus{{
+			SlotName:                   "store-gateway-1",
+			PVCName:                    "metadata-store-gateway-1-0",
+			PVCUID:                     "pvc-uid",
+			PreviousGarageNodeUID:      "old-node-uid",
+			ReplacementReservationHash: "nonce-hash",
+			ReplacementGarageNodeUID:   "new-node-uid",
+		}}},
+	}
+	spoke := &GarageCluster{}
+	if err := spoke.ConvertFrom(original); err != nil {
+		t.Fatalf("ConvertFrom: %v", err)
+	}
+	roundTripped := &v1beta2.GarageCluster{}
+	if err := spoke.ConvertTo(roundTripped); err != nil {
+		t.Fatalf("ConvertTo: %v", err)
+	}
+	if !reflect.DeepEqual(roundTripped.Status.AutoModePVCHandoffs, original.Status.AutoModePVCHandoffs) {
+		t.Fatalf("Auto-mode PVC handoff status changed across conversion: got %#v, want %#v", roundTripped.Status.AutoModePVCHandoffs, original.Status.AutoModePVCHandoffs)
+	}
+}
+
 // TestConvert_ZoneFromRoundTrip: spec.zoneFrom (#294) exists on both versions,
 // so a cluster using per-node zones must survive v1beta1 -> v1beta2 -> v1beta1
 // with no annotation and no loss. Serving it on the deprecated version too is

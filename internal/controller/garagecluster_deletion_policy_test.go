@@ -18,9 +18,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
@@ -578,6 +581,97 @@ func TestGatewayLayoutRemovalAdvancesDrainingHistoryWithoutBypassingExclusions(t
 	}
 	if applyCalls != 1 {
 		t.Fatalf("gateway removal applied %d times across active rollout exclusion, want 1", applyCalls)
+	}
+}
+
+func TestReconcileDeletingGatewayRefreshesDurableRetirementIntent(t *testing.T) {
+	t.Parallel()
+	const nodeID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	version := uint64(3)
+	historyCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case pathGetClusterStatus:
+			_ = json.NewEncoder(w).Encode(garage.ClusterStatus{LayoutVersion: version})
+		case pathGetClusterLayout:
+			_ = json.NewEncoder(w).Encode(garage.ClusterLayout{Version: version})
+		case pathGetLayoutHistory:
+			historyCalls++
+			_ = json.NewEncoder(w).Encode(garage.LayoutHistoryResponse{
+				CurrentVersion: version,
+				Versions: []garage.LayoutVersion{
+					{Version: version - 1, Status: garage.LayoutVersionStatusDraining},
+					{Version: version, Status: garage.LayoutVersionStatusCurrent},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	scheme := deletionTestScheme(t)
+	now := metav1.Now()
+	cluster := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "stale-cache-edge", Namespace: testGarageValue, UID: "stale-cache-edge-uid",
+			Finalizers: []string{garageClusterFinalizer}, DeletionTimestamp: &now,
+		},
+		Spec: garagev1beta2.GarageClusterSpec{
+			Gateway: &garagev1beta2.GatewaySpec{Replicas: 1},
+			ConnectTo: &garagev1beta2.ConnectToConfig{
+				AdminAPIEndpoint: server.URL,
+				AdminTokenSecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: testExternalAdminSecretName},
+					Key:                  DefaultAdminTokenKey,
+				},
+			},
+		},
+	}
+	proof, err := storageDrainRemovalIntent(
+		nil, storageDrainActorForCluster(cluster), []string{nodeID}, nil, time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster.Status.StorageDrain = v1beta2StorageDrainStatus(proof)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: testExternalAdminSecretName, Namespace: cluster.Namespace},
+		Data:       map[string][]byte{DefaultAdminTokenKey: []byte("token")},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&garagev1beta2.GarageCluster{}).
+		WithObjects(cluster, secret).Build()
+	staleCache := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, object, opts...); err != nil {
+				return err
+			}
+			if stale, ok := object.(*garagev1beta2.GarageCluster); ok && key == client.ObjectKeyFromObject(cluster) {
+				stale.Status.StorageDrain = nil
+			}
+			return nil
+		},
+	})
+	reconciler := &GarageClusterReconciler{
+		Client: staleCache, APIReader: base, Scheme: scheme, ClusterScoped: true,
+		LayoutMutations: NewLayoutMutationCoordinator(),
+	}
+
+	_, err = reconciler.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)})
+	if !stderrors.Is(err, errLayoutMutationPending) {
+		t.Fatalf("stale-cache deletion reconcile = %v, want pending layout-history settlement", err)
+	}
+	if historyCalls == 0 {
+		t.Fatal("deletion reconcile forgot the durable gateway-retirement intent from the authoritative API read")
+	}
+	remaining := &garagev1beta2.GarageCluster{}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(cluster), remaining); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(remaining.Finalizers, garageClusterFinalizer) {
+		t.Fatal("deletion reconcile released the finalizer while gateway role-removal history was draining")
 	}
 }
 

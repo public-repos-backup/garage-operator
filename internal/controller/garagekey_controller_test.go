@@ -547,7 +547,7 @@ var _ = Describe("GarageKey Controller", func() {
 			defer srv.Close()
 
 			r := &GarageKeyReconciler{}
-			err := r.finalize(context.Background(), buildKey(), garage.NewClient(srv.URL, "tok"))
+			err := r.finalize(context.Background(), buildKey(), nil, garage.NewClient(srv.URL, "tok"))
 
 			Expect(err).NotTo(HaveOccurred())
 			Expect(denyCalls).To(ConsistOf(bucketIDGood1, bucketIDStuck, bucketIDGood2))
@@ -561,10 +561,26 @@ var _ = Describe("GarageKey Controller", func() {
 			defer srv.Close()
 
 			r := &GarageKeyReconciler{}
-			err := r.finalize(context.Background(), buildKey(), garage.NewClient(srv.URL, "tok"))
+			err := r.finalize(context.Background(), buildKey(), nil, garage.NewClient(srv.URL, "tok"))
 
 			Expect(err).NotTo(HaveOccurred())
 			Expect(denyCalls).To(HaveLen(3))
+			Expect(atomic.LoadInt32(&deleteCalls)).To(Equal(int32(1)))
+		})
+
+		It("pre-revokes grants preserved only in managedBucketGrants", func() {
+			var denyCalls []string
+			var deleteCalls int32
+			srv := newServer(nil, http.StatusOK, &denyCalls, &deleteCalls)
+			defer srv.Close()
+
+			key := buildKey()
+			key.Status.Buckets = nil
+			key.Status.ManagedBucketGrants = []string{bucketIDGood2}
+			err := (&GarageKeyReconciler{}).finalize(context.Background(), key, nil, garage.NewClient(srv.URL, "tok"))
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(denyCalls).To(Equal([]string{bucketIDGood2}))
 			Expect(atomic.LoadInt32(&deleteCalls)).To(Equal(int32(1)))
 		})
 
@@ -584,7 +600,7 @@ var _ = Describe("GarageKey Controller", func() {
 			done := make(chan error, 1)
 			start := time.Now()
 			go func() {
-				done <- r.finalize(context.Background(), buildKey(), garage.NewClient(srv.URL, "tok"))
+				done <- r.finalize(context.Background(), buildKey(), nil, garage.NewClient(srv.URL, "tok"))
 			}()
 
 			select {

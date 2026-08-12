@@ -87,6 +87,24 @@ var _ = Describe("BucketAccessReconciler", func() {
 			}
 			Expect(k8sClient.Status().Update(ctx, cluster)).To(Succeed())
 
+			// BucketClaim whose exact API-server UID must be carried by the
+			// cluster-scoped Bucket reference.
+			claim := &cosiv1alpha2.BucketClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      claimName,
+					Namespace: cosiTestNamespace,
+				},
+				Spec: cosiv1alpha2.BucketClaimSpec{
+					BucketClassName: "test-class",
+				},
+			}
+			Expect(k8sClient.Create(ctx, claim)).To(Succeed())
+			claim.Status = cosiv1alpha2.BucketClaimStatus{
+				BoundBucketName: bucketName,
+				ReadyToUse:      ptr.To(true),
+			}
+			Expect(k8sClient.Status().Update(ctx, claim)).To(Succeed())
+
 			// COSI Bucket with BucketID already provisioned
 			cosiGarageBucket := &cosiv1alpha2.Bucket{
 				ObjectMeta: metav1.ObjectMeta{Name: bucketName},
@@ -100,6 +118,7 @@ var _ = Describe("BucketAccessReconciler", func() {
 					BucketClaimRef: cosiv1alpha2.BucketClaimReference{
 						Name:      claimName,
 						Namespace: cosiTestNamespace,
+						UID:       claim.UID,
 					},
 				},
 			}
@@ -121,7 +140,9 @@ var _ = Describe("BucketAccessReconciler", func() {
 						LabelCOSIBucketID: truncateLabelValue(testBucketID),
 					},
 					Annotations: map[string]string{
-						AnnotationCOSIBucketID: testBucketID,
+						AnnotationCOSIBucketID:                        testBucketID,
+						annotationCOSIReservationOwner:                bucketName,
+						garagev1beta1.AnnotationCOSIProvisioningState: garagev1beta1.COSIProvisioningStateBound,
 					},
 				},
 				Spec: garagev1beta1.GarageBucketSpec{
@@ -133,23 +154,9 @@ var _ = Describe("BucketAccessReconciler", func() {
 				},
 			}
 			Expect(k8sClient.Create(ctx, shadowBucket)).To(Succeed())
+			shadowBucket.Status.BucketID = testBucketID
+			Expect(k8sClient.Status().Update(ctx, shadowBucket)).To(Succeed())
 
-			// BucketClaim bound to the Bucket
-			claim := &cosiv1alpha2.BucketClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      claimName,
-					Namespace: cosiTestNamespace,
-				},
-				Spec: cosiv1alpha2.BucketClaimSpec{
-					BucketClassName: "test-class",
-				},
-			}
-			Expect(k8sClient.Create(ctx, claim)).To(Succeed())
-			claim.Status = cosiv1alpha2.BucketClaimStatus{
-				BoundBucketName: bucketName,
-				ReadyToUse:      ptr.To(true),
-			}
-			Expect(k8sClient.Status().Update(ctx, claim)).To(Succeed())
 		})
 
 		AfterEach(func() {
@@ -203,6 +210,9 @@ var _ = Describe("BucketAccessReconciler", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      accessName,
 					Namespace: cosiTestNamespace,
+					Finalizers: []string{
+						cosiv1alpha2.ProtectionFinalizer,
+					},
 				},
 				Spec: cosiv1alpha2.BucketAccessSpec{
 					BucketAccessClassName: "test-access-class",
@@ -254,6 +264,7 @@ var _ = Describe("BucketAccessReconciler", func() {
 			Expect(err).NotTo(HaveOccurred())
 			withFinalizer := &cosiv1alpha2.BucketAccess{}
 			Expect(k8sClient.Get(ctx, accessNN, withFinalizer)).To(Succeed())
+			Expect(withFinalizer.Finalizers).To(ContainElement(GarageProtectionFinalizer))
 			Expect(withFinalizer.Finalizers).To(ContainElement(cosiv1alpha2.ProtectionFinalizer))
 
 			By("second reconcile grants access")
@@ -272,11 +283,27 @@ var _ = Describe("BucketAccessReconciler", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: cosiTestNamespace}, sec)).To(Succeed())
 			Expect(sec.Data).To(HaveKey("S3_ACCESS_KEY_ID"))
 			Expect(sec.Data).To(HaveKey("S3_ACCESS_SECRET_KEY"))
+			Expect(sec.Data).To(HaveKey(string(cosiv1alpha2.CredentialVar_S3_AccessKeyId)))
+			Expect(sec.Data).To(HaveKey(string(cosiv1alpha2.CredentialVar_S3_AccessSecretKey)))
+			Expect(string(sec.Data[string(cosiv1alpha2.BucketInfoVar_S3_AddressingStyle)])).To(Equal("path"))
 			Expect(string(sec.Data["S3_ACCESS_KEY_ID"])).NotTo(BeEmpty())
 			Expect(string(sec.Data["S3_ACCESS_SECRET_KEY"])).NotTo(BeEmpty())
 
 			By("verifying the protection finalizer is present")
-			Expect(updated.Finalizers).To(ContainElement(cosiv1alpha2.ProtectionFinalizer))
+			Expect(updated.Finalizers).To(ContainElement(GarageProtectionFinalizer))
+
+			By("deleting safely after the upstream controller removes its shared finalizer first")
+			Expect(k8sClient.Delete(ctx, updated)).To(Succeed())
+			deleting := &cosiv1alpha2.BucketAccess{}
+			Expect(k8sClient.Get(ctx, accessNN, deleting)).To(Succeed())
+			deleting.Finalizers = []string{GarageProtectionFinalizer}
+			Expect(k8sClient.Update(ctx, deleting)).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: accessNN})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mockClient.deleteKeyCalls).To(HaveLen(1))
+			err = k8sClient.Get(ctx, accessNN, &cosiv1alpha2.BucketAccess{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
 	})
 

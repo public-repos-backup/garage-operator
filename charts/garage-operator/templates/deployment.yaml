@@ -83,6 +83,10 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: POD_SERVICE_ACCOUNT
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.serviceAccountName
         {{- with .Values.securityContext }}
         securityContext:
           {{- toYaml . | nindent 10 }}
@@ -90,7 +94,7 @@ spec:
         ports:
         {{- if .Values.metrics.enabled }}
         - name: metrics
-          containerPort: 8443
+          containerPort: {{ include "garage-operator.metricsPort" . }}
           protocol: TCP
         {{- end }}
         - name: health

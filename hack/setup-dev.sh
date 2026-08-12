@@ -89,8 +89,7 @@ install_cert_manager() {
         return
     fi
     log_info "Installing cert-manager (required for webhook serving certs)..."
-    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.3/cert-manager.yaml
-    kubectl -n cert-manager wait --for=condition=Available deployment --all --timeout=180s
+    "${PROJECT_ROOT}/hack/install-cert-manager.sh"
 }
 
 deploy_operator() {

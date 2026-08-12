@@ -18,6 +18,7 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
       packages: read
       # Provenance attestation for the install.yaml release asset.
@@ -26,34 +27,87 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          version: v0.36.1
+          driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Get version
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       - name: Verify Helm chart version matches tag
         run: make helm-verify-version
 
+      - name: Require successful image and chart publication
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for workflow in docker.yml helm.yml; do
+            run_id=""
+            for _ in $(seq 1 60); do
+              run_id="$(gh api --method GET \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/runs" \
+                -f event=push \
+                -f head_sha="${GITHUB_SHA}" \
+                -f per_page=20 \
+                | jq -r --arg ref "${GITHUB_REF_NAME}" \
+                  '.workflow_runs[] | select(.head_branch == $ref) | .id' \
+                | sed -n '1p')"
+              if [ -n "$run_id" ]; then
+                break
+              fi
+              sleep 5
+            done
+            if [ -z "$run_id" ]; then
+              echo "::error::no ${workflow} run found for ${GITHUB_REF_NAME} at ${GITHUB_SHA}"
+              exit 1
+            fi
+            echo "Waiting for ${workflow} run ${run_id}"
+            gh run watch "$run_id" --exit-status --repo "$GITHUB_REPOSITORY"
+          done
+
+      - name: Resolve immutable release image
+        id: image
+        run: |
+          image_tag="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}"
+          digest="$(docker buildx imagetools inspect "$image_tag" --format '{{.Manifest.Digest}}')"
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "::error::could not resolve digest for ${image_tag}"; exit 1 ;;
+          esac
+          echo "IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${digest}" >> "$GITHUB_OUTPUT"
+
       - name: Generate install manifests
         run: |
-          make build-installer IMG=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}
+          make build-installer IMG=${{ steps.image.outputs.IMAGE }}
 
       - name: Attest install manifest provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: dist/install.yaml
 
       - name: Generate changelog
         id: changelog
-        uses: orhun/git-cliff-action@v4
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4
         with:
           args: --latest --strip header
         env:
@@ -61,7 +115,7 @@ jobs:
           GITHUB_REPO: ${{ github.repository }}
 
       - name: Create Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           body: ${{ steps.changelog.outputs.content }}
           files: |

@@ -19,7 +19,11 @@ package v1beta1
 import (
 	"context"
 	"fmt"
+	"net"
+	"strings"
 
+	"k8s.io/apimachinery/pkg/api/equality"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -32,7 +36,7 @@ var garagebucketlog = logf.Log.WithName("garagebucket-resource")
 func (r *GarageBucket) SetupWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, r).
 		WithDefaulter(&GarageBucketDefaulter{}).
-		WithValidator(&GarageBucketValidator{Client: mgr.GetClient()}).
+		WithValidator(&GarageBucketValidator{Client: mgr.GetClient(), AuthorizationReader: mgr.GetAPIReader()}).
 		Complete()
 }
 
@@ -76,7 +80,15 @@ var _ admission.Validator[*GarageBucket] = &GarageBucketValidator{}
 // GarageBucketValidator handles validation for GarageBucket.
 // It carries a client to check GarageReferenceGrants for cross-namespace references.
 type GarageBucketValidator struct {
-	Client client.Client
+	Client              client.Client
+	AuthorizationReader client.Reader
+}
+
+func (v *GarageBucketValidator) authorizationReader() client.Reader {
+	if v.AuthorizationReader != nil {
+		return v.AuthorizationReader
+	}
+	return v.Client
 }
 
 // ValidateCreate implements admission.Validator so a webhook will be registered for the type.
@@ -88,7 +100,15 @@ func (v *GarageBucketValidator) ValidateCreate(ctx context.Context, obj *GarageB
 // ValidateUpdate implements admission.Validator so a webhook will be registered for the type.
 func (v *GarageBucketValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *GarageBucket) (admission.Warnings, error) {
 	garagebucketlog.Info("validate update", "name", newObj.Name)
-	return v.validateGarageBucket(ctx, newObj)
+	if clusterReferenceChanged(oldObj.Spec.ClusterRef, newObj.Spec.ClusterRef, newObj.Namespace) {
+		return nil, fmt.Errorf("clusterRef is immutable after creation; create a new GarageBucket to manage a bucket in another GarageCluster")
+	}
+	if oldObj.Status.BucketID != "" && oldObj.Spec.BucketID != newObj.Spec.BucketID {
+		return nil, fmt.Errorf("bucketId is immutable after the Garage bucket identity has been established")
+	}
+	oldDefaulted := oldObj.DeepCopy()
+	_ = (&GarageBucketDefaulter{}).Default(ctx, oldDefaulted)
+	return v.validateGarageBucketWithOptions(ctx, newObj, equality.Semantic.DeepEqual(oldDefaulted.Spec, newObj.Spec))
 }
 
 // ValidateDelete implements admission.Validator so a webhook will be registered for the type.
@@ -98,10 +118,13 @@ func (v *GarageBucketValidator) ValidateDelete(ctx context.Context, obj *GarageB
 }
 
 func (v *GarageBucketValidator) validateGarageBucket(ctx context.Context, obj *GarageBucket) (admission.Warnings, error) {
-	var warnings admission.Warnings
+	return v.validateGarageBucketWithOptions(ctx, obj, false)
+}
 
-	if obj.Spec.ClusterRef.Name == "" {
-		return warnings, fmt.Errorf("clusterRef.name is required")
+func (v *GarageBucketValidator) validateGarageBucketWithOptions(ctx context.Context, obj *GarageBucket, allowUnchangedLegacy bool) (admission.Warnings, error) {
+	var warnings admission.Warnings
+	if err := validateGarageBucketSpecWithOptions(obj, allowUnchangedLegacy); err != nil {
+		return warnings, err
 	}
 
 	// Cross-namespace cluster reference requires a GarageReferenceGrant.
@@ -109,19 +132,103 @@ func (v *GarageBucketValidator) validateGarageBucket(ctx context.Context, obj *G
 	if targetNS == "" {
 		targetNS = obj.Namespace
 	}
-	if err := checkReferenceGrant(ctx, v.Client, "GarageBucket", obj.Namespace, "GarageCluster", targetNS, obj.Spec.ClusterRef.Name); err != nil {
-		return warnings, err
+	if !allowUnchangedLegacy {
+		if err := checkReferenceGrant(ctx, v.authorizationReader(), garageBucketKind, obj.Namespace, garageClusterKind, targetNS, obj.Spec.ClusterRef.Name); err != nil {
+			return warnings, err
+		}
+		for i, permission := range obj.Spec.KeyPermissions {
+			keyNamespace := permission.KeyRef.Namespace
+			if keyNamespace == "" {
+				keyNamespace = obj.Namespace
+			}
+			if err := checkReferenceGrant(ctx, v.authorizationReader(), garageBucketKind, obj.Namespace, garageKeyKind, keyNamespace, permission.KeyRef.Name); err != nil {
+				return warnings, fmt.Errorf("keyPermissions[%d]: %w", i, err)
+			}
+		}
 	}
-
-	if err := validateKeyPermissions(obj.Spec.KeyPermissions); err != nil {
-		return warnings, err
-	}
-
-	if err := validateLifecycle(obj.Spec.Lifecycle); err != nil {
-		return warnings, err
-	}
-
 	return warnings, nil
+}
+
+// ValidateGarageBucketSpec validates GarageBucket fields without performing
+// ReferenceGrant reads. Controllers call it before any remote mutation.
+func ValidateGarageBucketSpec(obj *GarageBucket) error {
+	return validateGarageBucketSpecWithOptions(obj, false)
+}
+
+func validateGarageBucketSpecWithOptions(obj *GarageBucket, allowUnchangedLegacy bool) error {
+	if obj.Spec.ClusterRef.Name == "" {
+		return fmt.Errorf("clusterRef.name is required")
+	}
+	if !allowUnchangedLegacy {
+		if err := ValidateClusterReference(obj.Spec.ClusterRef, "clusterRef"); err != nil {
+			return err
+		}
+		alias := obj.Spec.GlobalAlias
+		if alias == "" {
+			alias = obj.Name
+		}
+		if err := validateGarageBucketAlias(alias, "globalAlias"); err != nil {
+			return err
+		}
+		if err := validateLocalAliases(obj.Spec.LocalAliases); err != nil {
+			return err
+		}
+	}
+	if err := validateKeyPermissions(obj.Namespace, obj.Spec.KeyPermissions, allowUnchangedLegacy); err != nil {
+		return err
+	}
+	if !allowUnchangedLegacy && obj.Spec.Quotas != nil {
+		if obj.Spec.Quotas.MaxSize != nil && obj.Spec.Quotas.MaxSize.Sign() < 0 {
+			return fmt.Errorf("quotas.maxSize must be >= 0")
+		}
+		if obj.Spec.Quotas.MaxObjects != nil && *obj.Spec.Quotas.MaxObjects < 0 {
+			return fmt.Errorf("quotas.maxObjects must be >= 0")
+		}
+	}
+	return validateLifecycle(obj.Spec.Lifecycle)
+}
+
+func validateGarageBucketAlias(alias, field string) error {
+	if len(alias) < 3 || len(alias) > 63 {
+		return fmt.Errorf("%s must contain between 3 and 63 characters", field)
+	}
+	for _, char := range alias {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '.' && char != '-' {
+			return fmt.Errorf("%s %q must contain only lowercase letters, digits, dots, and hyphens", field, alias)
+		}
+	}
+	if strings.HasPrefix(alias, ".") || strings.HasPrefix(alias, "-") ||
+		strings.HasSuffix(alias, ".") || strings.HasSuffix(alias, "-") {
+		return fmt.Errorf("%s %q must start and end with a letter or digit", field, alias)
+	}
+	if net.ParseIP(alias) != nil {
+		return fmt.Errorf("%s %q must not be formatted as an IP address", field, alias)
+	}
+	if strings.HasPrefix(alias, "xn--") || strings.Contains(alias, ".xn--") {
+		return fmt.Errorf("%s %q must not contain a punycode label", field, alias)
+	}
+	if strings.HasSuffix(alias, "-s3alias") {
+		return fmt.Errorf("%s %q uses the reserved -s3alias suffix", field, alias)
+	}
+	return nil
+}
+
+func validateLocalAliases(aliases []LocalAlias) error {
+	seen := make(map[string]int, len(aliases))
+	for i, alias := range aliases {
+		if problems := utilvalidation.IsDNS1123Subdomain(alias.KeyRef); len(problems) > 0 {
+			return fmt.Errorf("localAliases[%d].keyRef %q is invalid: %s", i, alias.KeyRef, strings.Join(problems, "; "))
+		}
+		if err := validateGarageBucketAlias(alias.Alias, fmt.Sprintf("localAliases[%d].alias", i)); err != nil {
+			return err
+		}
+		key := alias.KeyRef + "\x00" + alias.Alias
+		if previous, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("localAliases[%d] duplicates localAliases[%d] for key %q and alias %q", i, previous, alias.KeyRef, alias.Alias)
+		}
+		seen[key] = i
+	}
+	return nil
 }
 
 // validateLifecycle validates lifecycle rules against the subset Garage accepts.
@@ -185,13 +292,22 @@ func validateLifecycle(lifecycle *BucketLifecycle) error {
 	return nil
 }
 
-func validateKeyPermissions(perms []KeyPermission) error {
+func validateKeyPermissions(objectNamespace string, perms []KeyPermission, allowUnchangedLegacy bool) error {
 	seen := make(map[string]bool)
 	for i, perm := range perms {
 		if perm.KeyRef.Name == "" {
 			return fmt.Errorf("keyPermissions[%d]: keyRef.name is required", i)
 		}
-		key := perm.KeyRef.Namespace + "/" + perm.KeyRef.Name
+		if !allowUnchangedLegacy {
+			if err := validateNamespacedObjectReference(perm.KeyRef.Name, perm.KeyRef.Namespace, fmt.Sprintf("keyPermissions[%d].keyRef", i)); err != nil {
+				return err
+			}
+		}
+		keyNamespace := perm.KeyRef.Namespace
+		if keyNamespace == "" && !allowUnchangedLegacy {
+			keyNamespace = objectNamespace
+		}
+		key := keyNamespace + "/" + perm.KeyRef.Name
 		if seen[key] {
 			return fmt.Errorf("keyPermissions[%d]: duplicate keyRef '%s'", i, perm.KeyRef.Name)
 		}

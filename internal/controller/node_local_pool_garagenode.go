@@ -151,10 +151,7 @@ func (r *GarageClusterReconciler) buildNodeLocalPoolStorageNode(
 			return nil, err
 		}
 		if podIP != "" {
-			rpcPort := DefaultRPCPort
-			if cluster.Spec.Network.RPCBindPort != 0 {
-				rpcPort = cluster.Spec.Network.RPCBindPort
-			}
+			rpcPort := getRPCPort(cluster)
 			rpcAddress = rpcAddr(podIP, rpcPort)
 		}
 	}

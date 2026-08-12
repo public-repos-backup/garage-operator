@@ -20,20 +20,31 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 
+	"k8s.io/apimachinery/pkg/api/equality"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	"github.com/rajsinghtech/garage-operator/internal/garageconfig"
 )
 
 var garagekeylog = logf.Log.WithName("garagekey-resource")
+
+const (
+	defaultAccessKeyIDSecretDataKey     = "access-key-id"
+	defaultSecretAccessKeySecretDataKey = "secret-access-key"
+	defaultBucketSecretDataKey          = "bucket"
+)
 
 // SetupWebhookWithManager sets up the webhook with the Manager.
 func (r *GarageKey) SetupWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, r).
 		WithDefaulter(&GarageKeyDefaulter{}).
-		WithValidator(&GarageKeyValidator{Client: mgr.GetClient()}).
+		WithValidator(&GarageKeyValidator{Client: mgr.GetClient(), AuthorizationReader: mgr.GetAPIReader()}).
 		Complete()
 }
 
@@ -60,10 +71,10 @@ func (d *GarageKeyDefaulter) Default(ctx context.Context, obj *GarageKey) error 
 			obj.Spec.SecretTemplate.Type = "Opaque"
 		}
 		if obj.Spec.SecretTemplate.AccessKeyIDKey == "" {
-			obj.Spec.SecretTemplate.AccessKeyIDKey = "access-key-id"
+			obj.Spec.SecretTemplate.AccessKeyIDKey = defaultAccessKeyIDSecretDataKey
 		}
 		if obj.Spec.SecretTemplate.SecretAccessKeyKey == "" {
-			obj.Spec.SecretTemplate.SecretAccessKeyKey = "secret-access-key"
+			obj.Spec.SecretTemplate.SecretAccessKeyKey = defaultSecretAccessKeySecretDataKey
 		}
 		if obj.Spec.SecretTemplate.EndpointKey == "" {
 			obj.Spec.SecretTemplate.EndpointKey = "endpoint"
@@ -78,7 +89,7 @@ func (d *GarageKeyDefaulter) Default(ctx context.Context, obj *GarageKey) error 
 			obj.Spec.SecretTemplate.RegionKey = "region"
 		}
 		if obj.Spec.SecretTemplate.BucketNameKey == "" {
-			obj.Spec.SecretTemplate.BucketNameKey = "bucket"
+			obj.Spec.SecretTemplate.BucketNameKey = defaultBucketSecretDataKey
 		}
 	}
 
@@ -94,19 +105,45 @@ var _ admission.Validator[*GarageKey] = &GarageKeyValidator{}
 // GarageKeyValidator handles validation for GarageKey.
 // It carries a client to check GarageReferenceGrants for cross-namespace references.
 type GarageKeyValidator struct {
-	Client client.Client
+	Client              client.Client
+	AuthorizationReader client.Reader
+}
+
+func (v *GarageKeyValidator) authorizationReader() client.Reader {
+	if v.AuthorizationReader != nil {
+		return v.AuthorizationReader
+	}
+	return v.Client
 }
 
 // ValidateCreate implements admission.Validator so a webhook will be registered for the type.
 func (v *GarageKeyValidator) ValidateCreate(ctx context.Context, obj *GarageKey) (admission.Warnings, error) {
 	garagekeylog.Info("validate create", "name", obj.Name)
-	return v.validateGarageKey(ctx, obj)
+	return v.validateGarageKey(ctx, obj, false)
 }
 
 // ValidateUpdate implements admission.Validator so a webhook will be registered for the type.
 func (v *GarageKeyValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *GarageKey) (admission.Warnings, error) {
 	garagekeylog.Info("validate update", "name", newObj.Name)
-	return v.validateGarageKey(ctx, newObj)
+	if clusterReferenceChanged(oldObj.Spec.ClusterRef, newObj.Spec.ClusterRef, newObj.Namespace) {
+		return nil, fmt.Errorf("clusterRef is immutable after creation; create a new GarageKey to manage a key in another GarageCluster")
+	}
+	if !equality.Semantic.DeepEqual(oldObj.Spec.ImportKey, newObj.Spec.ImportKey) {
+		return nil, fmt.Errorf("importKey is immutable after creation; create a new GarageKey to manage different credential material")
+	}
+	allowLegacySnapshotCollision := garageKeyImportSnapshotCollision(oldObj) &&
+		equality.Semantic.DeepEqual(oldObj.Spec.SecretTemplate, newObj.Spec.SecretTemplate)
+	oldDefaulted := oldObj.DeepCopy()
+	_ = (&GarageKeyDefaulter{}).Default(ctx, oldDefaulted)
+	allowUnchangedLegacy := equality.Semantic.DeepEqual(oldDefaulted.Spec, newObj.Spec)
+	warnings, err := v.validateGarageKeyWithOptions(ctx, newObj, garageKeyValidationOptions{
+		allowLegacySnapshotCollision: allowLegacySnapshotCollision,
+		allowUnchangedLegacy:         allowUnchangedLegacy,
+	})
+	if allowLegacySnapshotCollision && garageKeyImportSnapshotCollision(newObj) {
+		warnings = append(warnings, "unchanged legacy secretTemplate.name collision with the internal import snapshot is temporarily tolerated so metadata/finalizers can be repaired or the output Secret can be renamed")
+	}
+	return warnings, err
 }
 
 // ValidateDelete implements admission.Validator so a webhook will be registered for the type.
@@ -115,11 +152,23 @@ func (v *GarageKeyValidator) ValidateDelete(ctx context.Context, obj *GarageKey)
 	return nil, nil
 }
 
-func (v *GarageKeyValidator) validateGarageKey(ctx context.Context, obj *GarageKey) (admission.Warnings, error) {
-	var warnings admission.Warnings
+func (v *GarageKeyValidator) validateGarageKey(ctx context.Context, obj *GarageKey, allowLegacySnapshotCollisionOption ...bool) (admission.Warnings, error) {
+	options := garageKeyValidationOptions{}
+	if len(allowLegacySnapshotCollisionOption) > 0 {
+		options.allowLegacySnapshotCollision = allowLegacySnapshotCollisionOption[0]
+	}
+	return v.validateGarageKeyWithOptions(ctx, obj, options)
+}
 
-	if obj.Spec.ClusterRef.Name == "" {
-		return warnings, fmt.Errorf("clusterRef.name is required")
+type garageKeyValidationOptions struct {
+	allowLegacySnapshotCollision bool
+	allowUnchangedLegacy         bool
+}
+
+func (v *GarageKeyValidator) validateGarageKeyWithOptions(ctx context.Context, obj *GarageKey, options garageKeyValidationOptions) (admission.Warnings, error) {
+	var warnings admission.Warnings
+	if err := validateGarageKeySpecWithOptions(obj, options); err != nil {
+		return warnings, err
 	}
 
 	// Cross-namespace cluster reference requires a GarageReferenceGrant.
@@ -127,24 +176,22 @@ func (v *GarageKeyValidator) validateGarageKey(ctx context.Context, obj *GarageK
 	if clusterNS == "" {
 		clusterNS = obj.Namespace
 	}
-	if err := checkReferenceGrant(ctx, v.Client, "GarageKey", obj.Namespace, "GarageCluster", clusterNS, obj.Spec.ClusterRef.Name); err != nil {
-		return warnings, err
-	}
-
-	if obj.Spec.ExpiresAt != nil && obj.Spec.NeverExpires {
-		return warnings, fmt.Errorf("expiresAt and neverExpires are mutually exclusive")
-	}
-
-	if err := validateImportKey(obj.Spec.ImportKey); err != nil {
-		return warnings, err
-	}
-
-	if err := v.validateBucketPermissions(ctx, obj); err != nil {
-		return warnings, err
-	}
-
-	if err := validateAllBuckets(obj.Spec.AllBuckets); err != nil {
-		return warnings, err
+	if !options.allowUnchangedLegacy {
+		if err := checkReferenceGrant(ctx, v.authorizationReader(), garageKeyKind, obj.Namespace, garageClusterKind, clusterNS, obj.Spec.ClusterRef.Name); err != nil {
+			return warnings, err
+		}
+		for i, permission := range obj.Spec.BucketPermissions {
+			if permission.BucketRef == nil {
+				continue
+			}
+			bucketNS := permission.BucketRef.Namespace
+			if bucketNS == "" {
+				bucketNS = obj.Namespace
+			}
+			if err := checkReferenceGrant(ctx, v.authorizationReader(), garageKeyKind, obj.Namespace, garageBucketKind, bucketNS, permission.BucketRef.Name); err != nil {
+				return warnings, fmt.Errorf("bucketPermissions[%d]: %w", i, err)
+			}
+		}
 	}
 
 	if len(obj.Spec.BucketPermissions) == 0 && obj.Spec.AllBuckets == nil {
@@ -162,6 +209,66 @@ func (v *GarageKeyValidator) validateGarageKey(ctx context.Context, obj *GarageK
 	return warnings, nil
 }
 
+// ValidateGarageKeySpec validates GarageKey fields without performing
+// ReferenceGrant reads. Controllers call it before any remote mutation.
+func ValidateGarageKeySpec(obj *GarageKey) error {
+	return validateGarageKeySpecWithOptions(obj, garageKeyValidationOptions{})
+}
+
+func validateGarageKeySpecWithOptions(obj *GarageKey, options garageKeyValidationOptions) error {
+	if obj.Spec.ClusterRef.Name == "" {
+		return fmt.Errorf("clusterRef.name is required")
+	}
+	if !options.allowUnchangedLegacy {
+		if err := ValidateClusterReference(obj.Spec.ClusterRef, "clusterRef"); err != nil {
+			return err
+		}
+		if err := validateGarageKeyMaterialSpec(obj, options.allowLegacySnapshotCollision); err != nil {
+			return err
+		}
+	}
+	if obj.Spec.ExpiresAt != nil && obj.Spec.NeverExpires {
+		return fmt.Errorf("expiresAt and neverExpires are mutually exclusive")
+	}
+	if err := validateBucketPermissionsSpec(obj.Namespace, obj.Spec.BucketPermissions, options.allowUnchangedLegacy); err != nil {
+		return err
+	}
+	return validateAllBuckets(obj.Spec.AllBuckets)
+}
+
+// ValidateGarageKeyMaterialSpec validates every field that can read or write
+// credential material. It is shared by admission and reconciliation so an old
+// or directly persisted object cannot bypass Secret namespace and data-key
+// collision protections.
+func ValidateGarageKeyMaterialSpec(obj *GarageKey) error {
+	return validateGarageKeyMaterialSpec(obj, false)
+}
+
+func validateGarageKeyMaterialSpec(obj *GarageKey, allowLegacySnapshotCollision bool) error {
+	if err := validateImportKey(obj.Spec.ImportKey); err != nil {
+		return err
+	}
+	if obj.Spec.ImportKey != nil && obj.Spec.ImportKey.SecretRef != nil {
+		secretNamespace := obj.Spec.ImportKey.SecretRef.Namespace
+		if secretNamespace != "" && secretNamespace != obj.Namespace {
+			return fmt.Errorf("importKey.secretRef.namespace must be empty or match metadata.namespace; cross-namespace Secret reads are not permitted")
+		}
+	}
+	if err := validateSecretTemplate(obj.Spec.SecretTemplate); err != nil {
+		return err
+	}
+	if !allowLegacySnapshotCollision && garageKeyImportSnapshotCollision(obj) {
+		return fmt.Errorf("secretTemplate.name %q collides with the controller's immutable import material snapshot Secret; choose a different generated Secret name", obj.Spec.SecretTemplate.Name)
+	}
+	return nil
+}
+
+func garageKeyImportSnapshotCollision(obj *GarageKey) bool {
+	return obj != nil && obj.Spec.ImportKey != nil && obj.Spec.ImportKey.SecretRef != nil &&
+		obj.Spec.SecretTemplate != nil && obj.Spec.SecretTemplate.Name != "" &&
+		obj.Spec.SecretTemplate.Name == garageconfig.GarageKeyImportSnapshotName(obj.Name)
+}
+
 func validateImportKey(ik *ImportKeyConfig) error {
 	if ik == nil {
 		return nil
@@ -170,6 +277,21 @@ func validateImportKey(ik *ImportKeyConfig) error {
 	if ik.SecretRef != nil {
 		if ik.AccessKeyID != "" || ik.SecretAccessKey != "" {
 			return fmt.Errorf("importKey: specify either secretRef or inline credentials (accessKeyId/secretAccessKey), not both")
+		}
+		if ik.SecretRef.Name == "" {
+			return fmt.Errorf("importKey.secretRef.name is required")
+		}
+		for field, key := range map[string]string{
+			"accessKeyIdKey": ik.AccessKeyIDKey, "secretAccessKeyKey": ik.SecretAccessKeyKey,
+		} {
+			if key != "" {
+				if problems := utilvalidation.IsConfigMapKey(key); len(problems) > 0 {
+					return fmt.Errorf("importKey.%s %q is not a valid Secret data key: %s", field, key, strings.Join(problems, "; "))
+				}
+			}
+		}
+		if defaultString(ik.AccessKeyIDKey, defaultAccessKeyIDSecretDataKey) == defaultString(ik.SecretAccessKeyKey, defaultSecretAccessKeySecretDataKey) {
+			return fmt.Errorf("importKey.accessKeyIdKey and secretAccessKeyKey must use distinct Secret data keys")
 		}
 		return nil
 	}
@@ -190,9 +312,81 @@ func validateImportKey(ik *ImportKeyConfig) error {
 		if !accessKeyPattern.MatchString(ik.AccessKeyID) {
 			return fmt.Errorf("importKey: accessKeyId should start with 'GK' followed by alphanumeric characters")
 		}
+		return nil
 	}
 
+	return fmt.Errorf("importKey: specify secretRef or both accessKeyId and secretAccessKey")
+}
+
+func validateSecretTemplate(template *SecretTemplate) error {
+	if template == nil {
+		return nil
+	}
+	if template.Name != "" {
+		if problems := utilvalidation.IsDNS1123Subdomain(template.Name); len(problems) > 0 {
+			return fmt.Errorf("secretTemplate.name %q is invalid: %s", template.Name, strings.Join(problems, "; "))
+		}
+	}
+
+	type generatedKey struct {
+		field   string
+		value   string
+		enabled bool
+	}
+	includeEndpoint := template.IncludeEndpoint == nil || *template.IncludeEndpoint
+	includeRegion := template.IncludeRegion == nil || *template.IncludeRegion
+	includeBucket := template.IncludeBucketName != nil && *template.IncludeBucketName
+	keys := []generatedKey{
+		{field: "accessKeyIdKey", value: defaultString(template.AccessKeyIDKey, defaultAccessKeyIDSecretDataKey), enabled: true},
+		{field: "secretAccessKeyKey", value: defaultString(template.SecretAccessKeyKey, defaultSecretAccessKeySecretDataKey), enabled: true},
+		{field: "endpointKey", value: defaultString(template.EndpointKey, "endpoint"), enabled: includeEndpoint},
+		{field: "hostKey", value: defaultString(template.HostKey, "host"), enabled: includeEndpoint},
+		{field: "schemeKey", value: defaultString(template.SchemeKey, "scheme"), enabled: includeEndpoint},
+		{field: "regionKey", value: defaultString(template.RegionKey, "region"), enabled: includeRegion},
+		{field: "bucketNameKey", value: defaultString(template.BucketNameKey, defaultBucketSecretDataKey), enabled: includeBucket},
+	}
+	seen := make(map[string]string, len(keys)+len(template.AdditionalData))
+	for _, key := range keys {
+		if problems := utilvalidation.IsConfigMapKey(key.value); len(problems) > 0 {
+			return fmt.Errorf("secretTemplate.%s %q is not a valid Secret data key: %s", key.field, key.value, strings.Join(problems, "; "))
+		}
+		if !key.enabled {
+			continue
+		}
+		if previous, duplicate := seen[key.value]; duplicate {
+			return fmt.Errorf("secretTemplate.%s and %s both use Secret data key %q", key.field, previous, key.value)
+		}
+		seen[key.value] = key.field
+	}
+	for key := range template.AdditionalData {
+		if problems := utilvalidation.IsConfigMapKey(key); len(problems) > 0 {
+			return fmt.Errorf("secretTemplate.additionalData key %q is invalid: %s", key, strings.Join(problems, "; "))
+		}
+		if previous, collision := seen[key]; collision {
+			return fmt.Errorf("secretTemplate.additionalData key %q collides with %s", key, previous)
+		}
+	}
+	for key, value := range template.Labels {
+		if problems := utilvalidation.IsQualifiedName(key); len(problems) > 0 {
+			return fmt.Errorf("secretTemplate.labels key %q is invalid: %s", key, strings.Join(problems, "; "))
+		}
+		if problems := utilvalidation.IsValidLabelValue(value); len(problems) > 0 {
+			return fmt.Errorf("secretTemplate.labels[%q] value %q is invalid: %s", key, value, strings.Join(problems, "; "))
+		}
+	}
+	for key := range template.Annotations {
+		if problems := utilvalidation.IsQualifiedName(key); len(problems) > 0 {
+			return fmt.Errorf("secretTemplate.annotations key %q is invalid: %s", key, strings.Join(problems, "; "))
+		}
+	}
 	return nil
+}
+
+func defaultString(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 func validateAllBuckets(ab *AllBucketsPermission) error {
@@ -205,21 +399,40 @@ func validateAllBuckets(ab *AllBucketsPermission) error {
 	return nil
 }
 
-// validateBucketPermissions validates bucket permissions, including cross-namespace bucket references.
-func (v *GarageKeyValidator) validateBucketPermissions(ctx context.Context, obj *GarageKey) error {
+// validateBucketPermissionsSpec validates permission shape without performing
+// ReferenceGrant reads. Newly strict alias syntax is skipped only for an
+// unchanged legacy update.
+func validateBucketPermissionsSpec(objectNamespace string, permissions []BucketPermission, allowUnchangedLegacy bool) error {
 	seen := make(map[string]bool)
-	for i, perm := range obj.Spec.BucketPermissions {
+	for i, perm := range permissions {
 		refs := 0
 		var refKey string
 		if perm.BucketRef != nil {
+			if perm.BucketRef.Name == "" {
+				return fmt.Errorf("bucketPermissions[%d].bucketRef.name is required", i)
+			}
+			if !allowUnchangedLegacy {
+				if err := validateNamespacedObjectReference(perm.BucketRef.Name, perm.BucketRef.Namespace, fmt.Sprintf("bucketPermissions[%d].bucketRef", i)); err != nil {
+					return err
+				}
+			}
 			refs++
-			refKey = "ref:" + perm.BucketRef.Name
+			bucketNamespace := perm.BucketRef.Namespace
+			if bucketNamespace == "" && !allowUnchangedLegacy {
+				bucketNamespace = objectNamespace
+			}
+			refKey = "ref:" + bucketNamespace + "/" + perm.BucketRef.Name
 		}
 		if perm.BucketID != "" {
 			refs++
 			refKey = "id:" + perm.BucketID
 		}
 		if perm.GlobalAlias != "" {
+			if !allowUnchangedLegacy {
+				if err := validateGarageBucketAlias(perm.GlobalAlias, fmt.Sprintf("bucketPermissions[%d].globalAlias", i)); err != nil {
+					return err
+				}
+			}
 			refs++
 			refKey = "alias:" + perm.GlobalAlias
 		}
@@ -229,17 +442,6 @@ func (v *GarageKeyValidator) validateBucketPermissions(ctx context.Context, obj 
 		}
 		if refs > 1 {
 			return fmt.Errorf("bucketPermissions[%d]: specify only one of bucketRef, bucketId, or globalAlias", i)
-		}
-
-		// Cross-namespace bucket reference requires a GarageReferenceGrant.
-		if perm.BucketRef != nil {
-			bucketNS := perm.BucketRef.Namespace
-			if bucketNS == "" {
-				bucketNS = obj.Namespace
-			}
-			if err := checkReferenceGrant(ctx, v.Client, "GarageKey", obj.Namespace, "GarageBucket", bucketNS, perm.BucketRef.Name); err != nil {
-				return fmt.Errorf("bucketPermissions[%d]: %w", i, err)
-			}
 		}
 
 		if seen[refKey] {

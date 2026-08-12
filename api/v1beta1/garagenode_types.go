@@ -20,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // NodeNetworkConfig configures per-node RPC address overrides.
@@ -428,7 +429,9 @@ type ExternalNodeConfig struct {
 	// +kubebuilder:default=3901
 	Port int32 `json:"port,omitempty"`
 
-	// RemoteClusterRef references a GarageCluster in another namespace/cluster
+	// RemoteClusterRef is retained for API compatibility but is not supported.
+	// Setting it is rejected because the operator has no remote-cluster client
+	// integration for GarageNode reconciliation.
 	// +optional
 	RemoteClusterRef *ClusterReference `json:"remoteClusterRef,omitempty"`
 }
@@ -478,6 +481,16 @@ type GarageNodeStatus struct {
 	// +optional
 	Tags []string `json:"tags,omitempty"`
 
+	// ManagedPVCs records convention-named PVC reservations made by this
+	// controller. A pending entry contains only a one-way nonce commitment; a
+	// bound entry contains the exact server-assigned UID. Names and public
+	// annotations are not ownership proof. Legacy claims are pinned here once
+	// while their exact live StatefulSet and Pod still prove continuity.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	ManagedPVCs []ManagedNodePVCStatus `json:"managedPVCs,omitempty"`
+
 	// DataPartition contains disk space info for the data partition
 	// Note: Garage reports a single partition even with multiple data paths
 	// +optional
@@ -491,11 +504,13 @@ type GarageNodeStatus struct {
 	// +optional
 	Version string `json:"version,omitempty"`
 
-	// DBEngine is the database engine used by this node (lmdb, sqlite, fjall)
+	// DBEngine is retained for API compatibility but is not currently populated;
+	// Garage's node-status API does not report the active database engine.
 	// +optional
 	DBEngine string `json:"dbEngine,omitempty"`
 
-	// GarageFeatures lists the enabled Cargo features on this node
+	// GarageFeatures is retained for API compatibility but is not currently
+	// populated because Garage's node-status API does not report build features.
 	// +optional
 	GarageFeatures []string `json:"garageFeatures,omitempty"`
 
@@ -503,23 +518,26 @@ type GarageNodeStatus struct {
 	// +optional
 	Partitions int `json:"partitions,omitempty"`
 
-	// StoredData is the amount of data stored on this node
+	// StoredData is retained for API compatibility but is not currently populated;
+	// Garage reports assigned partitions and disk free space, not per-node stored bytes.
 	// +optional
 	StoredData *resource.Quantity `json:"storedData,omitempty"`
 
-	// RepairInProgress indicates if a repair operation is running
+	// RepairInProgress is retained for API compatibility but is not currently
+	// populated because Garage's Admin API exposes no per-node repair status.
 	// +optional
 	RepairInProgress bool `json:"repairInProgress"`
 
-	// RepairType is the type of repair operation in progress
+	// RepairType is retained for API compatibility but is not currently populated.
 	// +optional
 	RepairType string `json:"repairType,omitempty"`
 
-	// RepairProgress is a human-readable repair progress description
+	// RepairProgress is retained for API compatibility but is not currently populated.
 	// +optional
 	RepairProgress string `json:"repairProgress,omitempty"`
 
-	// BlockErrors is the count of blocks with sync errors on this node
+	// BlockErrors is retained for API compatibility but is not currently populated;
+	// Garage's node-status API does not expose a per-node block error count.
 	// +optional
 	BlockErrors int32 `json:"blockErrors,omitempty"`
 
@@ -584,6 +602,29 @@ type GarageNodeStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// ManagedNodePVCStatus is the controller-owned identity reservation for one
+// convention-named GarageNode PVC.
+// +kubebuilder:validation:XValidation:rule="has(self.uid) != has(self.pendingReservationHash)",message="exactly one of uid and pendingReservationHash must be set"
+type ManagedNodePVCStatus struct {
+	// Name is the exact PersistentVolumeClaim name.
+	Name string `json:"name"`
+
+	// UID is the immutable API-server identity observed when the claim was
+	// created or safely migrated.
+	// Exactly one of UID and PendingReservationHash is set.
+	// +optional
+	UID types.UID `json:"uid,omitempty"`
+
+	// PendingReservationHash is a SHA-256 commitment to a cryptographically
+	// random nonce stamped on a PVC before its UID can be observed. It closes
+	// the create/status-update crash window without making the public status
+	// value sufficient to forge a controller reservation.
+	// Exactly one of UID and PendingReservationHash is set.
+	// +kubebuilder:validation:Pattern=`^[a-f0-9]{64}$`
+	// +optional
+	PendingReservationHash string `json:"pendingReservationHash,omitempty"`
 }
 
 // DiskPartitionStatus contains disk space information for a partition

@@ -98,15 +98,23 @@ func (r *GarageReferenceGrantReconciler) Reconcile(ctx context.Context, req ctrl
 
 func (r *GarageReferenceGrantReconciler) findUsers(ctx context.Context, grant *garagev1beta1.GarageReferenceGrant) ([]garagev1beta1.ReferenceGrantUser, error) {
 	var users []garagev1beta1.ReferenceGrantUser
+	add := func(kind, name, namespace string, matched *bool) {
+		if *matched {
+			return
+		}
+		users = append(users, garagev1beta1.ReferenceGrantUser{Kind: kind, Name: name, Namespace: namespace})
+		*matched = true
+	}
 
 	var keys garagev1beta1.GarageKeyList
 	if err := r.List(ctx, &keys); err != nil {
 		return nil, err
 	}
 	for _, k := range keys.Items {
-		if crossNSRefsGrant(&k.Spec.ClusterRef, k.Namespace, grant) {
-			users = append(users, garagev1beta1.ReferenceGrantUser{Kind: "GarageKey", Name: k.Name, Namespace: k.Namespace})
-			continue
+		matched := false
+		if crossNSRefsGrant(&k.Spec.ClusterRef, k.Namespace, grant) &&
+			garagev1beta1.GrantPermits(grant, garageKeyKind, k.Namespace, "GarageCluster", k.Spec.ClusterRef.Name) {
+			add(garageKeyKind, k.Name, k.Namespace, &matched)
 		}
 		for _, bp := range k.Spec.BucketPermissions {
 			if bp.BucketRef != nil {
@@ -114,8 +122,9 @@ func (r *GarageReferenceGrantReconciler) findUsers(ctx context.Context, grant *g
 				if ns == "" {
 					ns = k.Namespace
 				}
-				if ns == grant.Namespace && k.Namespace != grant.Namespace {
-					users = append(users, garagev1beta1.ReferenceGrantUser{Kind: "GarageKey", Name: k.Name, Namespace: k.Namespace})
+				if ns == grant.Namespace && k.Namespace != grant.Namespace &&
+					garagev1beta1.GrantPermits(grant, garageKeyKind, k.Namespace, "GarageBucket", bp.BucketRef.Name) {
+					add(garageKeyKind, k.Name, k.Namespace, &matched)
 					break
 				}
 			}
@@ -127,8 +136,21 @@ func (r *GarageReferenceGrantReconciler) findUsers(ctx context.Context, grant *g
 		return nil, err
 	}
 	for _, b := range buckets.Items {
-		if crossNSRefsGrant(&b.Spec.ClusterRef, b.Namespace, grant) {
-			users = append(users, garagev1beta1.ReferenceGrantUser{Kind: "GarageBucket", Name: b.Name, Namespace: b.Namespace})
+		matched := false
+		if crossNSRefsGrant(&b.Spec.ClusterRef, b.Namespace, grant) &&
+			garagev1beta1.GrantPermits(grant, "GarageBucket", b.Namespace, "GarageCluster", b.Spec.ClusterRef.Name) {
+			add("GarageBucket", b.Name, b.Namespace, &matched)
+		}
+		for _, permission := range b.Spec.KeyPermissions {
+			ns := permission.KeyRef.Namespace
+			if ns == "" {
+				ns = b.Namespace
+			}
+			if ns == grant.Namespace && b.Namespace != grant.Namespace &&
+				garagev1beta1.GrantPermits(grant, "GarageBucket", b.Namespace, garageKeyKind, permission.KeyRef.Name) {
+				add("GarageBucket", b.Name, b.Namespace, &matched)
+				break
+			}
 		}
 	}
 
@@ -137,7 +159,8 @@ func (r *GarageReferenceGrantReconciler) findUsers(ctx context.Context, grant *g
 		return nil, err
 	}
 	for _, tok := range tokens.Items {
-		if crossNSRefsGrant(&tok.Spec.ClusterRef, tok.Namespace, grant) {
+		if crossNSRefsGrant(&tok.Spec.ClusterRef, tok.Namespace, grant) &&
+			garagev1beta1.GrantPermits(grant, kindGarageAdminToken, tok.Namespace, "GarageCluster", tok.Spec.ClusterRef.Name) {
 			users = append(users, garagev1beta1.ReferenceGrantUser{Kind: kindGarageAdminToken, Name: tok.Name, Namespace: tok.Namespace})
 		}
 	}
@@ -199,6 +222,9 @@ func grantTargetNamespaces(obj client.Object) []string {
 		}
 	case *garagev1beta1.GarageBucket:
 		add(o.Spec.ClusterRef.Namespace)
+		for _, permission := range o.Spec.KeyPermissions {
+			add(permission.KeyRef.Namespace)
+		}
 	case *garagev1beta1.GarageAdminToken:
 		add(o.Spec.ClusterRef.Namespace)
 	}

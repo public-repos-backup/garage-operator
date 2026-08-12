@@ -16,6 +16,15 @@ limitations under the License.
 
 package v1beta1
 
+// Finalizers shared by the ordinary controllers and COSI shadow reservations.
+// COSI must install these in the reservation's initial create so a deletion can
+// never race ahead of the controller's first reconciliation and orphan the
+// corresponding Garage resource.
+const (
+	GarageBucketFinalizer = "garagebucket.garage.rajsingh.info/finalizer"
+	GarageKeyFinalizer    = "garagekey.garage.rajsingh.info/finalizer"
+)
+
 // Common condition types used across all Garage CRDs
 const (
 	// ConditionReady indicates the resource is fully reconciled and operational
@@ -630,6 +639,41 @@ const (
 	AnnotationCycle = AnnotationPrefix + "cycle"
 
 	// GarageBucket annotations
+
+	// AnnotationCOSIBucketID pins a COSI shadow GarageBucket to the exact remote
+	// Garage bucket created by the COSI provisioner.
+	AnnotationCOSIBucketID = AnnotationPrefix + "cosi-bucket-id"
+
+	// AnnotationCOSIAccountID pins a COSI shadow GarageKey to the exact remote
+	// Garage access key created by the COSI provisioner.
+	AnnotationCOSIAccountID = AnnotationPrefix + "cosi-account-id"
+
+	// AnnotationCOSIProvisioningState marks the two-phase COSI shadow handoff.
+	// Pending shadows are durable reservations and must not be reconciled by the
+	// generic GarageBucket/GarageKey controllers until the provisioner binds them.
+	AnnotationCOSIProvisioningState = AnnotationPrefix + "cosi-provisioning-state"
+	COSIProvisioningStatePending    = "pending"
+	COSIProvisioningStateBound      = "bound"
+
+	// AnnotationCOSIReservationAlias records the private temporary Garage
+	// alias used to recover a bucket created immediately before a process crash.
+	AnnotationCOSIReservationAlias = AnnotationPrefix + "cosi-reservation-alias"
+
+	// AnnotationCOSIRetain marks a COSI shadow GarageBucket for Kubernetes-only
+	// deletion. Its UID-bound value is verified by the GarageBucket controller
+	// before remote cleanup is bypassed.
+	AnnotationCOSIRetain = AnnotationPrefix + "cosi-retain"
+
+	// COSI shadow identity metadata is shared with the ordinary controllers so
+	// retention can fail closed unless the object is a provisioner-owned shadow.
+	LabelCOSIManaged               = AnnotationPrefix + "cosi-managed"
+	AnnotationCOSIReservationOwner = AnnotationPrefix + "cosi-reservation-owner"
+	AnnotationCOSIReservationReady = AnnotationPrefix + "cosi-reservation-ready"
+
+	// AnnotationBucketReservationAlias records a private, high-entropy Garage
+	// alias before an ordinary GarageBucket controller creates a remote bucket.
+	// It closes the crash window between remote creation and status.bucketID.
+	AnnotationBucketReservationAlias = AnnotationPrefix + "bucket-reservation-alias"
 
 	// AnnotationCleanupMPU triggers cleanup of incomplete multipart uploads when set to "true"
 	AnnotationCleanupMPU = AnnotationPrefix + "cleanup-mpu"

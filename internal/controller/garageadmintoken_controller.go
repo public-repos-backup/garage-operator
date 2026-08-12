@@ -69,6 +69,19 @@ func (r *GarageAdminTokenReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 		return ctrl.Result{}, err
 	}
+	if token.DeletionTimestamp.IsZero() {
+		if err := garagev1beta1.ValidateClusterReference(token.Spec.ClusterRef, "spec.clusterRef"); err != nil {
+			return r.updateStatus(ctx, token, PhaseFailed, err)
+		}
+		if token.Spec.ClusterRef.Namespace != "" && token.Spec.ClusterRef.Namespace != token.Namespace {
+			return r.updateStatus(ctx, token, PhaseFailed, fmt.Errorf(
+				"spec.clusterRef.namespace must match metadata.namespace: GarageAdminToken provisions namespace-local static bootstrap material",
+			))
+		}
+		if err := garagev1beta1.ValidateGarageAdminTokenMaterialSpec(token); err != nil {
+			return r.updateStatus(ctx, token, PhaseFailed, err)
+		}
+	}
 
 	// Deletion must run before resolving the cluster. A cluster that was already
 	// removed cannot be allowed to strand this resource's finalizer and Secret.

@@ -39,7 +39,6 @@ const (
 type GarageClusterSpec struct {
 	// Image specifies the Garage container image to use.
 	// Takes precedence over imageRepository if both are set.
-	// +kubebuilder:default="dxflrs/garage:v2.3.0"
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -639,8 +638,9 @@ type NetworkConfig struct {
 	// +kubebuilder:default=3901
 	RPCBindPort int32 `json:"rpcBindPort,omitempty"`
 
-	// RPCBindAddress is a custom bind address for the RPC server.
-	// Can be a TCP address (e.g., "0.0.0.0:3901", "[::]:3901").
+	// RPCBindAddress is a custom wildcard TCP bind address for the RPC server.
+	// Managed workloads accept "0.0.0.0:3901" or "[::]:3901" so the
+	// generated Service can reach every Garage process.
 	// If set, this overrides RPCBindPort.
 	// +optional
 	RPCBindAddress string `json:"rpcBindAddress,omitempty"`
@@ -727,9 +727,9 @@ type S3APIConfig struct {
 	// +kubebuilder:default=3900
 	BindPort int32 `json:"bindPort,omitempty"`
 
-	// BindAddress is a custom bind address for the S3 API.
-	// Can be a TCP address (e.g., "0.0.0.0:3900", "[::]:3900") or
-	// a Unix socket path (e.g., "unix:///run/garage/s3.sock").
+	// BindAddress is a custom wildcard TCP bind address for the S3 API.
+	// Managed workloads accept "0.0.0.0:3900" or "[::]:3900" so the
+	// generated Service and probes can reach every Garage process.
 	// If set, this overrides BindPort.
 	// +optional
 	BindAddress string `json:"bindAddress,omitempty"`
@@ -759,8 +759,7 @@ type K2VAPIConfig struct {
 	// +kubebuilder:default=3904
 	BindPort int32 `json:"bindPort,omitempty"`
 
-	// BindAddress is a custom bind address for the K2V API.
-	// Can be a TCP address or Unix socket path (e.g., "unix:///run/garage/k2v.sock").
+	// BindAddress is a custom wildcard TCP bind address for the K2V API.
 	// If set, this overrides BindPort.
 	// +optional
 	BindAddress string `json:"bindAddress,omitempty"`
@@ -793,8 +792,7 @@ type WebAPIConfig struct {
 	// +kubebuilder:default=3902
 	BindPort int32 `json:"bindPort,omitempty"`
 
-	// BindAddress is a custom bind address for the Web API.
-	// Can be a TCP address or Unix socket path (e.g., "unix:///run/garage/web.sock").
+	// BindAddress is a custom wildcard TCP bind address for the Web API.
 	// If set, this overrides BindPort.
 	// +optional
 	BindAddress string `json:"bindAddress,omitempty"`
@@ -892,7 +890,7 @@ type BlockConfig struct {
 
 	// CompressionLevel is the zstd compression level
 	// 1-19: standard, 20-22: ultra, -1 to -99: fast, "none": disabled
-	// +kubebuilder:validation:Pattern=`^(none|-?[1-9][0-9]*)$`
+	// +kubebuilder:validation:Pattern=`^(none|0|-?[1-9][0-9]*)$`
 	// +optional
 	CompressionLevel *string `json:"compressionLevel,omitempty"`
 
@@ -1085,7 +1083,9 @@ type PublicEndpointConfig struct {
 	// +optional
 	NodePort *NodePortEndpointConfig `json:"nodePort,omitempty"`
 
-	// ExternalIP configuration
+	// ExternalIP is retained for API compatibility but is not supported.
+	// Setting it is rejected because the operator does not consume the explicit
+	// address mapping or template.
 	// +optional
 	ExternalIP *ExternalIPEndpointConfig `json:"externalIP,omitempty"`
 }
@@ -1122,14 +1122,13 @@ type NodePortEndpointConfig struct {
 	BasePort int32 `json:"basePort,omitempty"`
 }
 
-// ExternalIPEndpointConfig for direct external IP exposure
+// ExternalIPEndpointConfig is retained for API compatibility but is unsupported.
 type ExternalIPEndpointConfig struct {
-	// Addresses maps pod names to external IPs
+	// Addresses is retained for API compatibility but is unsupported.
 	// +optional
 	Addresses map[string]string `json:"addresses,omitempty"`
 
-	// AddressTemplate uses go template to generate addresses from pod info
-	// Example: "garage-{{.Index}}.example.com"
+	// AddressTemplate is retained for API compatibility but is unsupported.
 	// +optional
 	AddressTemplate string `json:"addressTemplate,omitempty"`
 }
@@ -1150,9 +1149,9 @@ type RemoteClusterConfig struct {
 	// +required
 	Connection RemoteClusterConnection `json:"connection"`
 
-	// DefaultCapacity is the default storage capacity to assign to remote nodes
-	// that don't yet have a role in the layout. If not specified, defaults to 100Gi.
-	// Set to "0" to add nodes as gateway-only (no storage).
+	// DefaultCapacity is retained for API compatibility but is not supported.
+	// Remote role capacity is copied from the source cluster's committed or
+	// staged layout and cannot be overridden by the importing cluster.
 	// +optional
 	DefaultCapacity *resource.Quantity `json:"defaultCapacity,omitempty"`
 }
@@ -1446,6 +1445,13 @@ type GarageClusterStatus struct {
 	// +optional
 	StorageDrain *StorageDrainStatus `json:"storageDrain,omitempty"`
 
+	// AutoModePVCHandoffs mirrors the hub version's controller-owned retained
+	// PVC identity handoffs so conversion cannot erase an in-flight replacement.
+	// +optional
+	// +listType=map
+	// +listMapKey=pvcName
+	AutoModePVCHandoffs []AutoModePVCHandoffStatus `json:"autoModePvcHandoffs,omitempty"`
+
 	// FactorMigration is mirrored from the storage version so v1beta1 status
 	// conversion and delete admission cannot erase or overlook an in-flight
 	// replication-factor migration.
@@ -1497,6 +1503,17 @@ type GarageClusterStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// AutoModePVCHandoffStatus mirrors the v1beta2 retained Auto-mode PVC handoff
+// for lossless status conversion.
+type AutoModePVCHandoffStatus struct {
+	SlotName                   string `json:"slotName"`
+	PVCName                    string `json:"pvcName"`
+	PVCUID                     string `json:"pvcUid"`
+	PreviousGarageNodeUID      string `json:"previousGarageNodeUid"`
+	ReplacementReservationHash string `json:"replacementReservationHash,omitempty"`
+	ReplacementGarageNodeUID   string `json:"replacementGarageNodeUid,omitempty"`
 }
 
 // FactorMigrationStatus mirrors the v1beta2 coordinated replication-factor

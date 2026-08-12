@@ -30,9 +30,8 @@ type ClusterReference struct {
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
-	// KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.
-	// Only needed for multi-cluster federation where the GarageCluster lives in a different
-	// Kubernetes cluster entirely (not just a different namespace).
+	// KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.
+	// It is currently rejected by admission because the operator does not use it.
 	// +optional
 	KubeConfigSecretRef *corev1.SecretKeySelector `json:"kubeConfigSecretRef,omitempty"`
 }

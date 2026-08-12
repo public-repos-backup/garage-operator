@@ -18,7 +18,9 @@ package cosi
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 )
@@ -40,14 +42,12 @@ type BucketClassParameters struct {
 	MaxSize          *resource.Quantity
 	MaxObjects       *int64
 	WebsiteEnabled   bool
-	UnknownParams    []string
 }
 
 // BucketAccessClassParameters holds parsed BucketAccessClass parameters
 type BucketAccessClassParameters struct {
 	ClusterRef       string
 	ClusterNamespace string
-	UnknownParams    []string
 }
 
 var knownBucketClassParams = map[string]struct{}{
@@ -60,6 +60,9 @@ var knownBucketAccessClassParams = map[string]struct{}{
 
 // ParseBucketClassParameters parses BucketClass parameters
 func ParseBucketClassParameters(params map[string]string, defaultNamespace string) (*BucketClassParameters, error) {
+	if unknown := unknownParameters(params, knownBucketClassParams); len(unknown) > 0 {
+		return nil, fmt.Errorf("unsupported BucketClass parameters: %s", strings.Join(unknown, ", "))
+	}
 	clusterRef, ok := params[paramClusterRef]
 	if !ok || clusterRef == "" {
 		return nil, fmt.Errorf("required parameter 'clusterRef' not specified")
@@ -80,6 +83,9 @@ func ParseBucketClassParameters(params map[string]string, defaultNamespace strin
 		if err != nil {
 			return nil, fmt.Errorf("invalid maxSize: %w", err)
 		}
+		if q.Sign() < 0 {
+			return nil, fmt.Errorf("invalid maxSize: must not be negative")
+		}
 		p.MaxSize = &q
 	}
 
@@ -88,16 +94,20 @@ func ParseBucketClassParameters(params map[string]string, defaultNamespace strin
 		if err != nil {
 			return nil, fmt.Errorf("invalid maxObjects: %w", err)
 		}
+		if n < 0 {
+			return nil, fmt.Errorf("invalid maxObjects: must not be negative")
+		}
 		p.MaxObjects = &n
 	}
 
 	if websiteEnabled, ok := params[paramWebsiteEnabled]; ok {
-		p.WebsiteEnabled = websiteEnabled == paramTrue
-	}
-
-	for k := range params {
-		if _, known := knownBucketClassParams[k]; !known {
-			p.UnknownParams = append(p.UnknownParams, k)
+		switch websiteEnabled {
+		case paramTrue:
+			p.WebsiteEnabled = true
+		case "false":
+			p.WebsiteEnabled = false
+		default:
+			return nil, fmt.Errorf("invalid websiteEnabled %q: must be true or false", websiteEnabled)
 		}
 	}
 
@@ -106,6 +116,9 @@ func ParseBucketClassParameters(params map[string]string, defaultNamespace strin
 
 // ParseBucketAccessClassParameters parses BucketAccessClass parameters
 func ParseBucketAccessClassParameters(params map[string]string, defaultNamespace string) (*BucketAccessClassParameters, error) {
+	if unknown := unknownParameters(params, knownBucketAccessClassParams); len(unknown) > 0 {
+		return nil, fmt.Errorf("unsupported BucketAccessClass parameters: %s", strings.Join(unknown, ", "))
+	}
 	clusterRef, ok := params[paramClusterRef]
 	if !ok || clusterRef == "" {
 		return nil, fmt.Errorf("required parameter 'clusterRef' not specified")
@@ -121,11 +134,16 @@ func ParseBucketAccessClassParameters(params map[string]string, defaultNamespace
 		ClusterNamespace: clusterNS,
 	}
 
-	for k := range params {
-		if _, known := knownBucketAccessClassParams[k]; !known {
-			p.UnknownParams = append(p.UnknownParams, k)
+	return p, nil
+}
+
+func unknownParameters(params map[string]string, known map[string]struct{}) []string {
+	unknown := make([]string, 0)
+	for key := range params {
+		if _, ok := known[key]; !ok {
+			unknown = append(unknown, key)
 		}
 	}
-
-	return p, nil
+	sort.Strings(unknown)
+	return unknown
 }

@@ -175,6 +175,15 @@ func (r *GarageClusterReconciler) reconcileAutoModeStorageNodes(ctx context.Cont
 		for _, name := range descendantNames {
 			desiredByName[name] = true
 		}
+		if current != nil {
+			changed, handoffErr := r.reconcileCurrentAutoModePVCHandoffs(ctx, cluster, current, desired.Name)
+			if handoffErr != nil {
+				return fmt.Errorf("reconciling retained PVC handoff for storage ordinal %d: %w", i, handoffErr)
+			}
+			if changed {
+				return nil
+			}
+		}
 		if current == nil {
 			if nameErr := validateManagedGarageNodeName(desired); nameErr != nil {
 				return fmt.Errorf("refusing to create Auto storage GarageNode ordinal %d: %w", i, nameErr)
@@ -223,9 +232,21 @@ func (r *GarageClusterReconciler) reconcileAutoModeStorageNodes(ctx context.Cont
 
 		changedNames := make([]string, 0, len(toCreate)+len(toUpdate))
 		for _, desired := range toCreate {
+			hasHandoff, handoffErr := r.reserveAutoModeReplacement(ctx, cluster, desired)
+			if handoffErr != nil {
+				return fmt.Errorf("reserving retained PVC handoff for storage GarageNode %s: %w", desired.Name, handoffErr)
+			}
 			log.Info("Creating Auto-mode GarageNode (serialized topology batch)", "name", desired.Name)
 			if err := r.Create(ctx, desired); err != nil && !errors.IsAlreadyExists(err) {
 				return fmt.Errorf("creating GarageNode %s: %w", desired.Name, err)
+			}
+			if hasHandoff {
+				if desired.UID == "" {
+					return fmt.Errorf("creating storage GarageNode %s returned an empty UID for retained PVC handoff", desired.Name)
+				}
+				if err := r.bindAutoModeReplacement(ctx, cluster, desired, desired.Name); err != nil {
+					return fmt.Errorf("binding retained PVC handoff to storage GarageNode %s: %w", desired.Name, err)
+				}
 			}
 			// On AlreadyExists (stale informer cache or pre-existing user-created
 			// GarageNode), the next reconcile's list+diff loop handles drift.
@@ -328,6 +349,9 @@ func (r *GarageClusterReconciler) reconcileAutoModeStorageNodes(ctx context.Cont
 		}
 
 		log.Info("Deleting one Auto-mode GarageNode (serialized scale-down)", "name", candidate.Name)
+		if err := r.prepareRetainedAutoModePVCHandoffs(ctx, cluster, candidate); err != nil {
+			return fmt.Errorf("preparing retained PVC handoff for storage GarageNode %s: %w", candidate.Name, err)
+		}
 		if err := r.Delete(ctx, candidate); err != nil && !errors.IsNotFound(err) {
 			return fmt.Errorf("deleting GarageNode %s: %w", candidate.Name, err)
 		}

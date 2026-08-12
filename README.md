@@ -47,7 +47,13 @@ The Helm chart enables admission and conversion webhooks by default, so install
 cert-manager first. Disabling webhooks is limited to local development or
 simple v1beta2-only installs that neither use `nodeLocalPools` nor rely on
 admission-protected storage deletion. It removes those safety checks and all
-v1beta1 conversion support; node-local pools do not support that mode.
+v1beta1 conversion support; node-local pools and controller-managed persistent
+claims do not support that mode. `EmptyDir` remains fully supported there;
+explicit `existingClaim` volumes can be mounted, but their PVC-backed rollout
+and recovery paths remain fenced until admission is enabled. The
+webhooks also reserve managed PVC finalizer removal to the operator service
+account, preventing namespace users with PVC update rights from reopening a
+same-name claim replacement race before StatefulSet ownership is established.
 
 ```bash
 helm install garage-operator oci://ghcr.io/rajsinghtech/charts/garage-operator \
@@ -92,7 +98,7 @@ The Garage version is yours to choose — `GarageCluster.spec.image`, `GarageNod
 | 0.7.x | **v2.0.0** | v2.3.0, v2.2.0 | Admin API v2; node-local pools require Kubernetes 1.27+ |
 | 0.6.x | **v2.0.0** | v2.3.0, v2.2.0 | Admin API v2 only |
 
-`dxflrs/garage:v2.3.0` is the built-in default when `spec.image` is unset, so an unpinned cluster runs the newest tested version. CI exercises two versions on purpose: the Ginkgo suite runs v2.3.0 and the topology suites (multi-cluster, external gateway, IPv6, single-cluster) run v2.2.0, which is what backs the "v2.x range" claim rather than a single number.
+`dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690` is the built-in default when `spec.image` is unset, so default deployments use the exact tested multi-platform image index. CI exercises two versions on purpose: the Ginkgo suite runs the pinned v2.3.0 index and the topology suites (multi-cluster, external gateway, IPv6, single-cluster) run the pinned v2.2.0 index, which is what backs the "v2.x range" claim rather than a single number.
 
 **Garage 0.x and 1.x are not supported.** The operator drives buckets, keys, layout, and repair exclusively through the `/v2/...` admin API, which first shipped in Garage v2.0.0. Against an older node every admin call 404s and no cluster will reconcile.
 
@@ -1264,7 +1270,7 @@ team-b/
   GarageKey: team-b-key         (clusterRef.namespace: storage-admin)
 ```
 
-Tenants can only access what the platform team grants them. Revoking access is as simple as deleting the `GarageReferenceGrant`.
+Tenants can only create or continue reconciling cross-namespace references while a matching grant exists. Deleting the `GarageReferenceGrant` makes those resources fail closed on their next reconcile, but it does not itself revoke credentials already issued by Garage or delete buckets. Remove the dependent `GarageKey`/`GarageBucket` permission relationship (or delete the dependent resource and let its finalizer complete) before deleting the grant when Garage-side revocation is required.
 
 ## Multi-Cluster Federation
 
@@ -1598,7 +1604,8 @@ The operator includes an optional COSI (Container Object Storage Interface) driv
 > field is populated by the cluster-wide COSI **controller** — a separate deployment
 > from `kubernetes-sigs/container-object-storage-interface`, installed once per
 > cluster. Pin the install below to a ref that contains the `BucketClaimRef`-setting
-> logic — older builds create `Bucket` objects without it and the operator rejects them.
+> and Delete-policy BucketClaim cleanup logic — older builds create `Bucket` objects
+> without the required reference or leave claim-driven deletion unfinished.
 >
 > **Architecture:** The cluster-wide COSI controller reconciles `BucketClaim` →
 > `Bucket` and `BucketAccessClaim` → `BucketAccess`. The garage-operator watches the
@@ -1608,7 +1615,7 @@ The operator includes an optional COSI (Container Object Storage Interface) driv
 
 1. Install the COSI CRDs (pinned to a known-good ref):
    ```bash
-   COSI_REF=bf23a024f511482856f047525f732f26c61e2b85
+   COSI_REF=cc544691e2ef7ddc2fba972d796ed3188ea46315
    for crd in bucketclaims bucketaccesses bucketclasses bucketaccessclasses buckets; do
      kubectl apply -f "https://raw.githubusercontent.com/kubernetes-sigs/container-object-storage-interface/${COSI_REF}/client/config/crd/objectstorage.k8s.io_${crd}.yaml"
    done
@@ -1625,6 +1632,27 @@ The operator includes an optional COSI (Container Object Storage Interface) driv
      --namespace garage-operator-system \
      --create-namespace \
      --set cosi.enabled=true
+   ```
+
+   By default, COSI shadow `GarageBucket` and `GarageKey` resources live in the
+   Helm release namespace. If `cosi.namespace` is set to another namespace, each
+   namespace containing a target `GarageCluster` must explicitly authorize that
+   shadow namespace. For example:
+
+   ```yaml
+   apiVersion: garage.rajsingh.info/v1beta1
+   kind: GarageReferenceGrant
+   metadata:
+     name: allow-cosi-shadows
+     namespace: garage-operator-system # target GarageCluster namespace
+   spec:
+     from:
+       - kind: GarageBucket
+         namespace: cosi-shadows
+       - kind: GarageKey
+         namespace: cosi-shadows
+     to:
+       - kind: GarageCluster
    ```
 
 ### Using COSI
@@ -1691,19 +1719,22 @@ The operator includes an optional COSI (Container Object Storage Interface) driv
      valueFrom:
        secretKeyRef:
          name: my-bucket-creds
-         key: S3_ENDPOINT
+         key: COSI_S3_ENDPOINT
    - name: AWS_ACCESS_KEY_ID
      valueFrom:
        secretKeyRef:
          name: my-bucket-creds
-         key: S3_ACCESS_KEY_ID
+         key: COSI_S3_ACCESS_KEY_ID
    - name: AWS_SECRET_ACCESS_KEY
      valueFrom:
        secretKeyRef:
          name: my-bucket-creds
-         key: S3_ACCESS_SECRET_KEY
+         key: COSI_S3_ACCESS_SECRET_KEY
    ```
-   The secret also contains `S3_BUCKET_ID` and `S3_REGION`.
+   The secret also contains the canonical v1alpha2 fields `COSI_PROTOCOL`,
+   `COSI_S3_BUCKET_ID`, `COSI_S3_REGION`, and
+   `COSI_S3_ADDRESSING_STYLE`. Historical `S3_*` aliases remain available for
+   compatibility with existing workloads.
 
 ### COSI Limitations
 

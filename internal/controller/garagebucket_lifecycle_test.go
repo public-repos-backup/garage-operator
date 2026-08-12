@@ -309,7 +309,7 @@ func lifecycleStubServer(t *testing.T, stored *[]garage.AdminLifecycleRule, acce
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/v2/GetBucketInfo":
+		case testGetBucketInfoPath:
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id":             testLifecycleBucketID,
 				"lifecycleRules": *stored,

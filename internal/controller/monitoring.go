@@ -21,6 +21,8 @@ import (
 const (
 	adminPortName   = "admin"
 	s3PortName      = "s3"
+	k2vPortName     = "k2v"
+	webPortName     = "web"
 	metricsPath     = "/metrics"
 	metricsTokenKey = "metrics-token"
 	labelCluster    = "garage.rajsingh.info/cluster"
@@ -48,6 +50,10 @@ func (r *GarageClusterReconciler) reconcileMonitoring(ctx context.Context, clust
 		sm := &monitoringv1.ServiceMonitor{}
 		err := r.APIReader.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, sm)
 		if err == nil {
+			if !metav1.IsControlledBy(sm, cluster) {
+				log.Info("Leaving foreign same-name ServiceMonitor untouched", "name", name)
+				return nil
+			}
 			return r.Delete(ctx, sm)
 		}
 		if errors.IsForbidden(err) {
@@ -77,6 +83,9 @@ func (r *GarageClusterReconciler) reconcileMonitoring(ctx context.Context, clust
 	}
 	if err != nil {
 		return fmt.Errorf("get ServiceMonitor: %w", err)
+	}
+	if !metav1.IsControlledBy(sm, cluster) {
+		return fmt.Errorf("refusing to mutate ServiceMonitor %s/%s because it is not controlled by GarageCluster UID %s", sm.Namespace, sm.Name, cluster.UID)
 	}
 	if desiredSnapshot := currentStaticCredentialsSecretName(cluster); desiredSnapshot != "" &&
 		len(desired.Spec.Endpoints) > 0 && desired.Spec.Endpoints[0].Authorization != nil &&

@@ -118,6 +118,7 @@ type ImportKeyConfig struct {
 
 	// SecretRef references a Kubernetes secret containing the credentials.
 	// Mutually exclusive with inline accessKeyId/secretAccessKey.
+	// The namespace must be empty or match the GarageKey namespace.
 	// +optional
 	SecretRef *corev1.SecretReference `json:"secretRef,omitempty"`
 
@@ -320,7 +321,9 @@ type GarageKeyStatus struct {
 	// +optional
 	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
 
-	// ClusterWide indicates this key has cluster-wide bucket access via allBuckets
+	// ClusterWide records reserved or active operator ownership of permissions
+	// managed through spec.allBuckets. It is set before the first remote allow
+	// and remains set until every resulting permission has been removed.
 	// +optional
 	ClusterWide bool `json:"clusterWide"`
 
@@ -336,7 +339,16 @@ type GarageKeyStatus struct {
 	// +optional
 	Buckets []KeyBucketAccess `json:"buckets,omitempty"`
 
-	// EffectivePermissions shows merged permissions from both bucket and key definitions
+	// ManagedBucketGrants lists Garage bucket IDs with reserved or active
+	// operator ownership from this key's spec.bucketPermissions. IDs are recorded
+	// before the first remote mutation and removed only after exact convergence,
+	// allowing crash-safe removal or downgrade without touching manual grants.
+	// Cluster-wide spec.allBuckets ownership is represented by ClusterWide.
+	// +optional
+	ManagedBucketGrants []string `json:"managedBucketGrants,omitempty"`
+
+	// EffectivePermissions is retained for API compatibility but is not currently
+	// populated. Status.Buckets reports Garage's authoritative effective bucket access.
 	// +optional
 	EffectivePermissions []EffectivePermission `json:"effectivePermissions,omitempty"`
 

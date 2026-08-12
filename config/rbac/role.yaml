@@ -149,6 +149,7 @@ rules:
   - objectstorage.k8s.io
   resources:
   - bucketaccesses/status
+  - bucketclaims/status
   - buckets/status
   verbs:
   - get

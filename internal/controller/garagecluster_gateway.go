@@ -204,6 +204,9 @@ func (r *GarageClusterReconciler) reconcileGatewayStatefulSet(ctx context.Contex
 	if err != nil {
 		return err
 	}
+	if !metav1.IsControlledBy(existing, cluster) {
+		return fmt.Errorf("refusing to mutate gateway StatefulSet %s/%s because it is not controlled by GarageCluster UID %s", existing.Namespace, existing.Name, cluster.UID)
+	}
 
 	// VolumeClaimTemplates are immutable. Admission allows an edge gateway's
 	// PVC shape/size to change only after replicas reached zero. Do not trust the
@@ -339,6 +342,10 @@ func (r *GarageClusterReconciler) deletePreviousGatewayDeployment(ctx context.Co
 		}
 		return err
 	}
+	if !metav1.IsControlledBy(old, cluster) {
+		log.Info("Leaving foreign same-name legacy gateway Deployment untouched", "name", name)
+		return nil
+	}
 	log.Info("Removing pre-v0.5.6 gateway Deployment so the StatefulSet can take over", "name", name)
 	return r.Delete(ctx, old)
 }
@@ -363,6 +370,10 @@ func (r *GarageClusterReconciler) deleteGatewayStatefulSet(ctx context.Context, 
 		}
 		return err
 	}
+	if !metav1.IsControlledBy(existing, cluster) {
+		log.Info("Leaving foreign same-name gateway StatefulSet untouched", "name", name)
+		return nil
+	}
 	log.Info("Removing gateway StatefulSet (gateway tier no longer declared)", "name", name)
 	return r.Delete(ctx, existing)
 }
@@ -378,6 +389,10 @@ func (r *GarageClusterReconciler) deleteStorageStatefulSet(ctx context.Context, 
 			return nil
 		}
 		return err
+	}
+	if !metav1.IsControlledBy(existing, cluster) {
+		log.Info("Leaving foreign same-name storage StatefulSet untouched", "name", existing.Name)
+		return nil
 	}
 	log.Info("Removing storage StatefulSet (storage tier no longer declared)", "name", cluster.Name)
 	return r.Delete(ctx, existing)

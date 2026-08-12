@@ -334,6 +334,6 @@ var _ = Describe("managed Admin API endpoint", func() {
 			Admin: &garagev1beta2.AdminConfig{BindAddress: "127.0.0.1:4903"},
 		}}
 		_, err := managedAdminPort(cluster)
-		Expect(err).To(MatchError(ContainSubstring("not reachable through every managed Pod")))
+		Expect(err).To(MatchError(ContainSubstring("not a wildcard address")))
 	})
 })

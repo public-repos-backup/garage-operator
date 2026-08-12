@@ -90,6 +90,7 @@ webhooks:
     resources:
     - garagebuckets
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: mgaragecluster.kb.io
   admissionReviewVersions:
   - v1
@@ -110,6 +111,7 @@ webhooks:
     resources:
     - garageclusters
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: mgarageclusterv1beta1.kb.io
   admissionReviewVersions:
   - v1
@@ -130,6 +132,7 @@ webhooks:
     resources:
     - garageclusters
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: mgaragekey.kb.io
   admissionReviewVersions:
   - v1
@@ -150,6 +153,7 @@ webhooks:
     resources:
     - garagekeys
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: mgaragenode.kb.io
   admissionReviewVersions:
   - v1
@@ -170,6 +174,7 @@ webhooks:
     resources:
     - garagenodes
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 ---
 # ValidatingWebhookConfiguration
 apiVersion: admissionregistration.k8s.io/v1
@@ -183,6 +188,28 @@ metadata:
     cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ include "garage-operator.webhookCertName" . }}
   {{- end }}
 webhooks:
+- name: vmanagedpvcfinalizer.kb.io
+  admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: {{ include "garage-operator.webhookServiceName" . }}
+      namespace: {{ .Release.Namespace }}
+      path: /validate-core-v1-managed-pvc-finalizer
+  # This webhook protects a controller identity reservation. Failing open
+  # would let a namespace PVC writer remove the barrier during an outage.
+  failurePolicy: Fail
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - UPDATE
+    resources:
+    - persistentvolumeclaims
+  sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: vgarageadmintoken.kb.io
   admissionReviewVersions:
   - v1
@@ -203,6 +230,7 @@ webhooks:
     resources:
     - garageadmintokens
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: vgaragebucket.kb.io
   admissionReviewVersions:
   - v1
@@ -223,6 +251,7 @@ webhooks:
     resources:
     - garagebuckets
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: vgaragecluster.kb.io
   admissionReviewVersions:
   - v1
@@ -244,6 +273,7 @@ webhooks:
     resources:
     - garageclusters
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: vgarageclusterv1beta1.kb.io
   admissionReviewVersions:
   - v1
@@ -265,6 +295,7 @@ webhooks:
     resources:
     - garageclusters
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: vgarageclusterscale.kb.io
   admissionReviewVersions:
   - v1
@@ -285,6 +316,7 @@ webhooks:
     resources:
     - garageclusters/scale
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: vgaragekey.kb.io
   admissionReviewVersions:
   - v1
@@ -305,6 +337,7 @@ webhooks:
     resources:
     - garagekeys
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: vgaragenode.kb.io
   admissionReviewVersions:
   - v1
@@ -326,6 +359,7 @@ webhooks:
     resources:
     - garagenodes
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 - name: vgaragereferencegrant.kb.io
   admissionReviewVersions:
   - v1
@@ -346,4 +380,5 @@ webhooks:
     resources:
     - garagereferencegrants
   sideEffects: None
+  {{- include "garage-operator.webhookNamespaceSelector" . | nindent 2 }}
 {{- end }}
