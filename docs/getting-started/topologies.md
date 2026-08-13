@@ -51,7 +51,7 @@ An edge gateway has no local storage tier:
 ```yaml
 spec:
   gateway:
-    replicas: 3
+    replicas: 1
     rpcPublicAddr: edge-gateway.example.net:3901
   connectTo:
     adminApiEndpoint: https://storage.example.net:3903
@@ -63,7 +63,14 @@ spec:
       key: admin-token
 ```
 
-The storage cluster must be able to dial the gateway nodes back. Provide an externally routable address using `gateway.rpcPublicAddr`, `network.rpcPublicAddr`, or a derived `publicEndpoint`. With multiple gateway replicas behind different addresses, use per-node endpoint configuration; a shared L4 address cannot prove which Garage identity answered.
+The storage cluster must be able to dial the gateway node back. Provide an
+externally routable address using `gateway.rpcPublicAddr`,
+`network.rpcPublicAddr`, or a derived `publicEndpoint`. An edge gateway uses a
+single cluster-level config, so a shared address is safe only for one replica.
+For multiple independently routed identities, use one one-replica edge
+`GarageCluster` per route, or use a unified gateway tier with generated
+`GarageNode`s and per-ordinal addresses. A shared L4 address cannot prove which
+Garage identity answered.
 
 Edge gateways use one cluster-level StatefulSet because their layout is owned by the remote storage cluster. Scale to zero and wait for capacity-less roles to retire before changing an edge metadata PVC source or claim template.
 

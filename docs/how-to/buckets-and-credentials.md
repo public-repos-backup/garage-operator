@@ -1,6 +1,10 @@
 # Manage buckets and credentials
 
-The operator manages Garage resources through Kubernetes CRDs. Keep `GarageBucket`, `GarageKey`, and `GarageAdminToken` in the namespace where you want their generated Secrets to live. Cross-namespace references require an explicit grant in the destination namespace.
+The operator manages Garage resources through Kubernetes CRDs. Keep
+`GarageBucket`, `GarageKey`, and `GarageAdminToken` in the namespace where you
+want their generated Secrets to live. Cross-namespace `GarageBucket` and
+`GarageKey` references require an explicit grant in the destination namespace;
+`GarageAdminToken` references are always namespace-local.
 
 ## Create a bucket
 

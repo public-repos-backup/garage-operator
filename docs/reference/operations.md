@@ -19,6 +19,7 @@ Annotations are imperative requests layered onto declarative resources. Most are
 | `retry-migration` | `true` | Retry legacy StatefulSet → per-`GarageNode` migration |
 | `purge-cluster-layout` | `factor=N[,force]` | **Destructive:** coordinated replication-factor migration |
 | `purge-cluster-layout-abort` | `true` | Abort factor migration; cannot undo an on-disk purge |
+| `force-delete-unrevoked-operator-tokens` | `true` | **Federated/edge teardown risk:** continue when internally generated Admin-token rows could not be revoked through a surviving Admin API. Deletes only local one-time Secrets; a copied bearer may remain valid remotely. |
 | `migrate-legacy-rpc-secret` | `true` | Stage exact migration from released RPC env override |
 | `acknowledge-legacy-config-migration` | `true` | Attest equivalent rendered config after removing old file override |
 | `drain` | `true` | Prepare explicit federated cluster/site drain |

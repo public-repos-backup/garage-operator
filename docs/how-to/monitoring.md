@@ -20,6 +20,10 @@ spec:
     interval: 30s
     additionalLabels:
       release: kube-prometheus-stack
+    metricRelabelings:
+      - sourceLabels: [__name__]
+        regex: 'rpc_duration_seconds_bucket'
+        action: drop
   admin:
     metricsRequireToken: true
     metricsTokenSecretRef:
@@ -27,7 +31,13 @@ spec:
       key: metrics-token
 ```
 
-The operator creates a `ServiceMonitor` targeting each Garage node's Admin `/metrics` endpoint. When `metricsRequireToken` is set, Prometheus must be authorized to read the token Secret in the Garage namespace.
+The operator creates a `ServiceMonitor` targeting each Garage node's Admin
+`/metrics` endpoint. It selects both Auto and Manual node Services by the
+cluster label and uses `job: garage`, which matches the bundled dashboard.
+`metricRelabelings` are copied to the endpoint and run after scraping, before
+Prometheus stores samples; use them to control high-cardinality series such as
+per-method RPC histograms. When `metricsRequireToken` is set, Prometheus must
+be authorized to read the token Secret in the Garage namespace.
 
 ## Operator metrics
 
@@ -57,6 +67,47 @@ grafanaDashboard:
 ```
 
 The bundled rules cover availability, cluster health, quorum, partitions, RPC failures, block resync errors, and low disk space. The dashboard ConfigMap uses the common Grafana sidecar label pattern.
+
+The chart renders these alert names by default:
+
+| Group | Alerts |
+| --- | --- |
+| Availability | `GarageNodeDown`, `GarageHighRPCErrorRate` |
+| Storage | `GarageBlockResyncErrors`, `GarageHighBlockResyncQueue`, `GarageLowDiskSpace` |
+| Cluster | `GarageClusterUnhealthy`, `GarageClusterUnavailable`, `GarageStorageNodeDown`, `GaragePartitionsDegraded`, `GarageNodeDisconnected` |
+
+Set `prometheusRules.disabled.<AlertName>: true` to disable an individual
+rule. `customRules.<AlertName>.severity` and `.for` override the rendered
+severity or duration; `additionalRuleLabels`, `additionalRuleAnnotations`,
+and per-group labels/annotations are applied to the generated rules.
+
+The dashboard is a ConfigMap named `<release>-garage-dashboard` with key
+`garage-prometheus.json`. With the Grafana sidecar, match
+`grafanaDashboard.labels` to its discovery label. With Grafana Operator, use
+a `GrafanaDashboard` resource that references that ConfigMap:
+
+```yaml
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: garage
+  namespace: garage-operator-system
+spec:
+  allowCrossNamespaceImport: true
+  instanceSelector:
+    matchLabels:
+      grafana.internal/instance: grafana
+  folder: Garage
+  configMapRef:
+    name: garage-operator-garage-dashboard
+    key: garage-prometheus.json
+  datasources:
+    - inputName: DS_PROMETHEUS
+      datasourceName: Prometheus
+```
+
+Use the actual Helm release name in `configMapRef.name`; `namespace` must be
+the ConfigMap namespace when cross-namespace import is not enabled.
 
 ## Useful status queries
 

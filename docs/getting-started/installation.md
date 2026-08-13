@@ -78,7 +78,53 @@ Use the chart's `cosi.namespace` when enabling COSI in a separate namespace; aut
 
 Use `imagePullSecrets` for the operator image and `defaultGarageImage` for Garage pods that omit `spec.image`. For supply-chain policy, use `image.digest` for the operator and pin `spec.image` or `defaultGarageImage` to a digest.
 
-Released images and charts have keyless cosign signatures and provenance. See the repository README's [artifact verification section](https://github.com/rajsinghtech/garage-operator#verifying-release-artifacts) for the verification commands.
+## Verify release artifacts
+
+Released container images and Helm charts are signed with keyless cosign
+signing by GitHub Actions and carry provenance attestations. Release images
+also carry an SPDX SBOM. Verify the immutable image digest before placing it in
+`image.digest` or a `GarageCluster.spec.image`:
+
+```bash
+IMAGE=ghcr.io/rajsinghtech/garage-operator:v0.7.4
+
+cosign verify "$IMAGE" \
+  --certificate-identity-regexp '^https://github.com/rajsinghtech/garage-operator/\.github/workflows/docker\.yml@refs/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+gh attestation verify "oci://$IMAGE" --repo rajsinghtech/garage-operator
+cosign download attestation "$IMAGE" \
+  --predicate-type https://spdx.dev/Document/v2.3
+```
+
+For the Helm chart, first resolve its OCI digest, then verify that digest with
+the Helm publishing workflow identity:
+
+```bash
+CHART=oci://ghcr.io/rajsinghtech/charts/garage-operator
+helm show chart "$CHART" --version 0.7.4
+
+# Resolve the OCI manifest descriptor with an OCI client such as ORAS.
+oras manifest fetch --descriptor "$CHART:0.7.4"
+# Set CHART_DIGEST to the sha256 digest in that descriptor.
+CHART_DIGEST=ghcr.io/rajsinghtech/charts/garage-operator@sha256:<digest>
+cosign verify "$CHART_DIGEST" \
+  --certificate-identity-regexp '^https://github.com/rajsinghtech/garage-operator/\.github/workflows/helm\.yml@refs/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify "oci://$CHART_DIGEST" --repo rajsinghtech/garage-operator
+```
+
+The `install.yaml` asset attached to a GitHub release has a provenance
+attestation as well. Download it and verify it against the repository:
+
+```bash
+gh release download v0.7.4 --repo rajsinghtech/garage-operator \
+  --pattern install.yaml
+gh attestation verify install.yaml --repo rajsinghtech/garage-operator
+```
+
+Substitute the release being installed for `v0.7.4`. Pin verified image and
+chart digests in production; tags alone are mutable references.
 
 ## Uninstall
 

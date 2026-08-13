@@ -81,6 +81,7 @@ nav:
       - Manage buckets and credentials: how-to/buckets-and-credentials.md
       - Run gateways: how-to/gateways.md
       - Manage nodes manually: how-to/manual-nodes.md
+      - Configure Garage: how-to/configuration.md
       - Federate clusters: how-to/federation.md
       - Monitor Garage: how-to/monitoring.md
       - Use CSI-S3 and COSI: how-to/object-storage-interfaces.md
@@ -89,6 +90,7 @@ nav:
       - Day-2 operations: operations/day-2.md
       - Maintenance and recovery: operations/maintenance-and-recovery.md
       - Upgrade and migration: operations/upgrades.md
+      - Migration details: operations/migration.md
       - Troubleshooting: operations/troubleshooting.md
   - Reference:
       - Custom resources: reference/custom-resources.md

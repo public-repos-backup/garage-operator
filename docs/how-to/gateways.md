@@ -46,7 +46,9 @@ metadata:
   namespace: edge
 spec:
   gateway:
-    replicas: 3
+    # This edge shape has one shared config. Use one replica per independently
+    # routed edge identity; use separate edge resources for multiple routes.
+    replicas: 1
     rpcPublicAddr: edge-gateway.example.net:3901
   connectTo:
     rpcSecretRef:
@@ -64,7 +66,17 @@ spec:
 
 `connectTo` requires either a same-namespace `clusterRef` or enough external endpoint/credential information to reach the storage cluster. The operator establishes connectivity in both directions and periodically nudges reconnection when peers become sustained-unreachable.
 
-The storage cluster must be able to dial every gateway identity at the address Garage advertises. A single shared address is safe only when it routes to the intended single identity. For multiple Pods, use per-ordinal hostnames or per-node services and configure `remoteClusters[].connection.gatewayRpcEndpointTemplate` on other federated sites as needed.
+The storage cluster must be able to dial every gateway identity at the address
+Garage advertises. A single shared address is safe only for one edge identity.
+An edge gateway uses one cluster-level StatefulSet and shared config, so
+`{ordinal}` is not substituted in `gateway.rpcPublicAddr` for this shape and
+`publicEndpoint.loadBalancer.perNode` does not by itself give each Pod a
+different Garage advertisement. For several independently routable edge
+identities, create one one-replica edge `GarageCluster` per route (or use a
+unified gateway tier, whose generated `GarageNode`s support per-ordinal
+addresses). On consuming federated sites, configure
+`remoteClusters[].connection.gatewayRpcEndpointTemplate` only when the remote
+gateway workload actually publishes matching per-ordinal routes.
 
 ## Public S3 endpoints
 

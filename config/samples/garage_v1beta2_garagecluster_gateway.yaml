@@ -30,9 +30,11 @@ spec:
   image: dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690
 
   # Gateway tier only — no storage block. This edge gateway uses one StatefulSet
-  # with a persistent metadata PVC per replica; block data stays EmptyDir.
+  # with a persistent metadata PVC per identity; block data stays EmptyDir.
   gateway:
-    replicas: 2
+    # One shared config is safe for one independently routed edge identity.
+    # Create another one-replica edge CR for another route.
+    replicas: 1
     # Edge gateways default to Delete/Delete for compatibility. Use Retain to
     # keep the metadata node_key after scale-down/deletion. In a unified
     # cluster, the omitted default is Retain/Retain instead.
@@ -68,9 +70,8 @@ spec:
     bindPort: 3900
     region: garage
 
-  # Optional: when set, this address is written into the gateway pods'
-  # garage.toml as rpc_public_addr so peers in other regions can dial them by
-  # hostname. Purely cosmetic for in-cluster gateways.
+  # Optional: for a one-replica edge tier, this address is written into the
+  # gateway pod's garage.toml as rpc_public_addr so peers can dial it by name.
   # gateway:
   #   rpcPublicAddr: "edge-gateway.example.com:3901"
 
@@ -86,7 +87,9 @@ spec:
   image: dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690
 
   gateway:
-    replicas: 3
+    # The edge StatefulSet has one shared config. A shared address is safe for
+    # this one identity; use separate one-replica edge CRs for more routes.
+    replicas: 1
     rpcPublicAddr: "edge-gateway.tailnet.example:3901"
     resources:
       requests:
