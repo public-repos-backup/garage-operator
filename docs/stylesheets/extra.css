@@ -1,0 +1,51 @@
+.md-typeset .hero {
+  background: linear-gradient(135deg, var(--md-primary-fg-color), #5b7cfa 55%, #ef8b35);
+  border-radius: 1rem;
+  color: white;
+  margin: 0 0 2rem;
+  padding: clamp(1.5rem, 4vw, 3rem);
+}
+
+.md-typeset .hero h1,
+.md-typeset .hero h2,
+.md-typeset .hero a {
+  color: white;
+}
+
+.md-typeset .hero h1 {
+  font-size: clamp(2rem, 5vw, 3.5rem);
+  margin-bottom: .4rem;
+}
+
+.md-typeset .hero p {
+  font-size: 1.1rem;
+  max-width: 48rem;
+}
+
+.md-typeset .feature-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  margin: 1.5rem 0 2rem;
+}
+
+.md-typeset .feature-card {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: .8rem;
+  padding: 1.1rem 1.2rem;
+}
+
+.md-typeset .feature-card h3 {
+  margin-top: 0;
+}
+
+.md-typeset .feature-card p:last-child {
+  margin-bottom: 0;
+}
+
+.md-typeset .small-caps {
+  font-size: .75rem;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}

@@ -16,7 +16,7 @@ matters to the layout.
 Pools are additive. Keep SMB, Ceph, PVC, external, and exceptional-capacity
 nodes as ordinary `GarageNode` resources while uniform local nodes move into
 one or more pools. See the
-[mixed-storage sample](../config/samples/garage_v1beta2_garagecluster_node_local_pools.yaml)
+[mixed-storage sample](https://github.com/rajsinghtech/garage-operator/blob/main/config/samples/garage_v1beta2_garagecluster_node_local_pools.yaml)
 and the [complete design](design/2026-07-30-node-local-pools-design.md).
 
 One workload-owning `GarageCluster` is one Garage store/site lifecycle and

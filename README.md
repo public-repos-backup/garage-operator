@@ -9,6 +9,12 @@
 </p>
 
 <p align="center">
+  <a href="https://rajsinghtech.github.io/garage-operator/">Read the operator documentation</a> ·
+  <a href="https://github.com/rajsinghtech/garage-operator/releases">Releases</a> ·
+  <a href="https://github.com/rajsinghtech/garage-operator/issues">Support</a>
+</p>
+
+<p align="center">
   <a href="https://github.com/rajsinghtech/garage-operator/actions/workflows/test.yml"><img src="https://github.com/rajsinghtech/garage-operator/actions/workflows/test.yml/badge.svg" alt="CI"></a>
   <a href="https://goreportcard.com/report/github.com/rajsinghtech/garage-operator"><img src="https://goreportcard.com/badge/github.com/rajsinghtech/garage-operator" alt="Go Report Card"></a>
   <a href="https://github.com/rajsinghtech/garage-operator/releases/latest"><img src="https://img.shields.io/github/v/release/rajsinghtech/garage-operator" alt="Latest Release"></a>
@@ -73,7 +79,7 @@ helm install garage-operator oci://ghcr.io/rajsinghtech/charts/garage-operator \
 Released container images and Helm charts are signed with [cosign](https://docs.sigstore.dev/) keyless signing (the GitHub Actions OIDC identity — no long-lived keys), and carry SLSA build provenance. The image additionally carries an SPDX SBOM. All three are stored in GHCR as OCI referrers of the artifact digest.
 
 ```bash
-IMAGE=ghcr.io/rajsinghtech/garage-operator:v0.7.3
+IMAGE=ghcr.io/rajsinghtech/garage-operator:v0.7.4
 
 # Signature
 cosign verify "$IMAGE" \
@@ -1743,6 +1749,8 @@ The operator includes an optional COSI (Container Object Storage Interface) driv
 - Bucket and credential deletion run via a protection finalizer when the BucketClaim/BucketAccess (and the resulting Bucket/BucketAccess) are deleted — the operator deletes the Garage bucket and revokes/deletes the key directly (no gRPC sidecar). A non-empty bucket is refused: the operator surfaces a `bucket not empty` error and retries until it is emptied.
 
 ## Documentation
+
+The canonical documentation site is **[rajsinghtech.github.io/garage-operator](https://rajsinghtech.github.io/garage-operator/)**. It is built from `docs/` on every documentation change and includes installation, topology selection, API/Helm references, federation, node-local pools, day-2 operations, recovery, and troubleshooting.
 
 - [Contributing](CONTRIBUTING.md) - Design, testing, and release workflow
 - [Design Records](docs/design/) - Designs for substantial or high-risk changes

@@ -1,0 +1,107 @@
+site_name: Garage Kubernetes Operator
+site_description: Operate Garage distributed S3-compatible object storage on Kubernetes.
+site_url: https://rajsinghtech.github.io/garage-operator/
+repo_name: rajsinghtech/garage-operator
+repo_url: https://github.com/rajsinghtech/garage-operator
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.share
+    - search.suggest
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+  font:
+    text: Inter
+    code: JetBrains Mono
+  icon:
+    logo: material/warehouse
+    repo: fontawesome/brands/github
+  favicon: https://raw.githubusercontent.com/rajsinghtech/garage-operator/main/logo.svg
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-sunny
+        name: Use dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-night
+        name: Use light mode
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Get started:
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+      - Choose a topology: getting-started/topologies.md
+  - Concepts:
+      - Architecture: concepts/architecture.md
+      - Storage identity and layout: concepts/storage-and-layout.md
+      - API versions and compatibility: concepts/api-versions.md
+  - How-to:
+      - Manage buckets and credentials: how-to/buckets-and-credentials.md
+      - Run gateways: how-to/gateways.md
+      - Manage nodes manually: how-to/manual-nodes.md
+      - Federate clusters: how-to/federation.md
+      - Monitor Garage: how-to/monitoring.md
+      - Use CSI-S3 and COSI: how-to/object-storage-interfaces.md
+      - Node-local pools: node-local-pools.md
+  - Operations:
+      - Day-2 operations: operations/day-2.md
+      - Maintenance and recovery: operations/maintenance-and-recovery.md
+      - Upgrade and migration: operations/upgrades.md
+      - Troubleshooting: operations/troubleshooting.md
+  - Reference:
+      - Custom resources: reference/custom-resources.md
+      - Helm values: reference/helm.md
+      - Annotations and conditions: reference/operations.md
+      - Samples and generated schemas: reference/samples.md
+      - Compatibility matrix: reference/compatibility.md
+  - Project:
+      - Contributing: https://github.com/rajsinghtech/garage-operator/blob/main/CONTRIBUTING.md
+      - Design records:
+          - Management handle: design/2026-07-02-connectto-management-handle-design.md
+          - Node-local pools: design/2026-07-30-node-local-pools-design.md
+      - Releases: https://github.com/rajsinghtech/garage-operator/releases
+
+validation:
+  omitted_files: warn
